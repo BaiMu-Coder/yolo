@@ -318,13 +318,16 @@ return rknn_outputs_release(_ctx,_output_number,&(_output[0]));
 
 int yolov8seg::post_process(object_detect_result_list& result , letterbox& letter_box)
  {
+
+  TIMER xxx;
+
     std::vector<float> candidate_box;  //保存候选框  四个一组  x,y,w,h  
     std::vector<float> box_score;     //每个候选框的分类置信度
     std::vector<int> class_id;        //每个候选框的id
 
-    std::vector<float> box_mask_coefficient;  //每个候选框对应的mask 系数（长度 PROTO_CHANNEL）
-    auto proto=std::make_unique<float[]>(_proto_channel * _proto_width * _proto_height); //Proto 原型掩码（大小 C*Hp*Wp），只会在处理到 proto 输出的那一次被填充。
-    std::vector<float> filter_box_mask_coefficient;  //经过 NMS 筛选剩下的那些候选的系数，用于最终的 matmul也就是生成掩码
+    std::vector< rknpu2::float16> box_mask_coefficient;  //每个候选框对应的mask 系数（长度 PROTO_CHANNEL）
+    auto proto=std::unique_ptr< rknpu2::float16[]>( new rknpu2::float16[_proto_channel * _proto_width * _proto_height]); //Proto 原型掩码（大小 C*Hp*Wp），只会在处理到 proto 输出的那一次被填充。
+    std::vector< rknpu2::float16> filter_box_mask_coefficient;  //经过 NMS 筛选剩下的那些候选的系数，用于最终的 matmul也就是生成掩码
    
     int valid_count=0;
 
@@ -341,7 +344,7 @@ int yolov8seg::post_process(object_detect_result_list& result , letterbox& lette
 
 
 
-    
+    xxx.tik();
       //4+4+4+1）一共13个输出  
       for(int i=0; i<_output_number ; ++i)
       {
@@ -374,6 +377,10 @@ int yolov8seg::post_process(object_detect_result_list& result , letterbox& lette
         valid_count+=process_fp32(_output,_output_tensor,i,grid_w,grid_h,_model_width,_model_height,stride,candidate_box,box_score,class_id,proto,box_mask_coefficient,_proto_channel,_proto_width,_proto_height,BOX_THRESH);
        }
       }
+
+
+xxx.tok();
+xxx.print_time("process_i8");
 
 std::cout<<"validCount size :"<<valid_count<<std::endl;
       if(valid_count<=0)
@@ -462,17 +469,21 @@ result.count=last_count;
     int COLS_B=_proto_height*_proto_width;
   
 
-auto mask_matrix_mult_result=std::make_unique<float[]>(ROWS_A*COLS_B);
+auto mask_matrix_mult_result=std::unique_ptr<float[]>(new float[ROWS_A*COLS_B]);
 
-// int err=matrix_mult_by_npu_fp32(filter_box_mask_coefficient,proto,mask_matrix_mult_result,ROWS_A,COLS_A,COLS_B,_ctx); //直接拿浮点数进行计算，整体体量小,量化int8提升也很小
-//  if(err!=RKNN_SUCC)
-//  {
-//    LOG_ERROR("matrix_mult_by_npu_fp32 fail, errno:%d", err);
-//   return err;
-//  }
 
- matrix_mult_by_cpu_fp32(filter_box_mask_coefficient,proto,mask_matrix_mult_result,ROWS_A,COLS_A,COLS_B);
+   xxx.tik();
+int err=matrix_mult_by_npu_fp32(filter_box_mask_coefficient,proto,mask_matrix_mult_result,ROWS_A,COLS_A,COLS_B,_ctx); //直接拿浮点数进行计算，整体体量小,量化int8提升也很小
+ if(err!=RKNN_SUCC)
+ {
+   LOG_ERROR("matrix_mult_by_npu_fp32 fail, errno:%d", err);
+  return err;
+ }
 
+
+// matrix_mult_by_cpu_fp32(filter_box_mask_coefficient,proto,mask_matrix_mult_result,ROWS_A,COLS_A,COLS_B);
+xxx.tok();
+xxx.print_time("matrix_mult_by_npu_fp32");
 
 
 #ifdef XXX
@@ -520,19 +531,35 @@ auto mask_matrix_mult_result=std::make_unique<float[]>(ROWS_A*COLS_B);
 /*************************************************************/
 
 #else
+
 /*   方案2 先逐张放缩  在进行整体合并为一张图     */  
 //效果经测试比上述效果好
 //每张图进行逐行放缩
- auto all_mask=std::make_unique<float[]>(last_count*letter_box.src_w*letter_box.src_w*sizeof(float));
- resize_by_opencv_fp(mask_matrix_mult_result,last_count,_proto_width,_proto_height,
-                    all_mask,letter_box);
+   xxx.tik();
+ auto all_mask=std::unique_ptr<float[]>(new float[last_count * letter_box.src_w * letter_box.src_h]); 
+  xxx.tok();
+xxx.print_time("all_mask ");
+//    xxx.tik();
+//  resize_by_opencv_fp(mask_matrix_mult_result,last_count,_proto_width,_proto_height,
+//                     all_mask,letter_box); 
+//  xxx.tok();
+// xxx.print_time("方案2----1");
 
+xxx.tik();
+ resize_by_opencv_fp1(mask_matrix_mult_result,last_count,_proto_width,_proto_height,
+                    all_mask,letter_box);
+ xxx.tok();
+xxx.print_time("方案2----1");
+
+ xxx.tik();
 //整体掩码合并
- auto all_mask_in_one=std::make_unique<uint8_t[]>(letter_box.src_w*letter_box.src_h);
- memset(all_mask_in_one.get(),0,sizeof(int8_t)*letter_box.src_w*letter_box.src_h);
+ auto all_mask_in_one=std::make_unique<uint8_t[]>(letter_box.src_w*letter_box.src_h);  //这个会自动帮清零，会有开销，其他的地方要注意
  conbine_mak2(all_mask,all_mask_in_one,result,letter_box);
 
  result.results_mask->seg_mask=std::move(all_mask_in_one);
+
+ xxx.tok();
+xxx.print_time("方案2----2");
 
 /**************************************** */
 #endif

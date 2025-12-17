@@ -7,7 +7,7 @@
 #include <string.h>
 
 // Define this macro to disable timing logs
-// #define TIMING_DISABLED // if you don't need to print the time used, uncomment this line of code
+#define TIMING_DISABLED // if you don't need to print the time used, uncomment this line of code
 
 class TIMER
 {
@@ -38,6 +38,7 @@ public:
     {
         gettimeofday(&stop_time, NULL);
     }
+
 
 #ifdef TIMING_DISABLED
     void print_time(char *str)

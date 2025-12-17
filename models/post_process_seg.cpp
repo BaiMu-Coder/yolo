@@ -1,14 +1,17 @@
 #include "post_process_seg.hpp"
 
+
+
+
 inline static int32_t __clip(float val, float min, float max)
 {
   float f = val <= min ? min : (val >= max ? max : val);
   return f;
 }
 
-static float deqnt_affine_to_f32(int8_t proto, int32_t zp, float scale) // 这种处理方式是唯一解
+static  float deqnt_affine_to_f32(int8_t proto, int32_t zp,  float scale) // 这种处理方式是唯一解
 {
-  return ((float)proto - (float)zp) * scale;
+  return  (proto -  zp) * scale;
 }
 
 static int8_t qnt_f32_to_affine(float f32, int32_t zp, float scale)
@@ -46,10 +49,13 @@ static void compute_dfl(std::vector<float> &before_dfl, const int dfl_len, float
 int process_i8(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_tensor_attr[]> &output_tensor, int index, // 输出信息  和  索引
                int grid_w, int grid_h, int model_w, int model_h, int stride,                                          // 格子大小（输出的大小）  ;  模型输入的大小  stride（步长/下采样倍数） ——也就是该输出特征图上 1 个网格格子对应输入图像上多少个像素。
                std::vector<float> &candidate_box, std::vector<float> &box_score, std::vector<int> &class_id,          // 候选框  置信度  类别
-               std::unique_ptr<float[]> &proto, std::vector<float> &box_mask_coefficient,
+               std::unique_ptr<rknpu2::float16[]> &proto, std::vector<rknpu2::float16> &box_mask_coefficient,
                int proto_channel, int proto_width, int proto_height, // 掩码系数部分
                float box_threshold)                                  // NMS阈值
 {
+
+  TIMER xx;
+
   // Skip if input_id is not 0, 4, 8, or 12
   if (index % 4 != 0)
   {
@@ -59,8 +65,10 @@ int process_i8(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_tens
   int volid_count = 0;
   int grid_len = grid_w * grid_h;
 
+
   if (index == 12)
   {
+      xx.tik();
     /**
      * 获取第12层的输出数据，然后把量化后的数据还原到为原来的浮点型
      * 需要注意的是，这里没有使用比例关系，因为程序需要是INT的数据，不需要0~1的float数据
@@ -68,10 +76,24 @@ int process_i8(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_tens
     int8_t *input_proto = (int8_t *)output[index].buf;
     int32_t zp_proto = output_tensor[index].zp;
     float scale_proto = output_tensor[index].scale; //这两值是做反量化的
+    
+    //因为input_proto就-128到127种可能，直接把结果全算出来，然后查表找答案就行
+    rknpu2::float16 table[256];
+     for (int i = -128; i < 128; ++i) 
+     {
+        float f = deqnt_affine_to_f32(i, zp_proto, scale_proto);
+        table[i+128] = static_cast<rknpu2::float16>(f);
+    }
+
+    // #pragma omp parallel for schedule(static)   //把下面这个 for 循环 分给多个 CPU 线程同时跑 (提升效果不明显)
     for (int i = 0; i < proto_channel * proto_width * proto_height; i++)
     {
-      proto[i] = deqnt_affine_to_f32(input_proto[i], zp_proto, scale_proto); // 反量化_仿射
+      // proto[i] = (rknpu2::float16)deqnt_affine_to_f32(input_proto[i], zp_proto, scale_proto); // 反量化_仿射
+        proto[i] = table[(input_proto[i])+128]; // 反量化_查表  做这个量化主要原因就是，这里循环太大了，每个循环提升一点，累计下来都很大
     }
+
+    xx.tok();
+xx.print_time("index == 12");
     return 0;
   }
 
@@ -148,7 +170,7 @@ int process_i8(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_tens
         int8_t *tem_seg_tensor = seg_tensor + offset_seg;
         for (int k = 0; k < proto_channel; ++k)
         {
-          float tem_proto_coefficient = deqnt_affine_to_f32(tem_seg_tensor[k * grid_len], seg_zp, seg_scale);
+          rknpu2::float16 tem_proto_coefficient = (rknpu2::float16)deqnt_affine_to_f32(tem_seg_tensor[k * grid_len], seg_zp, seg_scale);
           box_mask_coefficient.push_back(tem_proto_coefficient);
         }
 
@@ -207,7 +229,7 @@ int process_i8(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_tens
 int process_fp32(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_tensor_attr[]> &output_tensor, int index,
                  int grid_w, int grid_h, int model_w, int model_h, int stride,
                  std::vector<float> &candidate_box, std::vector<float> &box_score, std::vector<int> &class_id,
-                 std::unique_ptr<float[]> &proto, std::vector<float> &box_mask_coefficient,
+                 std::unique_ptr<rknpu2::float16[]> &proto, std::vector<rknpu2::float16> &box_mask_coefficient,
                  int proto_channel, int proto_width, int proto_height,
                  float box_threshold)
 {
@@ -225,7 +247,7 @@ int process_fp32(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_te
     float *input_proto = (float *)output[index].buf;
     for (int i = 0; i < proto_channel * proto_width * proto_height; i++)
     {
-      proto[i] = input_proto[i];
+      proto[i] = (rknpu2::float16)input_proto[i];
     }
     return 0;
   }
@@ -292,7 +314,7 @@ int process_fp32(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_te
         float *tem_seg_tensor = seg_tensor + offset_seg;
         for (int k = 0; k < proto_channel; ++k)
         {
-          float tem_proto_coefficient = tem_seg_tensor[k * grid_len];
+          rknpu2::float16 tem_proto_coefficient = (rknpu2::float16)tem_seg_tensor[k * grid_len];
           box_mask_coefficient.push_back(tem_proto_coefficient);
         }
 
@@ -408,7 +430,7 @@ void nms(int valid_count,std::vector<int>& index_flag,std::vector<float>& candid
     float yy2=candidate_box[m*4+3]+yy1;
      if(CalculateOverlap(x1,y1,x2,y2,xx1,yy1,xx2,yy2)>nms_thresh){
           index_flag[j]=-1;
-        std::cout<<x1<<" "<<y1<<" "<<x2<<" "<<y2<<"消去了"<<xx1<<" "<<yy1<<" "<<xx2<<" "<<yy2<<"重合比例为："<<CalculateOverlap(x1,y1,x2,y2,xx1,yy1,xx2,yy2)<<std::endl;
+        // std::cout<<x1<<" "<<y1<<" "<<x2<<" "<<y2<<"消去了"<<xx1<<" "<<yy1<<" "<<xx2<<" "<<yy2<<"重合比例为："<<CalculateOverlap(x1,y1,x2,y2,xx1,yy1,xx2,yy2)<<std::endl;
 
     }
   }
@@ -440,9 +462,12 @@ static float clamp(float val, float min, float max)
 
 
 
-int matrix_mult_by_npu_fp32(std::vector<float>& filter_box_mask_coefficient,std::unique_ptr<float[]>& proto,std::unique_ptr<float[]>& matrix_mult_result,int ROWS_A,int COLS_A,int COLS_B,rknn_context& ctx )
+int matrix_mult_by_npu_fp32(std::vector<rknpu2::float16>& filter_box_mask_coefficient,std::unique_ptr<rknpu2::float16[]>& proto,std::unique_ptr<float[]>& matrix_mult_result,int ROWS_A,int COLS_A,int COLS_B,rknn_context& ctx )
 {
-//1.初始化矩阵乘法的上下分
+
+  TIMER xxx;
+xxx.tik();
+//1.初始化矩阵乘法的上下文
 rknn_matmul_info info;  //传入矩阵的相关信息
 memset(&info, 0, sizeof(rknn_matmul_info));
 info.M=ROWS_A;
@@ -463,8 +488,10 @@ if(err!=RKNN_SUCC)
   return err;
 }
 
+ xxx.tok();
+  xxx.print_time("init---1");
 
-
+xxx.tik();
 //2.创建ABC三个矩阵的NPU内存
 rknn_tensor_mem* A=rknn_create_mem(ctx,io_attr.A.size);
 if(A==NULL)
@@ -488,23 +515,34 @@ if(C==NULL)
   return -1;
 }
 
+ xxx.tok();
+  xxx.print_time("init---2");
+
     //3.把输入float32 -> float16，填到 A/B buffer
   rknpu2::float16* A16 = (rknpu2::float16*)A->virt_addr;
   rknpu2::float16* B16 = (rknpu2::float16*)B->virt_addr;
 
 
+  xxx.tik();
   //设置AB数据
-    for (int i = 0; i < ROWS_A * COLS_A; ++i) {
-        A16[i] = (rknpu2::float16)filter_box_mask_coefficient[i];
-    }
-    for (int i = 0; i < COLS_A * COLS_B; ++i) {
-        B16[i] = (rknpu2::float16)proto[i];
-    }
+  std::memcpy(A16, &(filter_box_mask_coefficient[0]), io_attr.A.size);
+  std::memcpy(B16, &(proto[0]), io_attr.B.size);
+
+    // for (int i = 0; i < ROWS_A * COLS_A; ++i) {
+    //     A16[i] = filter_box_mask_coefficient[i];
+    // }
+    // for (int i = 0; i < COLS_A * COLS_B; ++i) {
+    //     B16[i] = proto[i];
+    // }
 
       // 4. 绑定 IO
     rknn_matmul_set_io_mem(ctx, A, &io_attr.A);
     rknn_matmul_set_io_mem(ctx, B, &io_attr.B);
     rknn_matmul_set_io_mem(ctx, C, &io_attr.C);
+
+  xxx.tok();
+  xxx.print_time("init---3");
+
 
 
    // 5. 运行 matmul
@@ -517,15 +555,19 @@ if(C==NULL)
        return err;
     }
 
+
+
+   
     // 6. 拷贝 float32 输出到C
     float* C32 = (float*)C->virt_addr;
     std::memcpy(matrix_mult_result.get(), C32, sizeof(float)*ROWS_A*COLS_B);
 
 
-
     if (A) rknn_destroy_mem(ctx, A);
     if (B) rknn_destroy_mem(ctx, B);
     if (C) rknn_destroy_mem(ctx, C);
+
+
 
     return 0;
 }
@@ -584,12 +626,13 @@ int x1=result.results_box[i].x;
 int y1=result.results_box[i].y;
 int x2=result.results_box[i].w+x1;
 int y2=result.results_box[i].h+y1;
-for(int y=0; y<real_y; ++y)
+if (x2 <= x1 || y2 <= y1) continue;
+
+for(int y=y1; y<y2; ++y)
 {
-for(int x=0; x<real_x; ++x)
+for(int x=x1; x<x2; ++x)
 {
   if(all_mask_in_one[y*real_x+x]==0)
-  if(x >= x1 && x < x2 && y >= y1 && y < y2 ) //掩码在检测框里面
   if(all_mask[i*len+y*real_x+x]>0)
     all_mask_in_one[y*real_x+x]=result.results_box[i].cls_id+1;
 }
@@ -642,4 +685,65 @@ void resize_by_opencv_fp(std::unique_ptr<float[]>& mask_matrix_mult_result,int l
                       }
 
                       return ;
-                    }
+ } 
+
+
+
+
+
+
+
+
+
+ void resize_by_opencv_fp1(std::unique_ptr<float[]>& mask_matrix_mult_result,int last_count,int proto_width,int proto_height,
+                    std::unique_ptr<float[]>& all_mask,letterbox& letter_box)
+                    {
+
+ //先把掩码中填充的部分裁掉，在进行放缩
+
+  //1.裁剪
+    int tem_leftx=letter_box.upleft_pad_x/4;
+    int tem_rightx=letter_box.lowright_pad_x/4;
+    int tem_lefty=letter_box.upleft_pad_y/4;
+    int tem_righty=letter_box.lowright_pad_y/4;
+
+    int padx= (letter_box.lowright_pad_x+letter_box.upleft_pad_x)/4;
+    int pady= (letter_box.lowright_pad_y+letter_box.upleft_pad_y)/4;
+    int conbine_width = proto_width - padx;  //掩码160*160裁去填充部分 的宽度
+    int conbine_height= proto_height- pady;
+    int real_width = letter_box.src_w; //原始输入图像尺寸
+    int real_height = letter_box.src_h;
+
+
+
+
+    // OpenCV 的 ROI 用 Rect 表示：x=left, y=top, 宽=crop_w, 高=crop_h
+    const cv::Rect roi_rect(tem_leftx, tem_lefty, conbine_width, conbine_height);
+
+    // 输出要放缩到原图大小
+    const cv::Size dst_size(letter_box.src_w, letter_box.src_h);
+
+    // 每张输入 mask 的元素个数
+    const int proto_stride = proto_width * proto_height;
+    // 每张输出 mask 的元素个数
+    const int dst_stride   = letter_box.src_w * letter_box.src_h;
+
+    // 取出 unique_ptr 的裸指针，方便做指针偏移
+    float* src_ptr = mask_matrix_mult_result.get();
+    float* dst_ptr = all_mask.get();
+
+
+    //进行逐张放缩
+                      for(int i=0; i<last_count; ++i)
+                      {
+                    cv::Mat proto(proto_height, proto_width, CV_32F, (void*)(src_ptr + i * proto_stride));  //原图包装乘一个Mat
+                    cv::Mat cropped = proto(roi_rect);  // cropped 也是“视图”，指向 proto 的子区域
+
+                    cv::Mat dst(letter_box.src_h, letter_box.src_w, CV_32F,(void*)(dst_ptr + i * dst_stride)); //让输出 Mat 直接指向 all_mask 对应区域 
+ 
+                    cv::resize(cropped, dst, dst_size, 0, 0, cv::INTER_LINEAR); //// 把 cropped 放缩到 dst_size，并写入 dst（也就是 all_mask 的那段内存）
+
+                      }
+
+                      return ;
+ } 

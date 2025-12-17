@@ -3,7 +3,7 @@
 #include <memory>
 
 #define NMS_THRESH 0.45f   //框重复的比例
-#define BOX_THRESH 0.7f    //置信度阈值
+#define BOX_THRESH 0.5f    //置信度阈值
 #define OBJ_NUMB_MAX_SIZE 256   //最大检测的数目
 
 

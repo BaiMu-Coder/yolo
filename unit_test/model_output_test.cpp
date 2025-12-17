@@ -3,6 +3,8 @@
 #include "yolov8seg.hpp"
 #include "image_process.hpp"
 
+#include <easy_timer.h>
+
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <unistd.h>
@@ -37,6 +39,8 @@ static int8_t qnt_f32_to_affine(float f32, int32_t zp, float scale)
 int main()
 {
 
+  TIMER T;
+
   int err=0;
 string path("day.jpg");
 cv::Mat frame11=cv::imread(path);
@@ -47,8 +51,14 @@ if(frame11.empty())
     return -1;
 }
 
+T.tik();
 image_process image(frame11);
 image.image_preprocessing(640,640);
+T.tok();
+T.print_time("image_preprocessing");
+
+
+
 int image_len;
 uint8_t* image_data=image.get_image_buffer(&image_len);
 if(!image_data)
@@ -59,23 +69,36 @@ if(!image_data)
 
 
 
+T.tik();
 yolov8seg yolo("best.rknn");
 yolo.init();
+T.tok();
+T.print_time("init ");
+T.tik();
 err=yolo.set_input_data(image_data,image_len);
  if(err!=RKNN_SUCC)
 {
   cout<<"set_input_data error"<<endl;
     return -1;
 }
+T.tok();
+T.print_time("set_input_data");
 
 
-
+T.tik();
 err=yolo.rknn_model_inference();
  if(err)
 {
   cout<<"rknn_model_inference error"<<endl;
     return -1;
 }
+T.tok();
+T.print_time("rknn_model_inference");
+
+
+
+
+
 err=yolo.get_output_data();
  if(err)
 {
@@ -84,31 +107,30 @@ err=yolo.get_output_data();
 }
 
 
-
 object_detect_result_list result;
 letterbox letter_box=image.get_letterbox();
 
 
 
-
+T.tik();
 err=yolo.post_process(result,letter_box);
  if(err<0)
 {
   cout<<"post_process error"<<endl;
     return -1;
 }
-
+T.tok();
+T.print_time("post_process");
 
 cout<<"result.count: "<<result.count<<endl;
 
 
-  cout<<"5555555555555555555555555555"<<endl;
 
-for(int i=0; i<result.count; ++i)
-{
-  cout<<"qqqqqqqqqqqqqq"<<endl;
-  cout<<result.results_box[i].x<<" "<<result.results_box[i].y<<" "<<result.results_box[i].w<<" "<<result.results_box[i].h<<endl;
-}
+// for(int i=0; i<result.count; ++i)
+// {
+//   cout<<"qqqqqqqqqqqqqq"<<endl;
+//   cout<<result.results_box[i].x<<" "<<result.results_box[i].y<<" "<<result.results_box[i].w<<" "<<result.results_box[i].h<<endl;
+// }
 
 
 

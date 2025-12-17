@@ -3,15 +3,15 @@
         {
             "name": "Linux",
             "includePath": [
-                "${workspaceFolder}/**",
-                "/home/baimu/tools/rk3588_cross_compiler/aarch64-buildroot-linux-gnu/sysroot/usr/include",
-                "/home/baimu/tools/rk3588_cross_compiler/aarch64-buildroot-linux-gnu/sysroot/usr/include/opencv4",
-                "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/3rdparty/rknpu2/include",  
-                "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/common",
-                "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/source",
-                "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/models",
-                "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/image_process",
-                "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/visual"
+                "${workspaceFolder}/**"
+                // "/home/baimu/tools/rk3588_cross_compiler/aarch64-buildroot-linux-gnu/sysroot/usr/include",
+                // "/home/baimu/tools/rk3588_cross_compiler/aarch64-buildroot-linux-gnu/sysroot/usr/include/opencv4",
+                // "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/3rdparty/rknpu2/include",  
+                // "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/common",
+                // "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/source",
+                // "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/models",
+                // "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/image_process",
+                // "/home/baimu/tools/SDK/project/yolo项目/yolov8seg/visual"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",

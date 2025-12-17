@@ -8,7 +8,8 @@
 #include "common.hpp"
 #include "post_process_seg.hpp"
 #include <opencv2/opencv.hpp>
-
+#include "Float16.h"
+#include "easy_timer.h"
 
 class yolov8seg
 {

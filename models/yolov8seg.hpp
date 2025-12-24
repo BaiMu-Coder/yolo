@@ -20,7 +20,7 @@ class yolov8seg
 
  
 
-  rknn_context *get_rknn_context();
+  rknn_context* get_rknn_context();
 
   int set_npu_core(rknn_core_mask core_mask);
 

@@ -50,8 +50,8 @@ void nms(int valid_count,std::vector<int>& index_flag,std::vector<float>& candid
 
 std::pair<int,int> box_reverse(letterbox& letter_box , float x,float y) ;
 
-int matrix_mult_by_npu_fp32(std::vector<rknpu2::float16>& filter_box_mask_coefficient,std::unique_ptr<rknpu2::float16[]>& proto,std::unique_ptr<float[]>& matrix_mult_result,int ROWS_A,int COLS_A,int COLS_B,rknn_context& ctx);
-void matrix_mult_by_cpu_fp32(std::vector<float>& A,std::unique_ptr<float[]>& B,std::unique_ptr<float[]>& C, int ROWS_A, int COLS_A, int COLS_B);
+int matrix_mult_by_npu_fp32(std::vector<rknpu2::float16>& filter_box_mask_coefficient,std::unique_ptr<rknpu2::float16[]>& proto,std::unique_ptr<float[]>& matrix_mult_result,int ROWS_A,int COLS_A,int COLS_B);
+void matrix_mult_by_cpu_fp32(std::vector<rknpu2::float16>& A,std::unique_ptr<rknpu2::float16[]>& B,std::unique_ptr<float[]>& C, int ROWS_A, int COLS_A, int COLS_B);
 
 
 void conbine_mak(std::unique_ptr<float[]>& mask_matrix_mult_result,std::unique_ptr<int8_t[]>& all_mask_in_one,std::vector<float>& filter_candidate_box_mask_conbine,std::vector<int>& mask_classid,int last_count,int proto_width,int proto_height);

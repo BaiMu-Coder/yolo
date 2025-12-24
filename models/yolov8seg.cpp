@@ -76,7 +76,7 @@ static void printf_rknn_tensor_attr(const rknn_tensor_attr *attr)
     std::cout << std::endl;
 }
 
-yolov8seg::yolov8seg(std::string model_path) : _model_path(model_path),_ctx(0) {}
+yolov8seg::yolov8seg(std::string model_path) : _model_path(model_path),_ctx(0) ,_output(nullptr),_input(nullptr){}
 
 
 yolov8seg::~yolov8seg()
@@ -272,16 +272,17 @@ LOG_ERROR("image_data is nullptr");
     return -1;
     }
  
+    if(!_input)
   _input=std::make_unique<rknn_input[]>(_input_number);
   memset(&(_input[0]),0,sizeof(rknn_input)*_input_number);
-//   memset(image_data,0,size);
+
   _input[0].buf=image_data;
   _input[0].index=0;
   _input[0].size=size;
   _input[0].pass_through=0;  //让RKNN做量化预处理
   _input[0].type = RKNN_TENSOR_UINT8;   //这里就填输入数据是什么格式填什么格式就行,老老实实告诉RKNN让他帮你做预处理
   _input[0].fmt=RKNN_TENSOR_NHWC;    
-   
+  
   return rknn_inputs_set(_ctx,1,&(_input[0]));
  }
 
@@ -295,7 +296,9 @@ LOG_ERROR("image_data is nullptr");
 
 int yolov8seg::get_output_data()
 {
+if(!_output)
  _output=std::make_unique<rknn_output[]>(_output_number);
+ 
  memset(&(_output[0]),0,sizeof(rknn_output)*_output_number);   //rknn_output一共五个成员变量，下面三个需要自己设置，另两个返回设置
  for(int i=0; i<_output_number; ++i)
  {
@@ -331,7 +334,8 @@ int yolov8seg::post_process(object_detect_result_list& result , letterbox& lette
    
     int valid_count=0;
 
-   
+
+
      int dfl_len =_output_tensor[0].dims[1] / 4;//用回归张量的通道数反推出 DFL 的桶数（= reg_max+1），后处理时用于 DFL 解码。 dims[1]就是物品的类别数
      //YOLOv8 / YOLOv5（从 6.x 开始）用的是DLF 回归框：
     // 不是直接输出 4 个值（cx, cy, w, h）
@@ -379,10 +383,11 @@ int yolov8seg::post_process(object_detect_result_list& result , letterbox& lette
       }
 
 
+
 xxx.tok();
 xxx.print_time("process_i8");
 
-std::cout<<"validCount size :"<<valid_count<<std::endl;
+// std::cout<<"validCount size :"<<valid_count<<std::endl;
       if(valid_count<=0)
       {
        return 0;   //未检测到物体
@@ -409,6 +414,7 @@ std::cout<<"validCount size :"<<valid_count<<std::endl;
           }
 
         
+
 
           //最后：把框筛选出来  以及 把mask系数也提取出来
 int last_count = 0;//记录最终的检测数量
@@ -450,6 +456,8 @@ result.count=last_count;
  //nms部分结束
  
 
+
+
     //框坐标转换，由放缩填充后的转换为原图坐标系
     for(int i=0;i<last_count;++i)
     {
@@ -462,6 +470,8 @@ result.count=last_count;
     }
 
 
+
+
   
     //计算mask掩码信息，用mask系数和proto来计算  （矩阵乘法）
     int ROWS_A=last_count;   //行数
@@ -472,8 +482,10 @@ result.count=last_count;
 auto mask_matrix_mult_result=std::unique_ptr<float[]>(new float[ROWS_A*COLS_B]);
 
 
+
+
    xxx.tik();
-int err=matrix_mult_by_npu_fp32(filter_box_mask_coefficient,proto,mask_matrix_mult_result,ROWS_A,COLS_A,COLS_B,_ctx); //直接拿浮点数进行计算，整体体量小,量化int8提升也很小
+int err=matrix_mult_by_npu_fp32(filter_box_mask_coefficient,proto,mask_matrix_mult_result,ROWS_A,COLS_A,COLS_B); //直接拿浮点数进行计算，整体体量小,量化int8提升也很小
  if(err!=RKNN_SUCC)
  {
    LOG_ERROR("matrix_mult_by_npu_fp32 fail, errno:%d", err);
@@ -484,6 +496,11 @@ int err=matrix_mult_by_npu_fp32(filter_box_mask_coefficient,proto,mask_matrix_mu
 // matrix_mult_by_cpu_fp32(filter_box_mask_coefficient,proto,mask_matrix_mult_result,ROWS_A,COLS_A,COLS_B);
 xxx.tok();
 xxx.print_time("matrix_mult_by_npu_fp32");
+
+
+
+
+
 
 
 #ifdef XXX
@@ -566,8 +583,13 @@ xxx.print_time("方案2----2");
 
 
 
+
 return 0;
  }
  
 
 
+rknn_context* yolov8seg::get_rknn_context()
+  {
+    return &_ctx;
+  }

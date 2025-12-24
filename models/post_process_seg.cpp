@@ -462,10 +462,10 @@ static float clamp(float val, float min, float max)
 
 
 
-int matrix_mult_by_npu_fp32(std::vector<rknpu2::float16>& filter_box_mask_coefficient,std::unique_ptr<rknpu2::float16[]>& proto,std::unique_ptr<float[]>& matrix_mult_result,int ROWS_A,int COLS_A,int COLS_B,rknn_context& ctx )
+int matrix_mult_by_npu_fp32(std::vector<rknpu2::float16>& filter_box_mask_coefficient,std::unique_ptr<rknpu2::float16[]>& proto,std::unique_ptr<float[]>& matrix_mult_result,int ROWS_A,int COLS_A,int COLS_B )
 {
 
-  TIMER xxx;
+TIMER xxx;
 xxx.tik();
 //1.初始化矩阵乘法的上下文
 rknn_matmul_info info;  //传入矩阵的相关信息
@@ -481,7 +481,8 @@ info.AC_layout=RKNN_MM_LAYOUT_NORM;
 rknn_matmul_io_attr io_attr;
 memset(&io_attr,0,sizeof(rknn_matmul_io_attr));
 
-int err=rknn_matmul_create(&ctx,&info,&io_attr);
+rknn_matmul_ctx ctx;
+int err=rknn_matmul_create(&ctx,&info,&io_attr);  //单独建一个 matmul 专用的 ctx 变量
 if(err!=RKNN_SUCC)
 {
   LOG_ERROR("rknn_matmul_create fail,errno:%d",err);
@@ -567,12 +568,12 @@ if(C==NULL)
     if (B) rknn_destroy_mem(ctx, B);
     if (C) rknn_destroy_mem(ctx, C);
 
-
+  rknn_destroy(ctx);
 
     return 0;
 }
 
-void matrix_mult_by_cpu_fp32(std::vector<float>& A,std::unique_ptr<float[]>& B,std::unique_ptr<float[]>& C, int ROWS_A, int COLS_A, int COLS_B)
+void matrix_mult_by_cpu_fp32(std::vector<rknpu2::float16>& A,std::unique_ptr<rknpu2::float16[]>& B,std::unique_ptr<float[]>& C, int ROWS_A, int COLS_A, int COLS_B)
 {
     float temp = 0;
     for (int i = 0; i < ROWS_A; i++)
@@ -620,6 +621,11 @@ int real_x=letter_box.src_w;
 int real_y=letter_box.src_h;
 int len=real_x*real_y;
 int n=result.count;
+
+result.results_mask->each_of_mask.resize(n+3);
+for(int i=0; i<n+3;++i)
+result.results_mask->each_of_mask[i]=nullptr;
+
 for(int i=0; i<n; ++i)
 {
 int x1=result.results_box[i].x;
@@ -628,17 +634,27 @@ int x2=result.results_box[i].w+x1;
 int y2=result.results_box[i].h+y1;
 if (x2 <= x1 || y2 <= y1) continue;
 
+auto tem_mask=std::make_unique<uint8_t[]>(real_x*real_y);
+
 for(int y=y1; y<y2; ++y)
 {
 for(int x=x1; x<x2; ++x)
 {
+if(all_mask[i*len+y*real_x+x]>0)
+ tem_mask[y*real_x+x]=result.results_box[i].cls_id+1;   //记录每一个单独的掩码
+
   if(all_mask_in_one[y*real_x+x]==0)
   if(all_mask[i*len+y*real_x+x]>0)
     all_mask_in_one[y*real_x+x]=result.results_box[i].cls_id+1;
 }
 }
+result.results_mask->each_of_mask[result.results_box[i].cls_id]=std::move(tem_mask);  //因为我们最多预测出来三个种类嘛
 }
 }
+
+
+
+
 
 
 
@@ -747,3 +763,17 @@ void resize_by_opencv_fp(std::unique_ptr<float[]>& mask_matrix_mult_result,int l
 
                       return ;
  } 
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 

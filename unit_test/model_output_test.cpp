@@ -36,13 +36,14 @@ static int8_t qnt_f32_to_affine(float f32, int32_t zp, float scale)
 
 
 
-int main()
+int main(int argv , char* argc[])
 {
 
   TIMER T;
 
+
   int err=0;
-string path("day.jpg");
+string path((argc[1]));
 cv::Mat frame11=cv::imread(path);
 cv::Mat frame=cv::imread(path);
 if(frame11.empty())
@@ -140,15 +141,19 @@ cout<<"result.count: "<<result.count<<endl;
 cv::Point pt1(result.results_box[i].x, result.results_box[i].y);   // 左上角
 cv::Point pt2(result.results_box[i].x+result.results_box[i].w ,  result.results_box[i].y+result.results_box[i].h);   // 右下角
 cv::Scalar color(0, 0, 255);
-cv::rectangle(frame, pt1, pt2, color, 0);  // thickness<0 就填充  
+cv::rectangle(frame, pt1, pt2, color, 2);  // thickness<0 就填充  
         }
 
 
+     double alpha = 0.5;  // 透明度，可以自己调 0~1
         // draw mask
      // draw mask
     // 掩码：尺寸与 frame 一样，0 = 背景，>0 = 前景
+
+if(result.results_mask[0].each_of_mask[0])
+{
     cv::Mat mask(frame.rows, frame.cols, CV_8UC1,
-                 result.results_mask[0].seg_mask.get());
+                 result.results_mask[0].each_of_mask[0].get());
 
     // 只要 > 0 就认为是前景
     cv::Mat fgMask = (mask > 0);
@@ -163,8 +168,67 @@ cv::rectangle(frame, pt1, pt2, color, 0);  // thickness<0 就填充
     overlay.setTo(maskColor, fgMask);
 
     // 半透明叠加到原图上
-    double alpha = 0.5;  // 透明度，可以自己调 0~1
+
     cv::addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame);
+  }
+
+
+
+
+         // draw mask
+    // 掩码：尺寸与 frame 一样，0 = 背景，>0 = 前景
+if(result.results_mask[0].each_of_mask[1]){
+    cv::Mat mask1(frame.rows, frame.cols, CV_8UC1,
+                 result.results_mask[0].each_of_mask[1].get());
+
+    // 只要 > 0 就认为是前景
+    cv::Mat fgMask1 = (mask1 > 0);
+
+    // 做一个 overlay
+    cv::Mat overlay1 = frame.clone();
+
+    // 想要的掩码颜色（BGR）这里用红色
+    cv::Scalar maskColor1(0, 255, 0);
+
+    // 把前景区域涂成红色
+    overlay1.setTo(maskColor1, fgMask1);
+
+    // 半透明叠加到原图上
+    cv::addWeighted(overlay1, alpha, frame, 1.0 - alpha, 0, frame);
+    }
+
+
+    
+             // draw mask
+    // 掩码：尺寸与 frame 一样，0 = 背景，>0 = 前景
+if(result.results_mask[0].each_of_mask[2])
+{
+    cv::Mat mask2(frame.rows, frame.cols, CV_8UC1,
+                 result.results_mask[0].each_of_mask[2].get());
+
+    // 只要 > 0 就认为是前景
+    cv::Mat fgMask2 = (mask2 > 0);
+
+    // 做一个 overlay
+    cv::Mat overlay2 = frame.clone();
+
+    // 想要的掩码颜色（BGR）这里用红色
+    cv::Scalar maskColor2(255, 255, 0);
+
+    // 把前景区域涂成红色
+    overlay2.setTo(maskColor2, fgMask2);
+
+    // 半透明叠加到原图上
+    cv::addWeighted(overlay2, alpha, frame, 1.0 - alpha, 0, frame);
+
+    }
+
+
+
+
+
+
+
 
 cv::imshow("1",frame);
 cv::waitKey(0);

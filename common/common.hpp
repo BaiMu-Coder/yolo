@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdio>
 #include <memory>
+#include <vector>
+
 
 #define NMS_THRESH 0.45f   //框重复的比例
 #define BOX_THRESH 0.5f    //置信度阈值
@@ -58,6 +60,7 @@ typedef struct
 typedef struct
 {
   std::unique_ptr<uint8_t[]> seg_mask;
+  std::vector<std::unique_ptr<uint8_t[]>> each_of_mask;   //此项目定制 记录每个类别的掩码
 } object_segment_result;
 
 typedef struct
@@ -66,4 +69,8 @@ typedef struct
     object_detect_result results_box[OBJ_NUMB_MAX_SIZE];
     object_segment_result results_mask[1];  //所有mask合并为1个 放在这里
 } object_detect_result_list;
+
+
+
+
 

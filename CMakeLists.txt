@@ -16,7 +16,7 @@ set(CMAKE_SYSROOT ${TOOLCHAIN_DIR}/aarch64-buildroot-linux-gnu/sysroot)   #设�
 #正式内容
 message(STATUS "cmake version ${CMAKE_VERSION}")
 project(yolov8seg)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_INSTALL_PREFIX  ${CMAKE_CURRENT_SOURCE_DIR}/install)
 
 
@@ -48,11 +48,13 @@ include_directories(
     #各模块
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/image_process
-    ${CMAKE_CURRENT_SOURCE_DIR}/infer_pool
+    ${CMAKE_CURRENT_SOURCE_DIR}/npu_infer_pool
     ${CMAKE_CURRENT_SOURCE_DIR}/models
     ${CMAKE_CURRENT_SOURCE_DIR}/source
     ${CMAKE_CURRENT_SOURCE_DIR}/thread_pool
     ${CMAKE_CURRENT_SOURCE_DIR}/visual
+    ${CMAKE_CURRENT_SOURCE_DIR}/business
+    ${CMAKE_CURRENT_SOURCE_DIR}/block_queue
 
     #三方库
     ${OpenCV_INCLUDE_DIRS}   

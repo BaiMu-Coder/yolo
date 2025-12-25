@@ -1,410 +1,399 @@
 // 功能：
-// 1) 给定 images_root / labels_root / prefixes (逗号分隔)
-// 2) 在 images_root 下查找所有 “目录名匹配任意 prefix” 的子目录
-// 3) 对每个子目录 D：读取 D 里的所有图片
-// 4) 去 labels_root/D 里读取同名标签（默认 .txt）
-// 5) 处理图片并保存数据
+// 1) 给一个文件夹，递归读取所有图片
+// 2) YOLOv8Seg 推理
+// 3) 对每个检测：画框 + 椭圆拟合（优先 mask），失败则画“内切圆”
+// 4) 如果整张图没有任何检测：Canny -> 找最大轮廓 -> minEnclosingCircle 画圆
 //
-// 编译（Linux/macOS）：
-//   g++ -std=c++17 main.cpp `pkg-config --cflags --libs opencv4` -o app
+// 编译：
+// g++ -std=c++17 main.cpp `pkg-config --cflags --libs opencv4` -O2 -o app
 //
-// 运行示例（支持多个前缀，用逗号隔开）：
-//   ./app /path/to/images /path/to/labels "scene_01,scene_03"
+// 运行：
+// ./app <image_folder> <model.rknn> [out_dir] [--show]
 
 #include <opencv2/opencv.hpp>
 #include <filesystem>
 #include <algorithm>
 #include <iostream>
-#include <fstream>
-#include <sstream>
 #include <vector>
 #include <string>
 #include <optional>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 #include "yolov8seg.hpp"
 #include "image_process.hpp"
 #include "common.hpp"
 
-using namespace std;
 namespace fs = std::filesystem;
 
-// ---------- 判断是否图片 ----------
+// -------------------- 是否图片 --------------------
 static bool isImageFile(const fs::path &p)
 {
-    if (!p.has_extension())
-        return false;
+    if (!p.has_extension()) return false;
     std::string ext = p.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c)
-                   { return std::tolower(c); });
+                   [](unsigned char c){ return std::tolower(c); });
 
     static const std::vector<std::string> exts = {
-        ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"};
+        ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"
+    };
     return std::find(exts.begin(), exts.end(), ext) != exts.end();
 }
 
-// ---------- 判断字符串前缀 ----------
-static bool startsWith(const std::string &s, const std::string &prefix)
+// -------------------- 安全保存 --------------------
+static bool saveImage(const cv::Mat &img, const fs::path &outPath)
 {
-    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
-}
-
-// ---------- [新功能] 按逗号分割字符串 ----------
-static std::vector<std::string> splitByComma(const std::string& s) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (char ch : s) {
-        if (ch == ',') {
-            if (!cur.empty()) out.push_back(cur);
-            cur.clear();
-        } else if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') {
-            cur.push_back(ch);
-        }
-    }
-    if (!cur.empty()) out.push_back(cur);
-    return out;
-}
-
-// ---------- [新功能] 匹配任意前缀 ----------
-static bool matchAnyPrefix(const std::string& name, const std::vector<std::string>& prefixes) {
-    for (const auto& p : prefixes) {
-        if (!p.empty() && startsWith(name, p)) return true;
-    }
-    return false;
-}
-
-// ---------- YOLO 单行标签：class_id + 4个数 ----------
-struct Label4
-{
-    int id = -1;                       // class_id
-    double a = 0, b = 0, c = 0, d = 0; // xc, yc, w, h（归一化）
-};
-
-// ---------- 读同名标签文件 ----------
-static std::optional<Label4> readLabel4ForImage(const fs::path &imagePath,
-                                                const fs::path &labelDir,
-                                                const std::string &labelExt = ".txt")
-{
-    std::string stem = imagePath.stem().string();      // 001.jpg -> "001"
-    fs::path labelPath = labelDir / (stem + labelExt); // labels/001.txt
-
-    if (!fs::exists(labelPath) || !fs::is_regular_file(labelPath))
-        return std::nullopt;
-
-    std::ifstream ifs(labelPath);
-    if (!ifs.is_open())
-        return std::nullopt;
-
-    std::stringstream buffer;
-    buffer << ifs.rdbuf();
-    std::string content = buffer.str();
-    for (char &ch : content)
-        if (ch == ',')
-            ch = ' ';
-
-    std::istringstream iss(content);
-    Label4 lab;
-    if (!(iss >> lab.id >> lab.a >> lab.b >> lab.c >> lab.d))
-        return std::nullopt;
-
-    return lab;
-}
-
-// 图像最终保存
-bool saveImage(const cv::Mat &img, const std::string &outPath)
-{
-    fs::path p(outPath);
-    if (p.has_parent_path())
-    {
-        fs::create_directories(p.parent_path());
-    }
-    if (!cv::imwrite(outPath, img))
-    {
-        std::cerr << "Failed to save image: " << outPath << std::endl;
+    if (outPath.has_parent_path()) fs::create_directories(outPath.parent_path());
+    if (!cv::imwrite(outPath.string(), img)) {
+        std::cerr << "Failed to save: " << outPath << "\n";
         return false;
     }
     return true;
 }
 
-// ---------- 处理逻辑 ----------
-static void processImage(const cv::Mat &img,
-                         const std::string &imgPath,
-                         const std::optional<Label4> &labelOpt,
-                         yolov8seg &yolo,
-                         std::vector<double>& src_x, std::vector<double>& src_y,
-                         std::vector<double>& detect_x, std::vector<double>& detect_y,
-                         std::vector<double>& Deviation_x, std::vector<double>& Deviation_y)
-{
-    if (!labelOpt.has_value())
-    {
-        std::cerr << "[WARN] No/Bad label for: " << imgPath << "\n";
-        return;
-    }
 
-    const Label4 &lab = labelOpt.value();
-    int W = img.cols, H = img.rows;
+static inline void overlay_mask_roi(
+    cv::Mat& bgr,
+    const cv::Rect& roi,
+    const cv::Mat& full_mask_u8,   // 与原图同尺寸的 0/255 mask
+    const cv::Scalar& color_bgr,   // 叠加颜色
+    float alpha = 0.45f            // 透明度
+){
+    if (full_mask_u8.empty() || full_mask_u8.type() != CV_8U) return;
+    cv::Rect r = roi & cv::Rect(0,0,bgr.cols,bgr.rows);
+    if (r.width <= 0 || r.height <= 0) return;
 
-    double cx = lab.a * W;
-    double cy = lab.b * H;
-    src_x.push_back(cx);
-    src_y.push_back(cy);
-    double bw = lab.c * W;
-    double bh = lab.d * H;
-
-    int x1 = (int)std::round(cx - bw / 2.0);
-    int y1 = (int)std::round(cy - bh / 2.0);
-    int x2 = (int)std::round(cx + bw / 2.0);
-    int y2 = (int)std::round(cy + bh / 2.0);
-
-    x1 = std::max(0, std::min(x1, W - 1));
-    y1 = std::max(0, std::min(y1, H - 1));
-    x2 = std::max(0, std::min(x2, W - 1));
-    y2 = std::max(0, std::min(y2, H - 1));
-
-    cv::Mat vis = img.clone();
-    cv::rectangle(vis, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
-    int xx = (x1 + x2) >> 1;
-    int yy = (y1 + y2) >> 1;
-    cv::circle(vis, cv::Point(xx, yy), 3, cv::Scalar(0, 255, 0), -1);
-
-    cv::putText(vis, "Drogue",
-                cv::Point(x1, std::max(0, y1 - 5)),
-                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-
-    cv::Mat test_img = img.clone();
-    image_process ip(test_img);
-
-    ip.image_preprocessing(640, 640);
-    int img_len;
-    uint8_t *buffer = ip.get_image_buffer(&img_len);
-    if (!buffer) { cout << "get_image_buffer error" << endl; return; }
-
-    int err = yolo.set_input_data(buffer, img_len);
-    if (err != 0) { std::cout << "yolo set_input_data error" << std::endl; return; }
-
-    err = yolo.rknn_model_inference();
-    if (err != 0) { std::cout << "yolo rknn_model_inference error" << std::endl; return; }
-
-    err = yolo.get_output_data();
-    if (err != 0) { std::cout << "yolo get_output_data error" << std::endl; return; }
-
-    object_detect_result_list result;
-    letterbox letter_box = ip.get_letterbox();
-
-    err = yolo.post_process(result, letter_box);
-    if (err < 0) { std::cout << "post_process error" << std::endl; return; }
-
-    for (int i = 0; i < result.count; i++)
-    {
-        double temx1 = result.results_box[i].x;
-        double temy1 = result.results_box[i].y;
-        double temx2 = result.results_box[i].w + temx1;
-        double temy2 = result.results_box[i].h + temy1;
-        cv::Point pt1(temx1, temy1);
-        cv::Point pt2(temx2, temy2);
-        cv::Scalar color(0, 0, 255);
-        cv::rectangle(vis, pt1, pt2, color, 2);
-
-        if (i == 0)
-        {
-            double zz1 = (temx1 + temx2) / 2;
-            double zz2 = (temy1 + temy2) / 2;
-            cv::circle(vis, cv::Point(zz1, zz2), 3, cv::Scalar(0, 0, 255), -1);
-            
-            detect_x.push_back(zz1);
-            detect_y.push_back(zz2);
-            Deviation_x.push_back(zz1 - cx);
-            Deviation_y.push_back(zz2 - cy);
-
-            std::string text = "Ref: (" + std::to_string(cx) + ", " + std::to_string(cy) + ")";
-            cv::putText(vis, text, cv::Point(20, 100), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 255, 0), 3);
-
-            std::string text1 = "Det: (" + std::to_string(zz1) + ", " + std::to_string(zz2) + ")";
-            cv::putText(vis, text1, cv::Point(20, 200), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 3);
-
-            std::string text2 = "Err: (" + std::to_string(zz1 - cx) + ", " + std::to_string(zz2 - cy) + ")";
-            cv::putText(vis, text2, cv::Point(20, 300), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 0, 0), 3);
+    for (int y = r.y; y < r.y + r.height; ++y) {
+        cv::Vec3b* p = bgr.ptr<cv::Vec3b>(y);
+        const uchar* m = full_mask_u8.ptr<uchar>(y);
+        for (int x = r.x; x < r.x + r.width; ++x) {
+            if (m[x] == 0) continue;
+            p[x][0] = cv::saturate_cast<uchar>(p[x][0] * (1 - alpha) + color_bgr[0] * alpha);
+            p[x][1] = cv::saturate_cast<uchar>(p[x][1] * (1 - alpha) + color_bgr[1] * alpha);
+            p[x][2] = cv::saturate_cast<uchar>(p[x][2] * (1 - alpha) + color_bgr[2] * alpha);
         }
     }
-
-    // 1. 使用 filesystem 解析原始路径
-    fs::path originalPath(imgPath);
-
-    // 2. 提取不带扩展名的文件名 (例如 "001")
-    std::string stem = originalPath.stem().string();
-
-    // 3. 提取父目录名 (例如 "scene_01")，用于保持输出目录结构
-    std::string parentDirName = originalPath.parent_path().filename().string();
-
-    // 4. 定义一个统一的输出根目录，例如 "results"
-    fs::path outputRoot("results_iamge");
-
-    // 5. 构造完整的输出路径：results / scene_01 / 001_result.jpg
-    // 这样既不会覆盖，又能保持原始的目录结构
-    fs::path outputDir = outputRoot / parentDirName;
-    fs::path outputPath = outputDir / (stem + "_result.jpg");
-
-    // 6. 调用 saveImage 保存。saveImage 会自动创建不存在的目录。
-    std::cout << "Saving result to: " << outputPath.string() << std::endl;
-    saveImage(vis, outputPath.string());
-
-
-
-    cv::imshow("vis", vis);
-    cv::waitKey(1); // 1ms delay for display
-
-    yolo.release_output_data();
 }
 
-int main(int argc, char **argv)
+
+// ============================================================
+// 兜底 1：从检测框得到“内切圆”
+// ============================================================
+static void draw_inscribed_circle(cv::Mat& vis, const object_detect_result& det, const cv::Scalar& color)
 {
-    // 修改用法说明
-    if (argc < 4)
-    {
-        std::cerr << "Usage: " << argv[0] << " <images_root> <labels_root> <prefixes_comma_separated>\n";
-        std::cerr << "Example: " << argv[0] << " ./data/images ./data/labels \"scene_01,scene_03\"\n";
+    float cx = det.x + det.w * 0.5f;
+    float cy = det.y + det.h * 0.5f;
+    float r  = 0.5f * std::min(det.w, det.h);
+    cv::circle(vis, cv::Point2f(cx, cy), (int)std::round(r), color, 2);
+    cv::circle(vis, cv::Point2f(cx, cy), 2, color, -1);
+}
+
+// ============================================================
+// 兜底 2：整张图没检测出来 -> Canny 提取圆（用轮廓最大内接圆）
+// ============================================================
+static bool fallback_circle_by_canny(const cv::Mat& bgr, cv::Point2f& bestCenter, float& bestR)
+{
+    cv::Mat gray, blurImg, edges;
+    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, blurImg, cv::Size(5,5), 1.2);
+    cv::Canny(blurImg, edges, 50, 150);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (contours.empty()) return false;
+
+    bestR = 0.0f;
+    for (const auto& c : contours) {
+        if (c.size() < 20) continue; // 太小的边缘噪声忽略
+        cv::Point2f cc;
+        float rr = 0.0f;
+        cv::minEnclosingCircle(c, cc, rr);
+        if (rr > bestR) {
+            bestR = rr;
+            bestCenter = cc;
+        }
+    }
+    return bestR > 5.0f; // 半径太小就不算
+}
+
+// ============================================================
+// 椭圆拟合：优先 mask 拟合，失败则返回 “内切圆”
+// 注：这里假设 raw_mask_ptr 是与原图同尺寸的 8UC1 mask（你项目里就是这么用的）
+// ============================================================
+struct EllipseFitResult {
+    bool ok = false;
+    bool from_mask = false;
+    cv::RotatedRect ellipse;
+};
+
+static EllipseFitResult fit_ellipse_from_mask_or_fallback(
+    const cv::Mat& frame,
+    const object_detect_result& det,
+    uint8_t* raw_mask_ptr,
+    float deviation_threshold = 0.3f
+){
+    EllipseFitResult out;
+
+    // box roi
+    int x = std::max(0, det.x);
+    int y = std::max(0, det.y);
+    int w = std::min((int)det.w, frame.cols - x);
+    int h = std::min((int)det.h, frame.rows - y);
+    if (w <= 0 || h <= 0) return out;
+
+    cv::Point2f box_center(x + w * 0.5f, y + h * 0.5f);
+
+    bool fit_success = false;
+    cv::RotatedRect fitted;
+
+    // --- 尝试 mask 拟合 ---
+    if (raw_mask_ptr) {
+        // ⚠️ 假设 mask 与 frame 同尺寸（你原代码/池子里也是这么构造的）
+        cv::Mat full_mask(frame.rows, frame.cols, CV_8UC1, raw_mask_ptr);
+        cv::Rect roi_rect(x, y, w, h);
+        cv::Mat roi_mask = full_mask(roi_rect);
+
+        // findContours 会改数据，所以 clone 一份
+        cv::Mat contour_input = roi_mask.clone();
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(contour_input, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        if (!contours.empty()) {
+            // 选点最多的轮廓
+            auto max_itr = std::max_element(
+                contours.begin(), contours.end(),
+                [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b){
+                    return a.size() < b.size();
+                }
+            );
+
+            if (max_itr->size() >= 5) {
+                cv::RotatedRect local = cv::fitEllipse(*max_itr);
+                local.center.x += x;
+                local.center.y += y;
+
+                // 偏差校验：mask 椭圆中心不能离 box 中心太远
+                float dist = cv::norm(local.center - box_center);
+                float limit = std::min((float)w, (float)h) * deviation_threshold;
+                if (dist <= limit) {
+                    fitted = local;
+                    fit_success = true;
+                }
+            }
+        }
+    }
+
+    if (fit_success) {
+        out.ok = true;
+        out.from_mask = true;
+        out.ellipse = fitted;
+        return out;
+    }
+
+    // --- 失败：返回“box 内切圆”（用 RotatedRect 表示一个正圆） ---
+    float r = 0.5f * std::min((float)w, (float)h);
+    out.ok = true;
+    out.from_mask = false;
+    out.ellipse = cv::RotatedRect(box_center, cv::Size2f(2*r, 2*r), 0.0f);
+    return out;
+}
+
+// ============================================================
+// 单张图片处理：推理 + 绘制
+// ============================================================
+static bool processOneImage(
+    const cv::Mat& img_bgr,
+    const fs::path& imgPath,
+    yolov8seg& yolo,
+    const fs::path& outDir,
+    bool show
+){
+    if (img_bgr.empty()) return false;
+
+    cv::Mat vis = img_bgr.clone();
+
+    // ---------- 推理（保持你原来的调用方式） ----------
+    cv::Mat tmp = img_bgr.clone();
+    image_process ip(tmp);
+    ip.image_preprocessing(640, 640);
+
+    int img_len = 0;
+    uint8_t* buffer = ip.get_image_buffer(&img_len);
+    if (!buffer) {
+        std::cerr << "get_image_buffer error: " << imgPath << "\n";
+        return false;
+    }
+
+    int err = yolo.set_input_data(buffer, img_len);
+    if (err != 0) { std::cerr << "set_input_data error\n"; return false; }
+
+    err = yolo.rknn_model_inference();
+    if (err != 0) { std::cerr << "rknn_model_inference error\n"; return false; }
+
+    err = yolo.get_output_data();
+    if (err != 0) { std::cerr << "get_output_data error\n"; return false; }
+
+    object_detect_result_list result;
+    letterbox lb = ip.get_letterbox();
+
+    err = yolo.post_process(result, lb);
+    if (err < 0) {
+        std::cerr << "post_process error\n";
+        yolo.release_output_data();
+        return false;
+    }
+
+    // ---------- 画检测框 + 椭圆/内切圆 ----------
+    if (result.count > 0) {
+        const auto& seg_result = result.results_mask[0];
+
+        for (int i = 0; i < result.count; ++i) {
+            const auto& det = result.results_box[i];
+
+            // box
+            int x = std::max(0, det.x);
+            int y = std::max(0, det.y);
+            int w = std::min((int)det.w, vis.cols - x);
+            int h = std::min((int)det.h, vis.rows - y);
+            if (w <= 0 || h <= 0) continue;
+
+            cv::Rect box(x, y, w, h);
+            cv::rectangle(vis, box, cv::Scalar(0, 0, 255), 2);
+
+            // label
+            char text[128];
+            std::snprintf(text, sizeof(text), "cls=%d conf=%.2f", det.cls_id, det.prop);
+            cv::putText(vis, text, cv::Point(x, std::max(0, y-5)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0,0,255), 2);
+
+            // mask ptr（按你的 each_of_mask 习惯：用 cls_id 索引）
+            uint8_t* raw_mask_ptr = nullptr;
+            int cid = det.cls_id;
+            if (cid >= 0 && cid < (int)seg_result.each_of_mask.size()) {
+                if (seg_result.each_of_mask[cid]) {
+                    raw_mask_ptr = seg_result.each_of_mask[cid].get();
+                    // 画 mask 叠加（如果有 mask）
+if (raw_mask_ptr) {
+    cv::Mat full_mask(vis.rows, vis.cols, CV_8UC1, raw_mask_ptr);
+
+    // 给不同类一个颜色（你可以自己改）
+    cv::Scalar color;
+    if (det.cls_id % 3 == 0) color = cv::Scalar(0, 0, 255);      // 红
+    else if (det.cls_id % 3 == 1) color = cv::Scalar(0, 255, 0); // 绿
+    else color = cv::Scalar(255, 255, 0);                        // 青
+
+    overlay_mask_roi(vis, box, full_mask, color, 0.45f);
+}
+
+                }
+            }
+
+            // fit ellipse (mask优先)，失败则内切圆
+            EllipseFitResult e = fit_ellipse_from_mask_or_fallback(vis, det, raw_mask_ptr, 0.2f);
+
+            if (e.ok) {
+                cv::Scalar ec = e.from_mask ? cv::Scalar(0,255,0) : cv::Scalar(0,255,255); // mask绿 / 兜底黄
+                // 画椭圆（如果是兜底，这里画的是圆）
+                cv::ellipse(vis, e.ellipse, ec, 2);
+                cv::circle(vis, e.ellipse.center, 2, ec, -1);
+            } else {
+                // 极端兜底（一般不会到这里）：直接画内切圆
+                draw_inscribed_circle(vis, det, cv::Scalar(0,255,255));
+            }
+        }
+    } else {
+        // ---------- 没任何检测：Canny 提取圆 ----------
+        cv::Point2f c;
+        float r = 0.f;
+        bool ok = fallback_circle_by_canny(vis, c, r);
+        if (ok) {
+            cv::circle(vis, c, (int)std::round(r), cv::Scalar(255, 0, 255), 3);
+            cv::circle(vis, c, 3, cv::Scalar(255, 0, 255), -1);
+            cv::putText(vis, "Canny fallback circle", cv::Point(20, 40),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(255,0,255), 2);
+        } else {
+            cv::putText(vis, "No det & no circle found", cv::Point(20, 40),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0,0,255), 2);
+        }
+    }
+
+    yolo.release_output_data();
+
+    // ---------- 保存 ----------
+    // 保持相对路径结构：out_dir / relative_path / xxx_vis.jpg
+    // 这里只用文件名，不包含子目录的话也行
+    fs::path outPath = outDir / (imgPath.stem().string() + "_vis.jpg");
+    saveImage(vis, outPath);
+
+    // ---------- 可选显示 ----------
+    if (show) {
+        cv::imshow("vis", vis);
+        int k = cv::waitKey(1);
+        if (k == 27 || k == 'q') return false; // 提前退出
+    }
+
+    return true;
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <image_folder> <model.rknn> [out_dir] [--show]\n";
+        std::cerr << "Example: " << argv[0] << " ./images best.rknn ./out --show\n";
         return 1;
     }
 
-    fs::path imagesRoot = argv[1];
-    fs::path labelsRoot = argv[2];
-    std::string prefixInput = argv[3]; // 获取逗号分隔的字符串
+    fs::path inDir = argv[1];
+    std::string modelPath = argv[2];
+    fs::path outDir = (argc >= 4 && std::string(argv[3]).rfind("--", 0) != 0) ? fs::path(argv[3]) : fs::path("out_vis");
 
-    if (!fs::exists(imagesRoot) || !fs::is_directory(imagesRoot))
-    {
-        std::cerr << "Error: images_root invalid: " << imagesRoot << "\n";
-        return 1;
-    }
-    if (!fs::exists(labelsRoot) || !fs::is_directory(labelsRoot))
-    {
-        std::cerr << "Error: labels_root invalid: " << labelsRoot << "\n";
-        return 1;
+    bool show = false;
+    for (int i = 3; i < argc; ++i) {
+        if (std::string(argv[i]) == "--show") show = true;
     }
 
-    // 1) 解析前缀列表
-    std::vector<std::string> prefixes = splitByComma(prefixInput);
-    std::cout << "Target Prefixes: ";
-    for(auto& p : prefixes) std::cout << "[" << p << "] ";
-    std::cout << "\n";
+    if (!fs::exists(inDir) || !fs::is_directory(inDir)) {
+        std::cerr << "Input folder invalid: " << inDir << "\n";
+        return 1;
+    }
 
-    // 2) 查找 images_root 下匹配任意前缀的子目录
-    std::vector<fs::path> matchedImageDirs;
-    for (const auto &entry : fs::directory_iterator(imagesRoot))
-    {
-        if (!entry.is_directory())
+    // 初始化 yolo
+    yolov8seg yolo(modelPath.c_str());
+    if (yolo.init() != 0) {
+        std::cerr << "yolo init failed: " << modelPath << "\n";
+        return 1;
+    }
+
+    if (show) {
+        cv::namedWindow("vis", cv::WINDOW_NORMAL);
+        cv::resizeWindow("vis", 1280, 720);
+    }
+
+    // 收集所有图片（递归）
+    std::vector<fs::path> images;
+    for (auto& p : fs::recursive_directory_iterator(inDir)) {
+        if (!p.is_regular_file()) continue;
+        if (isImageFile(p.path())) images.push_back(p.path());
+    }
+    std::sort(images.begin(), images.end());
+
+    std::cout << "Found images: " << images.size() << "\n";
+    fs::create_directories(outDir);
+
+    for (const auto& imgPath : images) {
+        cv::Mat img = cv::imread(imgPath.string(), cv::IMREAD_COLOR);
+        if (img.empty()) {
+            std::cerr << "imread failed: " << imgPath << "\n";
             continue;
-        std::string dirName = entry.path().filename().string();
-        
-        // 使用多前缀匹配函数
-        if (matchAnyPrefix(dirName, prefixes))
-        {
-            matchedImageDirs.push_back(entry.path());
         }
+
+        bool ok = processOneImage(img, imgPath, yolo, outDir, show);
+        if (!ok) break;
     }
 
-    if (matchedImageDirs.empty())
-    {
-        std::cerr << "No sub-directories matched prefixes under: " << imagesRoot << "\n";
-        return 0;
+    if (show) {
+        std::cout << "Press any key to exit...\n";
+        cv::waitKey(0);
     }
 
-    std::cout << "Matched dirs count: " << matchedImageDirs.size() << "\n";
-
-    // 初始化模型
-    yolov8seg yolo("best.rknn");
-    yolo.init();
-
-    std::vector<double> Deviation_x;
-    std::vector<double> Deviation_y;
-    std::vector<double> src_x;
-    std::vector<double> src_y;
-    std::vector<double> detect_x;
-    std::vector<double> detect_y;
-
-    // 3) 逐目录处理
-    for (const auto &imgDir : matchedImageDirs)
-    {
-        std::string dirName = imgDir.filename().string();
-        fs::path labelDir = labelsRoot / dirName;
-
-        if (!fs::exists(labelDir) || !fs::is_directory(labelDir))
-        {
-            std::cerr << "[WARN] Label dir missing: " << labelDir << "\n";
-        }
-
-        std::vector<fs::path> images;
-        for (const auto &e : fs::directory_iterator(imgDir))
-        {
-            if (!e.is_regular_file()) continue;
-            if (isImageFile(e.path()))
-                images.push_back(e.path());
-        }
-        std::sort(images.begin(), images.end());
-
-        std::cout << "Processing Dir [" << dirName << "]: " << images.size() << " images\n";
-
-        for (const auto &imgPath : images)
-        {
-            cv::Mat img = cv::imread(imgPath.string(), cv::IMREAD_COLOR);
-            if (img.empty()) continue;
-
-            std::optional<Label4> labelOpt = readLabel4ForImage(imgPath, labelDir, ".txt");
-            processImage(img, imgPath.string(), labelOpt, yolo, src_x, src_y, detect_x, detect_y, Deviation_x, Deviation_y);
-        }
-    }
-
-    // ---------- 文件写入 ----------
-    // 确保 val 目录存在
-    if(!fs::exists("val")) fs::create_directory("val");
-
-    int fd1 = open("val/误差x.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    int fd2 = open("val/误差y.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    int fd3 = open("val/参考值x.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    int fd4 = open("val/参考值y.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    int fd5 = open("val/检测值x.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    int fd6 = open("val/检测值y.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
-
-    // [Fix] 写入 Deviation_x (误差) 到 fd1
-    string arr;
-    for (auto &x : Deviation_x) { arr += to_string(x) + " "; }
-    write(fd1, arr.c_str(), arr.size());
-    close(fd1);
-
-    // [Fix] 写入 Deviation_y (误差) 到 fd2
-    string brr;
-    for (auto &x : Deviation_y) { brr += to_string(x) + " "; }
-    write(fd2, brr.c_str(), brr.size());
-    close(fd2);
-
-    // 写入 src_x (参考值) 到 fd3
-    string crr;
-    for (auto &x : src_x) { crr += to_string(x) + " "; }
-    write(fd3, crr.c_str(), crr.size());
-    close(fd3);
-
-    // 写入 src_y (参考值) 到 fd4
-    string drr;
-    for (auto &x : src_y) { drr += to_string(x) + " "; }
-    write(fd4, drr.c_str(), drr.size());
-    close(fd4);
-
-    // 写入 detect_x (检测值) 到 fd5
-    string frr;
-    for (auto &x : detect_x) { frr += to_string(x) + " "; }
-    write(fd5, frr.c_str(), frr.size());
-    close(fd5);
-
-    // 写入 detect_y (检测值) 到 fd6
-    string err_str;
-    for (auto &x : detect_y) { err_str += to_string(x) + " "; }
-    write(fd6, err_str.c_str(), err_str.size());
-    close(fd6);
-
-    std::cout << "Done. Results saved to ./val/\n";
-    cv::waitKey(0); // 如果不需要最后卡住可以注释掉
+    std::cout << "Done. Output: " << outDir << "\n";
     return 0;
 }

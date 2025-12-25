@@ -486,7 +486,7 @@ private:
                         if (dist <= limit_dist) {
                             result.is_from_mask = true;
                             fit_success = true;
-                        } else {
+                        } else {56
                             // 偏离太远，fit_success 保持 false，自动掉入下面的保底逻辑
                             // std::cout << "Mask ellipse rejected! Deviation: " << dist << " > " << limit_dist << std::endl;
                         }

@@ -245,7 +245,7 @@ image.image_preprocessing(640,640);
 int image_len;
 void* image_data=image.get_image_buffer(&image_len);
 
-yolov8seg yolo("best.rknn");
+yolov8seg yolo("new_yolov8_seg.rknn");
 yolo.init();
 yolo.set_input_data(image_data,image_len);
 err=yolo.rknn_model_inference();

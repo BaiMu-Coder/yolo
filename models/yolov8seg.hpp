@@ -11,6 +11,7 @@
 #include "Float16.h"
 #include "easy_timer.h"
 
+
 class yolov8seg
 {
  public:
@@ -71,4 +72,6 @@ class yolov8seg
   int _proto_width;
   int _proto_height;
 
+  //Proto反量化查表数据
+   rknpu2::float16 _proto_table[256];
 };

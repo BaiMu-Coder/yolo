@@ -91,6 +91,7 @@ static void draw_inscribed_circle(cv::Mat& vis, const object_detect_result& det,
 // ============================================================
 static bool fallback_circle_by_canny(const cv::Mat& bgr, cv::Point2f& bestCenter, float& bestR)
 {
+    return false;
     cv::Mat gray, blurImg, edges;
     cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
     cv::GaussianBlur(gray, blurImg, cv::Size(5,5), 1.2);

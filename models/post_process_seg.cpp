@@ -43,15 +43,29 @@ static void compute_dfl(std::vector<float> &before_dfl, const int dfl_len, float
 }
 
 
+void process_i8_index12_init(std::unique_ptr<rknn_tensor_attr[]> &output_tensor, rknpu2::float16 table[])
+{
+    int32_t zp_proto = output_tensor[12].zp;
+    float scale_proto = output_tensor[12].scale; //这两值是做反量化的
+    
+    //因为input_proto就-128到127种可能，直接把结果全算出来，然后查表找答案就行
+     for (int i = -128; i < 128; ++i) 
+     {
+        float f = deqnt_affine_to_f32(i, zp_proto, scale_proto);
+        table[i+128] = static_cast<rknpu2::float16>(f);
+    }
+}
 
 
 
-int process_i8(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_tensor_attr[]> &output_tensor, int index, // 输出信息  和  索引
-               int grid_w, int grid_h, int model_w, int model_h, int stride,                                          // 格子大小（输出的大小）  ;  模型输入的大小  stride（步长/下采样倍数） ——也就是该输出特征图上 1 个网格格子对应输入图像上多少个像素。
-               std::vector<float> &candidate_box, std::vector<float> &box_score, std::vector<int> &class_id,          // 候选框  置信度  类别
-               std::unique_ptr<rknpu2::float16[]> &proto, std::vector<rknpu2::float16> &box_mask_coefficient,
-               int proto_channel, int proto_width, int proto_height, // 掩码系数部分
-               float box_threshold)                                  // NMS阈值
+
+int process_i8(std::unique_ptr<rknn_output[]>& output,std::unique_ptr<rknn_tensor_attr[]>& output_tensor,int index,         //输出信息  和  索引
+     int grid_w, int grid_h, int model_w, int model_h, int stride,                    //格子大小（输出的大小）  ;  模型输入的大小  stride（步长/下采样倍数） ——也就是该输出特征图上 1 个网格格子对应输入图像上多少个像素。
+     std::vector<float>& candidate_box ,std::vector<float>& box_score,std::vector<int>& class_id,  //候选框  置信度  类别
+    std::unique_ptr<rknpu2::float16[]>& proto,std::vector<rknpu2::float16>& box_mask_coefficient,
+    int proto_channel,int proto_width,int proto_height ,    //掩码系数部分
+     float box_threshold ,   //NMS阈值  
+     rknpu2::float16 proto_table[])    //proto反量化查表                                
 {
 
   TIMER xx;
@@ -74,28 +88,31 @@ int process_i8(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_tens
      * 需要注意的是，这里没有使用比例关系，因为程序需要是INT的数据，不需要0~1的float数据
      */
     int8_t *input_proto = (int8_t *)output[index].buf;
-    int32_t zp_proto = output_tensor[index].zp;
-    float scale_proto = output_tensor[index].scale; //这两值是做反量化的
+    // int32_t zp_proto = output_tensor[index].zp;
+    // float scale_proto = output_tensor[index].scale; //这两值是做反量化的
     
-    //因为input_proto就-128到127种可能，直接把结果全算出来，然后查表找答案就行
-    rknpu2::float16 table[256];
-     for (int i = -128; i < 128; ++i) 
-     {
-        float f = deqnt_affine_to_f32(i, zp_proto, scale_proto);
-        table[i+128] = static_cast<rknpu2::float16>(f);
-    }
+    // //因为input_proto就-128到127种可能，直接把结果全算出来，然后查表找答案就行
+    // rknpu2::float16 table[256];
+    //  for (int i = -128; i < 128; ++i) 
+    //  {
+    //     float f = deqnt_affine_to_f32(i, zp_proto, scale_proto);
+    //     table[i+128] = static_cast<rknpu2::float16>(f);
+    // }
 
     // #pragma omp parallel for schedule(static)   //把下面这个 for 循环 分给多个 CPU 线程同时跑 (提升效果不明显)
     for (int i = 0; i < proto_channel * proto_width * proto_height; i++)
     {
       // proto[i] = (rknpu2::float16)deqnt_affine_to_f32(input_proto[i], zp_proto, scale_proto); // 反量化_仿射
-        proto[i] = table[(input_proto[i])+128]; // 反量化_查表  做这个量化主要原因就是，这里循环太大了，每个循环提升一点，累计下来都很大
+        proto[i] = proto_table[(input_proto[i])+128]; // 反量化_查表  做这个量化主要原因就是，这里循环太大了，每个循环提升一点，累计下来都很大
     }
 
     xx.tok();
 xx.print_time("index == 12");
-    return 0;
+     return 0;
   }
+
+
+
 
   // 预测框部分  解码xywh
   int8_t *box_temsor = (int8_t *)output[index].buf;
@@ -654,6 +671,41 @@ result.results_mask->each_of_mask[result.results_box[i].cls_id]=std::move(tem_ma
 
 
 
+void conbine_mak22(std::unique_ptr<float[]>& all_mask, object_detect_result_list& result ,letterbox& letter_box)
+{
+int real_x=letter_box.src_w;
+int real_y=letter_box.src_h;
+int len=real_x*real_y;
+int n=result.count;
+
+if(n+3>result.results_mask->each_of_mask.size())
+result.results_mask->each_of_mask.resize(n+3);
+
+for(int i=0; i<n+3;++i)
+result.results_mask->each_of_mask[i]=nullptr;
+
+for(int i=0; i<n; ++i)
+{
+int x1=result.results_box[i].x;
+int y1=result.results_box[i].y;
+int x2=result.results_box[i].w+x1;
+int y2=result.results_box[i].h+y1;
+if (x2 <= x1 || y2 <= y1) continue;
+
+auto tem_mask=std::make_unique<uint8_t[]>(real_x*real_y);
+
+for(int y=y1; y<y2; ++y)
+{
+for(int x=x1; x<x2; ++x)
+{
+if(all_mask[i*len+y*real_x+x]>0)
+ tem_mask[y*real_x+x]=result.results_box[i].cls_id+1;   //记录每一个单独的掩码
+
+}
+}
+result.results_mask->each_of_mask[result.results_box[i].cls_id]=std::move(tem_mask);  //因为我们最多预测出来三个种类嘛
+}
+}
 
 
 

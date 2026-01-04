@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 
 #环境配置区  只放 交叉编译 / 工具链 /平台相关设置
-# set(TOOLCHAIN_DIR /home/baimu/tools/rk3588_cross_compiler)
-set(TOOLCHAIN_DIR /home/baimu/Desktop/tools/cross_compiler)
+set(TOOLCHAIN_DIR /home/baimu/tools/rk3588_cross_compiler)
+# set(TOOLCHAIN_DIR /home/baimu/Desktop/tools/cross_compiler)
 set(CMAKE_CXX_COMPILER ${TOOLCHAIN_DIR}/bin/aarch64-buildroot-linux-gnu-g++)
 set(CMAKE_C_COMPILER ${TOOLCHAIN_DIR}/bin/aarch64-buildroot-linux-gnu-gcc)
 set(TARGET_SOC rk3588)

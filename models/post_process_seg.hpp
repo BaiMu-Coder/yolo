@@ -23,7 +23,10 @@ int process_i8(std::unique_ptr<rknn_output[]>& output,std::unique_ptr<rknn_tenso
      std::vector<float>& candidate_box ,std::vector<float>& box_score,std::vector<int>& class_id,  //候选框  置信度  类别
     std::unique_ptr<rknpu2::float16[]>& proto,std::vector<rknpu2::float16>& box_mask_coefficient,
     int proto_channel,int proto_width,int proto_height ,    //掩码系数部分
-     float nms_threshold ) ;          //NMS阈值                               
+     float nms_threshold ,   //NMS阈值  
+     rknpu2::float16 proto_table[]) ;    //proto反量化查表                                  
+
+void process_i8_index12_init(std::unique_ptr<rknn_tensor_attr[]> &output_tensor, rknpu2::float16 table[]);
 
 
 
@@ -56,6 +59,7 @@ void matrix_mult_by_cpu_fp32(std::vector<rknpu2::float16>& A,std::unique_ptr<rkn
 
 void conbine_mak(std::unique_ptr<float[]>& mask_matrix_mult_result,std::unique_ptr<int8_t[]>& all_mask_in_one,std::vector<float>& filter_candidate_box_mask_conbine,std::vector<int>& mask_classid,int last_count,int proto_width,int proto_height);
 void conbine_mak2(std::unique_ptr<float[]>& all_mask,std::unique_ptr<uint8_t[]>& all_mask_in_one, object_detect_result_list& result ,letterbox& letter_box);
+void conbine_mak22(std::unique_ptr<float[]>& all_mask, object_detect_result_list& result ,letterbox& letter_box);
 
 
 

@@ -253,6 +253,10 @@ int yolov8seg::init(rknn_context *ctx )
   _output_tensor=std::move(output_tensor);
   _input_tensor=std::move(input_tensor);
 
+
+  process_i8_index12_init(_output_tensor,_proto_table);
+
+
 return 0;
 }
 
@@ -374,7 +378,7 @@ int yolov8seg::post_process(object_detect_result_list& result , letterbox& lette
    
        if(_is_quant)
        {
-        valid_count+=process_i8(_output,_output_tensor,i,grid_w,grid_h,_model_width,_model_height,stride,candidate_box,box_score,class_id,proto,box_mask_coefficient,_proto_channel,_proto_width,_proto_height,BOX_THRESH);
+        valid_count+=process_i8(_output,_output_tensor,i,grid_w,grid_h,_model_width,_model_height,stride,candidate_box,box_score,class_id,proto,box_mask_coefficient,_proto_channel,_proto_width,_proto_height,BOX_THRESH,_proto_table);
        }
        else
        {
@@ -568,20 +572,25 @@ xxx.tik();
  xxx.tok();
 xxx.print_time("方案2----1");
 
- xxx.tik();
-//整体掩码合并
- auto all_mask_in_one=std::make_unique<uint8_t[]>(letter_box.src_w*letter_box.src_h);  //这个会自动帮清零，会有开销，其他的地方要注意
- conbine_mak2(all_mask,all_mask_in_one,result,letter_box);
 
- result.results_mask->seg_mask=std::move(all_mask_in_one);
+//  xxx.tik();
+// //整体掩码合并
+//  auto all_mask_in_one=std::make_unique<uint8_t[]>(letter_box.src_w*letter_box.src_h);  //这个会自动帮清零，会有开销，其他的地方要注意
+//  conbine_mak2(all_mask,all_mask_in_one,result,letter_box);
+//  result.results_mask->seg_mask=std::move(all_mask_in_one);
+//  xxx.tok();
+// xxx.print_time("方案2----2");
+
+
+ xxx.tik();
+ //小优化不合并整个掩码直接每个单独保存就行
+conbine_mak22(all_mask,result,letter_box);
 
  xxx.tok();
-xxx.print_time("方案2----2");
+xxx.print_time("方案2----3");
 
 /**************************************** */
 #endif
-
-
 
 
 return 0;

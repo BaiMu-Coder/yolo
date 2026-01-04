@@ -62,6 +62,20 @@ public:
     }
 #endif
 
+
+
+  void print_time_app(char *str)
+    {
+        printf("%s", indent);
+        printf("%s use: %f ms\n", str, get_time());
+    }
+    void print_time_app(const char *str)
+    {
+        printf("%s", indent);
+        printf("%s use: %f ms\n", str, get_time());
+    }
+
+
     float get_time()
     {
         return (__get_us(stop_time) - __get_us(start_time)) / 1000;

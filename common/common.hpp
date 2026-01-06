@@ -52,7 +52,7 @@ int lowright_pad_y;
 
 typedef struct
 {
-    int x,y,w,h;
+    int x,y,w,h;  //检测框左上角的点坐标以及长宽     原点为左上角 x正方向向右  y正方向向下
     float prop;
     int cls_id;
 } object_detect_result;
@@ -60,14 +60,15 @@ typedef struct
 typedef struct
 {
   std::unique_ptr<uint8_t[]> seg_mask;
-  std::vector<std::unique_ptr<uint8_t[]>> each_of_mask;   //此项目定制 记录每个类别的掩码
+  std::vector<std::unique_ptr<uint8_t[]>> each_of_mask;   //此项目定制 记录每个类别的掩码     其实这里每一个框和每一个单独的掩码也是对应的关系
+  std::vector<int> each_of_mask_clsid;   //记录each_of_mask里面每一个掩码属于哪个类别
 } object_segment_result;
 
 typedef struct
 {
     int count=0;
     object_detect_result results_box[OBJ_NUMB_MAX_SIZE];
-    object_segment_result results_mask[1];  //所有mask合并为1个 放在这里
+    object_segment_result results_mask[1];  //所有mask
 } object_detect_result_list;
 
 

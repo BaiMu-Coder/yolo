@@ -21,6 +21,7 @@ struct Pose6D {
     double tz_mm     = 0.0;
 };
 
+
 class PoseEstimatorLM {
 public:
     PoseEstimatorLM() = default;
@@ -111,9 +112,10 @@ public:
     }
 
 private:
-    cv::Mat K_, D_;
+    cv::Mat K_, D_;           //相机内参 和 畸变系数
     DrogueModel model_;
     std::vector<cv::Point3f> pts3d_cls0_, pts3d_cls1_, pts3d_hole_;
+
 
     static inline double deg2rad(double d){ return d * CV_PI / 180.0; }
     static inline double rad2deg(double r){ return r * 180.0 / CV_PI; }

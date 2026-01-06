@@ -678,11 +678,12 @@ int real_y=letter_box.src_h;
 int len=real_x*real_y;
 int n=result.count;
 
-if(n+3>result.results_mask->each_of_mask.size())
-result.results_mask->each_of_mask.resize(n+3);
+if(n>result.results_mask->each_of_mask.size())
+{
+  result.results_mask->each_of_mask.reserve(n+3);
+  result.results_mask->each_of_mask_clsid.reserve(n+3);
+}
 
-for(int i=0; i<n+3;++i)
-result.results_mask->each_of_mask[i]=nullptr;
 
 for(int i=0; i<n; ++i)
 {
@@ -703,7 +704,9 @@ if(all_mask[i*len+y*real_x+x]>0)
 
 }
 }
-result.results_mask->each_of_mask[result.results_box[i].cls_id]=std::move(tem_mask);  //因为我们最多预测出来三个种类嘛
+result.results_mask->each_of_mask.push_back(std::move(tem_mask));  
+result.results_mask->each_of_mask_clsid.push_back(result.results_box[i].cls_id);  
+
 }
 }
 

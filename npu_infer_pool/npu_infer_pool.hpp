@@ -588,7 +588,7 @@ private:
     //如果缺少关键目标，会在画面上显示 "Pose: --" "Dist: --" 然后 return;
      {
         //颜色bgr
-        const cv::Scalar C_GRAY(100, 100, 100);
+        const cv::Scalar C_GRAY(100, 100, 100);  //灰色
         const cv::Scalar C_CYAN(255, 255, 0);
         const cv::Scalar C_GRN(0, 255, 0);
         const cv::Scalar C_YEL(0, 255, 255);
@@ -612,6 +612,10 @@ private:
         color_weights[2][2] = 0; // 青
 
         const auto &seg_result = result.results_mask[0];
+
+        //存储拟合的每个圆，共姿态结算使用，避免多次拟合
+        std::vector<EllipseResult> store_EllipseResult ;
+        store_EllipseResult.reserve(result.count);
 
         for (int i = 0; i < result.count; i++)
         {
@@ -639,44 +643,46 @@ private:
 
                 
             EllipseResult ellipse_res = calculate_best_ellipse(frame, det_box, raw_mask_ptr, force_box, deviation_threshold_ratio);
+            cv::Scalar e_color = ellipse_res.is_from_mask ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);  //cv::Scalar调色用  是掩码的话绿色，否则黄色
+            cv::ellipse(frame, ellipse_res.rect, e_color, 2);  //在图像上绘制一个椭圆  线宽为2
+            cv::circle(frame, ellipse_res.rect.center, 2, cv::Scalar(0, 0, 255), -1);  //画椭圆的中心点   -1表示填充，也就是一个实心圆心
 
-            cv::Scalar e_color = ellipse_res.is_from_mask ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
-            cv::ellipse(frame, ellipse_res.rect, e_color, 2);
-            cv::circle(frame, ellipse_res.rect.center, 2, cv::Scalar(0, 0, 255), -1);
+            store_EllipseResult.push_back(std::move(ellipse_res));
 
             // ROI mask 上色
-            if (raw_mask_ptr && w > 0 && h > 0 && mask_idx >= 0)
+            if (raw_mask_ptr && w > 0 && h > 0 && class_id >= 0)
             {
-                cv::Mat full_mask(frame.rows, frame.cols, CV_8UC1, raw_mask_ptr);
-                #pragma omp parallel for
+                cv::Mat full_mask(frame.rows, frame.cols, CV_8UC1, raw_mask_ptr);  //CV_8UC1单通道灰度图
+                #pragma omp parallel for  //开启多线程并行加速 告诉编译器，把下面的for循环拆开分给cpu的多个核心同时执行
                 for (int r = 0; r < h; r++)
                 {
                     int abs_row = y + r;
-                    uchar *ptr_img = frame.ptr<uchar>(abs_row);
-                    uchar *ptr_mask = full_mask.ptr<uchar>(abs_row);
+                    uchar *ptr_img = frame.ptr<uchar>(abs_row);  //获取图像的 abs_row 行首地址
+                    uchar *ptr_mask = full_mask.ptr<uchar>(abs_row); //行首地址
                     for (int c = 0; c < w; c++)
                     {
                         int abs_col = x + c;
                         if (ptr_mask[abs_col] > 0)
                         {
                             blend_pixel(&ptr_img[3 * abs_col], &ptr_img[3 * abs_col + 1], &ptr_img[3 * abs_col + 2],
-                                        color_weights[mask_idx], beta);
+                                        color_weights[class_id], beta);
                         }
                     }
                 }
             }
         }
 
-        // ====== B) 追加：cls0/1/2 择优 + 姿态解算 + 深度 ======
+        // ====== B) cls0/1/2 择优 + 姿态解算 + 深度 ======
         const int CLS0_ID = 0; // 外圈
         const int CLS1_ID = 1; // 中圈
         const int CLS2_ID = 2; // 内孔
 
+        //找预测结果里面最优的目标（置信度最高）
         int idx0 = pick_best_idx_by_class(result, CLS0_ID);
         int idx1 = pick_best_idx_by_class(result, CLS1_ID);
         int idx2 = pick_best_idx_by_class(result, CLS2_ID);
 
-        // Python 同逻辑：必须有孔 + (外圈或中圈)
+        // Python 同逻辑：必须有孔 + (外圈或中圈)  才能进行姿态解算
         if (idx2 < 0 || (idx0 < 0 && idx1 < 0))
         {
             draw_txt(frame, "Pose: --", 190, C_CYAN, 1.2);
@@ -684,14 +690,23 @@ private:
             return;
         }
 
-        auto mask_ptr_of = [&](int cls_id) -> uint8_t *
+
+
+        //定义在函数内部的“临时小函数”，Lambda表达式
+        //[&] : 按引用捕获外部作用域的所有变量
+        //(int cls_id) : 参数列表
+        //->uint8_t *  : 尾置返回类型
+        auto mask_ptr_of = [&](int index) -> uint8_t *
         {
-            if (cls_id < 0 || cls_id >= (int)seg_result.each_of_mask.size())
+            if (index < 0 || index >= (int)seg_result.each_of_mask.size())
                 return nullptr;
-            if (!seg_result.each_of_mask[cls_id])
+            if (!seg_result.each_of_mask[index])
                 return nullptr;
-            return seg_result.each_of_mask[cls_id].get();
+            return seg_result.each_of_mask[index].get();
         };
+        ///////////Lambda表达式结束
+
+
 
         // cand0 / cand1
         bool has0 = (idx0 >= 0);
@@ -699,17 +714,25 @@ private:
 
         EllipseResult cand0{}, cand1{};
         if (has0)
-            cand0 = calculate_best_ellipse(frame, result.results_box[idx0], mask_ptr_of(CLS0_ID), false, deviation_threshold_ratio);
+        {
+            // cand0 = calculate_best_ellipse(frame, result.results_box[idx0], mask_ptr_of(idx0), false, deviation_threshold_ratio);
+            cand0 = store_EllipseResult[idx0];
+        }
         if (has1)
-            cand1 = calculate_best_ellipse(frame, result.results_box[idx1], mask_ptr_of(CLS1_ID), false, deviation_threshold_ratio);
+        {
+            // cand1 = calculate_best_ellipse(frame, result.results_box[idx1], mask_ptr_of(idx1), false, deviation_threshold_ratio);
+            cand1 = store_EllipseResult[idx1];
+        }
 
-        // hole（cls2）：可选用 mask 拟合；如果开关关了就强制 box（和你现有代码一致）
-        bool force_box2 = !use_mask_fit_class2;
-        EllipseResult hole_e = calculate_best_ellipse(frame, result.results_box[idx2], mask_ptr_of(CLS2_ID), force_box2, deviation_threshold_ratio);
+        //// hole（cls2）：可选用 mask 拟合；如果开关关了就强制 box
+        // bool force_box2 = !use_mask_fit_class2;
+        // EllipseResult hole_e = calculate_best_ellipse(frame, result.results_box[idx2], mask_ptr_of(idx2), force_box2, deviation_threshold_ratio);
+          EllipseResult& hole_e=store_EllipseResult[idx2];
+
         cv::Point2f hole_center = hole_e.rect.center;
-        float hole_radius = 0.5f * std::min(hole_e.rect.size.width, hole_e.rect.size.height);
+       
 
-        // 择优策略：优先 cand0=Mask，否则 cand1=Mask，否则 cand0（按你 Python）
+        // 择优策略：优先 cand0=Mask，否则 cand1=Mask，否则 cand0
         cv::RotatedRect target;
         bool use_cls1 = false;
         bool ok_target = false;
@@ -751,24 +774,17 @@ private:
         if (!ok_target)
             return;
 
-        // 备选灰色
-        if (has0)
-            cv::ellipse(frame, cand0.rect, C_GRAY, 1);
-        if (has1)
-            cv::ellipse(frame, cand1.rect, C_GRAY, 1);
-        if (hole_radius > 1)
-            cv::circle(frame, hole_center, (int)hole_radius, C_GRAY, 1);
 
-        // 正主高亮
+        // 正主高亮  C_CYAN青色
         cv::ellipse(frame, target, C_CYAN, 4);
+        cv::ellipse(frame, hole_e.rect, C_CYAN, 4);
         cv::circle(frame, hole_center, 6, C_CYAN, -1);
-        if (hole_radius > 1)
-            cv::circle(frame, hole_center, (int)hole_radius, C_CYAN, 3);
-        cv::line(frame, target.center, hole_center, C_CYAN, 3);
+        cv::line(frame, target.center, hole_center, C_CYAN, 3);  //绘制姿态轴线，画一条直线连接 两个椭圆的中心
+
 
         // 双轨解算
-        Pose6D pose_auto = _pose_estimator.Solve(target, hole_center, use_cls1, std::nullopt);
-        Pose6D pose_fix = _pose_estimator.Solve(target, hole_center, use_cls1, _fixed_distance_mm);
+        Pose6D pose_auto = _pose_estimator.Solve(target, hole_center, use_cls1, std::nullopt);   //自己解算深度信息
+        Pose6D pose_fix = _pose_estimator.Solve(target, hole_center, use_cls1, _fixed_distance_mm);   //提供深度信息
         Pose6D pose_final = _display_fixed_mode ? pose_fix : pose_auto;
 
         // 画轴

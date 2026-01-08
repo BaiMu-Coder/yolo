@@ -1,259 +1,3 @@
-// #include <opencv2/opencv.hpp>
-// #include <atomic>
-// #include <memory>
-// #include <type_traits>
-// #include <iostream>
-
-// #include "npu_infer_pool.hpp"
-// #include <image_process.hpp>
-
-// // 自动适配 image_process 构造函数（如果不匹配，编译会提示你改这里）
-// static std::unique_ptr<image_process> make_proc(cv::Mat& bgr)
-// {
-//     if constexpr (std::is_constructible_v<image_process, cv::Mat&>) {
-//         return std::make_unique<image_process>(bgr);
-//     } else if constexpr (std::is_constructible_v<image_process, const cv::Mat&>) {
-//         return std::make_unique<image_process>((const cv::Mat&)bgr);
-//     } else if constexpr (std::is_constructible_v<image_process, cv::Mat*>) {
-//         return std::make_unique<image_process>(&bgr);
-//     } else {
-//         static_assert(
-//             std::is_constructible_v<image_process, cv::Mat&> ||
-//             std::is_constructible_v<image_process, const cv::Mat&> ||
-//             std::is_constructible_v<image_process, cv::Mat*>,
-//             "image_process has no supported constructor. Please edit make_proc() to match your image_process ctor."
-//         );
-//         return nullptr;
-//     }
-// }
-
-// int main(int argc, char** argv)
-// {
-//     if (argc < 3) {
-//         std::cerr << "Usage: " << argv[0] << " <model.rknn> <video_path>\n";
-//         return 1;
-//     }
-
-//     std::string model_path = argv[1];
-//     std::string video_path = argv[2];
-
-//     cv::VideoCapture cap(video_path);
-//     if (!cap.isOpened()) {
-//         std::cerr << "Open video failed: " << video_path << "\n";
-//         return 1;
-//     }
-
-//     npu_infer_pool pool(model_path, 6, 4);
-
-//     // 可选：固定距离显示（如果你的 pool 已加入这两个接口）
-//     // pool.set_pose_display_fixed(false);
-//     // pool.set_pose_fixed_distance_mm(3000.0);
-
-//     // 可选：cls2 mask 拟合开关 & 偏差阈值（如果你的 pool 有这两个接口）
-//     // pool.set_class2_mask_fit_mode(true);
-//     // pool.set_deviation_threshold(0.3f);
-
-//     // 丢弃过期帧（视频一般不需要，但保留不影响）
-//     auto expect_id = std::make_shared<std::atomic<uint64_t>>(0);
-//     pool.set_expect_id_ptr(expect_id);
-
-//     cv::namedWindow("Result", cv::WINDOW_NORMAL);
-
-//     uint64_t fid = 0;
-
-// double fps = 0.0;
-// int64 lastTick = cv::getTickCount();
-// const double tickFreq = cv::getTickFrequency();
-
-
-//     while (true) {
-//         cv::Mat frame;
-//         if (!cap.read(frame) || frame.empty()) break;
-
-//         expect_id->store(fid, std::memory_order_relaxed);
-//         pool.AddInferenceTask(make_proc(frame));
-//         fid++;
-
-//         // 从输出队列取结果（你 BlockingQueue 的 pop() 若不是 optional，按你的实现改）
-//         auto outOpt = pool.get_npu_infer_out().pop();
-//         if (!outOpt) continue;
-
-//         auto& out = *outOpt;
-
-//         // 你在业务线程里已经画到 p->_src_image_frame 上了
-//         if (out.proc && out.proc->_src_image_frame) {
-//            cv::Mat show = *(out.proc->_src_image_frame);   // 注意：这里只是引用/浅拷贝
-// // 如果你要缩放显示，可取消注释：
-// // cv::resize(show, show, cv::Size(1280, 720));
-
-// int64 nowTick = cv::getTickCount();
-// double dt = (nowTick - lastTick) / tickFreq;
-// lastTick = nowTick;
-
-// double inst_fps = (dt > 1e-9) ? (1.0 / dt) : 0.0;
-// // 平滑一下，避免跳动
-// fps = (fps <= 0.0) ? inst_fps : (0.9 * fps + 0.1 * inst_fps);
-
-// char buf[64];
-// std::snprintf(buf, sizeof(buf), "FPS: %.1f", fps);
-
-// // 画黑底+白字
-// cv::putText(show, buf, cv::Point(20, 40),
-//             cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0,0,0), 4);
-// cv::putText(show, buf, cv::Point(20, 40),
-//             cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255,255,255), 2);
-
-// cv::imshow("Result", show);
-
-//             cv::resizeWindow("Result", 1280, 720);  // 你想要的窗口尺寸
-//         } else {
-//             // fallback（一般不会走到）
-//             cv::imshow("Result", frame);
-//         }
-
-//         int k = cv::waitKey(1);
-//         if (k == 27 || k == 'q') break;
-//     }
-
-//     pool.Stop();
-//     cap.release();
-//     cv::destroyAllWindows();
-//     return 0;
-// }
-
-
-
-// #include <opencv2/opencv.hpp>
-// #include <atomic>
-// #include <memory>
-// #include <type_traits>
-// #include <iostream>
-// #include <mutex>
-// #include <thread>
-
-// #include "npu_infer_pool.hpp"
-// #include <image_process.hpp>
-
-
-
-// static inline void draw_fps(cv::Mat& img, double fps)
-// {
-//     char buf[64];
-//     std::snprintf(buf, sizeof(buf), "FPS: %.1f", fps);
-//     cv::putText(img, buf, {20, 40}, cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0,0,0), 4);
-//     cv::putText(img, buf, {20, 40}, cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255,255,255), 2);
-// }
-
-// int main(int argc, char** argv)
-// {
-//     if (argc < 3) {
-//         std::cerr << "Usage: " << argv[0] << " <model.rknn> <video_path>\n";
-//         return 1;
-//     }
-
-//     std::string model_path = argv[1];
-//     std::string video_path = argv[2];
-
-//     cv::VideoCapture cap(video_path);
-//     if (!cap.isOpened()) {
-//         std::cerr << "Open video failed: " << video_path << "\n";
-//         return 1;
-//     }
-
-//     // 可选：减少 OpenCV 自身多线程抢资源（有时更快更稳）
-//     cv::setNumThreads(1);
-
-//     // 建 pool
-//     npu_infer_pool pool(model_path, 6, 3);
-
-//     // ====== 视频处理：不启用 expect_id 丢帧（避免“黑框没输出”）======
-//     // 所以不调用 set_expect_id_ptr()
-
-//     // 如果你 pool 支持这些开关，可以按需打开：
-//     // pool.set_class2_mask_fit_mode(true);
-//     // pool.set_deviation_threshold(0.3f);
-//     // pool.set_pose_display_fixed(false);
-//     // pool.set_pose_fixed_distance_mm(3000.0);
-
-//     // 显示窗口
-//     cv::namedWindow("Result", cv::WINDOW_NORMAL);
-//     cv::resizeWindow("Result", 1280, 720);
-
-//     // latest 结果缓存（consumer 写，主线程读）
-//     std::mutex mtx;
-//     cv::Mat latest_show;
-
-//     std::atomic<bool> running(true);     //控制consumer线程是否继续运行的开关
-
-//     // 消费线程：不停从 out_queue 取结果，保存最新图
-//     std::thread consumer([&]{
-//         while (running.load()) {
-//             auto outOpt = pool.get_npu_infer_out().pop(); // 阻塞OK
-//             if (!outOpt) continue;
-
-//             auto& out = *outOpt;
-//             if (out.proc && out.proc->_src_image_frame) {
-//                  auto tem_frame = out.proc->_src_image_frame->clone(); // 深拷贝给显示用
-
-//                  {
-//                 std::lock_guard<std::mutex> lk(mtx);    //实现了“进入代码块自动上锁，离开自动解锁”    就是lk离开作用域会立即解锁
-//                                                         //用 RAII 自动加锁/解锁，保护临界区，防止多线程同时读写 latest_show 造成数据竞争和崩溃
-//                 latest_show = std::move(tem_frame);
-//                                                     }
-            
-//             }
-//         }
-//     });
-
-//     // FPS 统计（显示端到端/显示吞吐）
-//     double fps = 0.0;
-//     int64 lastTick = cv::getTickCount();  //返回一个 “高精度计时器”的当前计数值 ，  后面每帧都会再取一次 nowTick，两者相减得到经过了多少 tick。
-//     const double tickFreq = cv::getTickFrequency();   //返回计时器的频率，没秒有多少tick
-
-//     while (true) {
-//         cv::Mat frame;
-//         if (!cap.read(frame) || frame.empty()) break;  //读帧+检查有效性
-
-//         // 喂给 NPU（不等待结果）
-//         auto tem_image=std::make_unique<image_process>(frame);
-//         tem_image->image_preprocessing(640,640);
-//         pool.AddInferenceTask(std::move(tem_image));
-
-//         // 拿最新结果（没有就用原始 frame，避免黑屏）
-//         cv::Mat show;
-//         {
-//             std::lock_guard<std::mutex> lk(mtx);
-//             if (!latest_show.empty()) show = latest_show;
-//         }
-//         if (show.empty()) show = frame;
-
-//         // FPS
-//         int64 nowTick = cv::getTickCount();
-//         double dt = (nowTick - lastTick) / tickFreq;
-//         lastTick = nowTick;
-//         double inst_fps = (dt > 1e-9) ? (1.0 / dt) : 0.0;
-//         fps = (fps <= 0.0) ? inst_fps : (0.9 * fps + 0.1 * inst_fps);
-//         draw_fps(show, fps);
-
-//         cv::imshow("Result", show);
-
-//         int k = cv::waitKey(1);
-//         if (k == 27 || k == 'q') break;
-//     }
-
-//     running.store(false);
-//     pool.Stop();  //
-//     if (consumer.joinable())  //防御性判断
-//      consumer.join();
-
-//     cap.release();
-//     cv::destroyAllWindows();
-//     return 0;
-// }
-
-
-
-
 #include <opencv2/opencv.hpp>
 #include <atomic>
 #include <memory>
@@ -336,7 +80,7 @@ int main(int argc, char** argv)
     cv::setNumThreads(1);
 
     // 建 npu_pool
-    npu_infer_pool pool(args.model, 6, 3);
+    npu_infer_pool pool(args.model, 6, 6);
 
     // =======================
     // 多线程控制变量
@@ -345,7 +89,7 @@ int main(int argc, char** argv)
 
     // inflight 背压：限制“已提交但未出结果”的数量，避免积压导致延迟越来越大
     std::atomic<int> inflight(0);
-    const int MAX_INFLIGHT = args.use_cam ? 2 : 10; // 摄像头更低延迟；视频可更大吞吐
+    const int MAX_INFLIGHT = args.use_cam ? 4 : 12; // 摄像头更低延迟；视频可更大吞吐
 
     // 显示队列：consumer push，主线程 pop
     std::mutex show_mtx;
@@ -396,6 +140,14 @@ int main(int argc, char** argv)
         cv::VideoCapture cap;
         if (args.use_cam) {
             cap.open(args.cam_id);
+        // === 关键修改 ===
+        // 降低分辨率，减少 CPU 负担
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, 640); 
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 640);
+        // 使用压缩格式，降低 USB 带宽压力
+        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+        // ================
+
         } else {
             cap.open(args.video_path);
         }

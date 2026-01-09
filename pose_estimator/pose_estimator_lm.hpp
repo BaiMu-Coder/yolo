@@ -79,7 +79,11 @@ public:
         // tz init: tz ≈ f * R / r_img   这里就是利用小孔成像原理
         const double ew = targetEllipse.size.width; // RotatedRect 的 size.width/size.height 是拟合得到的椭圆“外接旋转矩形”的宽高
         const double eh = targetEllipse.size.height;
-        const double r_img = (ew + eh) * 0.25;                                   // (w+h)/4   得到椭圆的参考半径    因为椭圆有左右偏转和上下偏转，只使用长轴没有这个精准
+        double r_img ;  //使用长轴进行距离求解
+        if(ew>eh)
+        r_img=ew/2.0;
+        else
+        r_img=eh/2.0;
         const double f_mean = 0.5 * (K_.at<double>(0, 0) + K_.at<double>(1, 1)); // f_mean是相机的焦距    (K_.at<double>(0,0)表示矩阵中(0,0)位置的元素   （这里可以写真值，不用fx fy去反算）
 
         double tz_est = 200.0; // 这里给一个默认值
@@ -104,7 +108,7 @@ public:
         }
 
         // tx/ty init by back-projecting ellipse center
-        double tx0 = (cx - K_.at<double>(0, 2)) * tz_est / K_.at<double>(0, 0); // 椭圆中心在图像哪里，就反推出“物体中心在相机坐标的 X/Y 方向偏了多少(物理距离)”。
+        double tx0 = (cx - K_.at<double>(0, 2)) * tz_est / K_.at<double>(0, 0); // 椭圆中心在图像哪里，就反推出“物体中心在相机坐标的 X/Y 方向偏了多少(也就是相机坐标系下的坐标，这里并且通过小孔成像原理将像素坐标转换为了：物理距离的坐标单位毫米)”。
         double ty0 = (cy - K_.at<double>(1, 2)) * tz_est / K_.at<double>(1, 1);
 
         if (known_dist_mm.has_value())
@@ -250,7 +254,7 @@ private:
 
         std::vector<cv::Point2f> proj_outer;
         cv::projectPoints(pts3d, rvec, tvec, K_, D_, proj_outer); // 将 3D 点 pts3d 投影到 2D 图像平面，使用了相机内参 K_ 和畸变系数 D_。
-                                                                  // 也就是  把这个真实的圆投影到 我拟合出来的椭圆的那个平面上  （因为我的3D点云是个正视平面，所以用上面的旋转矩阵和平移向量，把这个真实的圆，投影到和拟合的圆平面上去，做误差计算）
+                                                                  // 也就是  把这个真实的圆投影到 我拟合出来的椭圆的那个平面上(也就是相机平面)  （因为我的3D点云是个正视平面，所以用上面的旋转矩阵和平移向量，把这个真实的圆，投影到和拟合的圆平面上去，做误差计算）
 
         std::vector<cv::Point3f> hole3d = {cv::Point3f(0.0f, 0.0f, (float)(-model_.length_L_mm))}; // 把中心孔中心的3D位置 投影到图像上
         std::vector<cv::Point2f> proj_hole;

@@ -26,6 +26,8 @@ set(CMAKE_INSTALL_PREFIX  ${CMAKE_CURRENT_SOURCE_DIR}/install)
 add_definitions(-g -O0 -ggdb -gdwarf -funwind-tables -rdynamic)
 add_definitions(-Wno-write-strings -Wno-return-type)
 
+# add_definitions(-O3 -gdwarf -funwind-tables -rdynamic)
+
 
 find_package(OpenCV REQUIRED)      # 用了 OpenCV
 

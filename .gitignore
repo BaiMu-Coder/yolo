@@ -26,6 +26,7 @@ build/*
 !build/.gitkeep
 install/*
 !install/.gitkeep
+video/*
 
 _build/
 out/
@@ -91,6 +92,12 @@ CTestTestfile.cmake
 # If you generate code / artifacts, add them here:
 # generated/
 # third_party/build/
+
+# Python PT inference environment/cache/results
+.venv-yolo/
+__pycache__/
+*.py[cod]
+output_python/
 
 
 

@@ -1,0 +1,6 @@
+# 推荐 Python 3.8；当前项目 .venv-yolo 已按下列兼容组合配置。
+ultralytics==8.3.0
+torch==2.1.0
+torchvision==0.16.0
+opencv-python>=4.6,<5
+numpy>=1.23,<2

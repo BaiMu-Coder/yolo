@@ -73,3 +73,20 @@ cmake --install build
 - `ellipses/原图名.txt`：类别、椭圆中心、长轴、短轴、角度、置信度、拟合来源及误差。
 - `poses/原图名.txt`：参考类别与中心、孔中心，以及自动/固定距离两套 yaw、pitch、roll、tx、ty、tz。
 - 视频输入还会在输出根目录生成 `<视频名>_result.mp4`，编码不可用时自动回退为 AVI。
+
+### C++ 单帧模块化示例
+
+`unit_test/single_frame_pipeline.cpp` 把单帧流程拆成六个互相独立的小模块：
+`ImageLoader`、`RknnInference`、`EllipseFitter`、`PoseSolver`、`Visualizer` 和
+`ResultWriter`。模块之间只通过 `FrameContext` 传递结果，不修改项目原有接口。
+
+```bash
+cmake --build build --target single_frame_pipeline -j
+./install/single_frame_pipeline \
+  --model ./best.rknn \
+  --image /data/input/test.jpg \
+  --output /data/result \
+  --show
+```
+
+它会为这一帧保存可视化图片、YOLO 检测 TXT、椭圆 TXT，以及自动距离和固定距离两套位姿 TXT。

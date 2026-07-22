@@ -12,6 +12,7 @@
 # add_executable(test_new test.cpp)
 # add_executable(shipin_show final_version.cpp)
 add_executable(performance_test performance_test.cpp)
+add_executable(batch_image_video batch_image_video.cpp)
 
 
 set_target_properties(performance_test PROPERTIES    #设置“安装后运行时找动态库的路径（RPATH）”
@@ -23,4 +24,13 @@ target_link_libraries(performance_test
       PRIVATE  yolov8seg_core          # 刚才在顶层定义的库
 )
 
-install(TARGETS performance_test DESTINATION .)
+set_target_properties(batch_image_video PROPERTIES
+    INSTALL_RPATH "\$ORIGIN/lib"
+    INSTALL_RPATH "\$ORIGIN/runtime"
+)
+
+target_link_libraries(batch_image_video
+      PRIVATE yolov8seg_core
+)
+
+install(TARGETS performance_test batch_image_video DESTINATION .)

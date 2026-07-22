@@ -36,6 +36,8 @@ video_name = "test01.mp4"
 
 `unit_test/batch_image_video.cpp` 接入现有 RKNN、YOLOv8-seg 后处理、Mask、RANSAC
 椭圆拟合及 LM 位姿解算框架，并通过现有 CMake 生成 `batch_image_video`。
+C++ 的 Mask/RANSAC、质量评分和内切圆保底逻辑已统一抽离到
+`ellipse_fitter/ellipse_fitter.hpp/.cpp`，在线推理池、批处理和单帧测试不再各自保留副本。
 
 编译：
 
@@ -54,6 +56,9 @@ cmake --install build
   --output-path /data/result \
   --show
 ```
+
+内孔默认使用检测框中心/内切圆。如需对比内孔 Mask 拟合，追加
+`--hole-mask`；验收保底时追加 `--force-reference-box`，可强制外/中参考圈使用检测框内切圆。
 
 处理视频：
 
@@ -89,4 +94,29 @@ cmake --build build --target single_frame_pipeline -j
   --show
 ```
 
+单帧入口同样支持 `--hole-mask` 和 `--force-reference-box`。
+
 它会为这一帧保存可视化图片、YOLO 检测 TXT、椭圆 TXT，以及自动距离和固定距离两套位姿 TXT。
+
+## 圆环拟合现场切换
+
+`npu_infer_pool` 默认对参考外/中圈（cls0/cls1）优先使用 Mask 拟合，内孔（cls2）使用检测框中心和内切圆。验收现场图像质量不足时，可在提交推理任务前开启参考圈保底模式：
+
+默认外圈/中圈只采用两级策略：Mask-RANSAC 综合内点率、平均边界误差、圆心偏差和轴比得到质量分，低于门槛时直接改用检测框内切圆，不执行灰度边缘拟合。两圈同时存在时再检查同心度、物理直径比、轴比和方向一致性。视频/摄像头模式最后使用随质量自适应的椭圆 EMA，并拒绝低质量突变。可视化中绿色为 Mask、黄色为检测框内切圆。
+
+```cpp
+npu_infer_pool pool(model_path);
+
+// false（默认）：外/中圈优先 Mask 椭圆；
+// true：外/中圈都强制使用检测框内切圆。
+pool.set_reference_ring_force_box_mode(true);
+
+// 内孔默认已是 false；如需试验 Mask 拟合可显式打开。
+pool.set_class2_mask_fit_mode(false);
+
+// 默认开启视频时序滤波；单张图片测试可关闭。
+pool.set_temporal_filter_enabled(true);
+```
+
+也可通过 `set_class0_mask_fit_mode()` 和 `set_class1_mask_fit_mode()` 分别控制两个参考圈。
+使用 `unit_test/final_version.cpp` 的命令行版本时，可直接追加 `--force-reference-box` 开启该保底模式，或追加 `--hole-mask` 对比内孔 Mask 拟合。

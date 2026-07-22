@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "ellipse_fitter.hpp"
 #include "image_process.hpp"
 #include "pose_estimator_lm.hpp"
 #include "yolov8seg.hpp"
@@ -32,13 +33,10 @@ struct AppConfig {
     fs::path output_path;
     bool show = false;
     bool display_fixed_pose = false;
+    bool force_reference_box = false;
+    bool fit_hole_from_mask = false;
     double fixed_distance_mm = 3000.0;
     float ellipse_center_deviation_ratio = 0.30f;
-};
-
-struct FittedEllipse {
-    cv::RotatedRect shape;
-    bool from_mask = false;
 };
 
 struct PoseResult {
@@ -54,7 +52,7 @@ struct PoseResult {
 struct FrameContext {
     cv::Mat image;
     object_detect_result_list detections{};
-    std::vector<FittedEllipse> ellipses;
+    std::vector<EllipseFitResult> ellipses;
     PoseResult pose;
     cv::Mat visualization;
 };
@@ -104,65 +102,42 @@ private:
 
 // ============================== 3. 椭圆拟合模块 ==============================
 
-class EllipseFitter {
+class EllipseStage {
 public:
-    explicit EllipseFitter(float center_deviation_ratio)
-        : center_deviation_ratio_(center_deviation_ratio) {}
+    explicit EllipseStage(const AppConfig& config)
+        : force_reference_box_(config.force_reference_box),
+          fit_hole_from_mask_(config.fit_hole_from_mask) {
+        EllipseFitConfig fit_config;
+        fit_config.center_deviation_ratio = config.ellipse_center_deviation_ratio;
+        fitter_ = EllipseFitter(fit_config);
+    }
 
     void run(FrameContext& frame) const {
         frame.ellipses.clear();
         frame.ellipses.reserve(frame.detections.count);
         const auto& masks = frame.detections.results_mask[0].each_of_mask;
         for (int i = 0; i < frame.detections.count; ++i) {
+            const auto& detection = frame.detections.results_box[i];
             const uint8_t* mask = (i < static_cast<int>(masks.size()) && masks[i])
                                       ? masks[i].get()
                                       : nullptr;
-            frame.ellipses.push_back(fit_one(frame.image, frame.detections.results_box[i], mask));
+            const bool is_reference = detection.cls_id == 0 || detection.cls_id == 1;
+            const bool force_box = (is_reference && force_reference_box_) ||
+                                   (detection.cls_id == 2 && !fit_hole_from_mask_);
+            const cv::Rect box(detection.x, detection.y, detection.w, detection.h);
+            const EllipseFitMode fit_mode = force_box
+                                                ? EllipseFitMode::ForceBox
+                                                : (is_reference
+                                                       ? EllipseFitMode::PreferMaskNoEdge
+                                                       : EllipseFitMode::PreferMask);
+            frame.ellipses.push_back(fitter_.Fit(frame.image, box, mask, fit_mode));
         }
     }
 
 private:
-    FittedEllipse fit_one(const cv::Mat& image, const object_detect_result& detection,
-                          const uint8_t* mask_data) const {
-        const cv::Point2f box_center(detection.x + detection.w * 0.5f,
-                                     detection.y + detection.h * 0.5f);
-        if (mask_data != nullptr) {
-            const int x = std::max(0, detection.x);
-            const int y = std::max(0, detection.y);
-            const int width = std::min(detection.w, image.cols - x);
-            const int height = std::min(detection.h, image.rows - y);
-            if (width > 0 && height > 0) {
-                cv::Mat full_mask(image.rows, image.cols, CV_8UC1,
-                                  const_cast<uint8_t*>(mask_data));
-                cv::Mat roi = full_mask(cv::Rect(x, y, width, height)).clone();
-                std::vector<std::vector<cv::Point>> contours;
-                cv::findContours(roi, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-                std::vector<cv::Point> points;
-                const double minimum_area = 0.005 * width * height;
-                for (const auto& contour : contours) {
-                    if (contour.size() >= 5 && std::abs(cv::contourArea(contour)) >= minimum_area) {
-                        points.insert(points.end(), contour.begin(), contour.end());
-                    }
-                }
-                if (points.size() >= 5) {
-                    try {
-                        cv::RotatedRect ellipse = cv::fitEllipse(points);
-                        ellipse.center += cv::Point2f(static_cast<float>(x), static_cast<float>(y));
-                        const float deviation = cv::norm(ellipse.center - box_center);
-                        const float limit = std::min(detection.w, detection.h) * center_deviation_ratio_;
-                        if (deviation <= limit) return {ellipse, true};
-                    } catch (...) {
-                        // 自动进入检测框保底。
-                    }
-                }
-            }
-        }
-        const float side = static_cast<float>(std::min(detection.w, detection.h));
-        return {cv::RotatedRect(box_center, cv::Size2f(side, side), 0.0f), false};
-    }
-
-    float center_deviation_ratio_;
+    EllipseFitter fitter_;
+    bool force_reference_box_ = false;
+    bool fit_hole_from_mask_ = false;
 };
 
 // ============================== 4. 位姿解算模块 ==============================
@@ -185,18 +160,28 @@ public:
     }
 
     void run(FrameContext& frame) {
-        const int outer = best_detection(frame.detections, 0);
-        const int middle = best_detection(frame.detections, 1);
-        const int hole = best_detection(frame.detections, 2);
+        std::vector<int> class_ids(frame.detections.count);
+        std::vector<float> detection_confidences(frame.detections.count);
+        for (int i = 0; i < frame.detections.count; ++i) {
+            class_ids[i] = frame.detections.results_box[i].cls_id;
+            detection_confidences[i] = frame.detections.results_box[i].prop;
+        }
+        const RingPairSelection pair = ring_refiner_.SelectAndRefine(
+            class_ids, detection_confidences, frame.ellipses);
+        const int outer = pair.outer_index;
+        const int middle = pair.middle_index;
+        const int hole = best_detection(frame.detections, frame.ellipses, 2);
         frame.pose = {};
         if (hole < 0 || (outer < 0 && middle < 0) ||
             frame.ellipses.size() < static_cast<size_t>(frame.detections.count)) return;
 
         int reference = -1;
         if (outer >= 0 && middle >= 0) {
-            reference = frame.ellipses[outer].from_mask
-                            ? outer
-                            : (frame.ellipses[middle].from_mask ? middle : outer);
+            const float outer_score = EllipseSelectionScore(
+                frame.ellipses[outer], frame.detections.results_box[outer].prop);
+            const float middle_score = EllipseSelectionScore(
+                frame.ellipses[middle], frame.detections.results_box[middle].prop);
+            reference = outer_score >= middle_score ? outer : middle;
         } else {
             reference = outer >= 0 ? outer : middle;
         }
@@ -204,13 +189,13 @@ public:
         frame.pose.valid = true;
         frame.pose.reference_class = frame.detections.results_box[reference].cls_id;
         frame.pose.use_middle_ring = frame.pose.reference_class == 1;
-        frame.pose.reference_center = frame.ellipses[reference].shape.center;
-        frame.pose.hole_center = frame.ellipses[hole].shape.center;
+        frame.pose.reference_center = frame.ellipses[reference].ellipse.center;
+        frame.pose.hole_center = frame.ellipses[hole].ellipse.center;
         frame.pose.automatic = estimator_.Solve(
-            frame.ellipses[reference].shape, frame.pose.hole_center,
+            frame.ellipses[reference].ellipse, frame.pose.hole_center,
             frame.pose.use_middle_ring, std::nullopt);
         frame.pose.fixed = estimator_.Solve(
-            frame.ellipses[reference].shape, frame.pose.hole_center,
+            frame.ellipses[reference].ellipse, frame.pose.hole_center,
             frame.pose.use_middle_ring, fixed_distance_mm_);
     }
 
@@ -219,14 +204,19 @@ public:
     }
 
 private:
-    static int best_detection(const object_detect_result_list& detections, int class_id) {
+    static int best_detection(const object_detect_result_list& detections,
+                              const std::vector<EllipseFitResult>& ellipses,
+                              int class_id) {
         int best = -1;
         float best_score = -1.0f;
         for (int i = 0; i < detections.count; ++i) {
             const auto& detection = detections.results_box[i];
-            if (detection.cls_id == class_id && detection.prop > best_score) {
+            const float score = i < static_cast<int>(ellipses.size())
+                                    ? EllipseSelectionScore(ellipses[i], detection.prop)
+                                    : detection.prop;
+            if (detection.cls_id == class_id && score > best_score) {
                 best = i;
-                best_score = detection.prop;
+                best_score = score;
             }
         }
         return best;
@@ -234,6 +224,7 @@ private:
 
     double fixed_distance_mm_;
     PoseEstimatorLM estimator_;
+    RingPairRefiner ring_refiner_;
 };
 
 // ============================== 5. 可视化模块 ==============================
@@ -259,12 +250,17 @@ public:
             }
             cv::rectangle(frame.visualization,
                           {detection.x, detection.y, detection.w, detection.h}, {0, 0, 255}, 2);
-            cv::ellipse(frame.visualization, frame.ellipses[i].shape,
-                        frame.ellipses[i].from_mask ? cv::Scalar(0, 255, 0)
-                                                   : cv::Scalar(0, 255, 255), 2);
+            const auto& ellipse = frame.ellipses[i];
+            const cv::Scalar fit_color = ellipse.source == EllipseSource::Mask
+                                             ? cv::Scalar(0, 255, 0)
+                                             : (ellipse.source == EllipseSource::Edge
+                                                    ? cv::Scalar(255, 0, 255)
+                                                    : cv::Scalar(0, 255, 255));
+            cv::ellipse(frame.visualization, ellipse.ellipse, fit_color, 2);
             cv::putText(frame.visualization,
                         "cls=" + std::to_string(detection.cls_id) +
-                            " conf=" + cv::format("%.3f", detection.prop),
+                            " " + cv::format("%s q=%.2f", EllipseSourceName(ellipse.source),
+                                             ellipse.quality),
                         {detection.x, std::max(18, detection.y - 5)},
                         cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 2);
         }
@@ -332,16 +328,18 @@ private:
 
     static void write_ellipses(const fs::path& path, const FrameContext& frame) {
         std::ofstream output(path);
-        output << "# class_id center_x center_y major_axis minor_axis angle confidence source\n"
+        output << "# class_id center_x center_y major_axis minor_axis angle confidence source quality inlier_ratio inliers mean_error_px geometry_ok temporal\n"
                << std::fixed << std::setprecision(6);
         for (int i = 0; i < frame.detections.count; ++i) {
             const auto& d = frame.detections.results_box[i];
             const auto& e = frame.ellipses[i];
-            output << d.cls_id << ' ' << e.shape.center.x << ' ' << e.shape.center.y << ' '
-                   << std::max(e.shape.size.width, e.shape.size.height) << ' '
-                   << std::min(e.shape.size.width, e.shape.size.height) << ' '
-                   << e.shape.angle << ' ' << d.prop << ' '
-                   << (e.from_mask ? "mask" : "box") << '\n';
+            output << d.cls_id << ' ' << e.ellipse.center.x << ' ' << e.ellipse.center.y << ' '
+                   << std::max(e.ellipse.size.width, e.ellipse.size.height) << ' '
+                   << std::min(e.ellipse.size.width, e.ellipse.size.height) << ' '
+                   << e.ellipse.angle << ' ' << d.prop << ' '
+                   << EllipseSourceName(e.source) << ' ' << e.quality << ' '
+                   << e.inlier_ratio << ' ' << e.inliers << ' ' << e.mean_error_px << ' '
+                   << e.geometry_consistent << ' ' << e.temporally_filtered << '\n';
         }
     }
 
@@ -390,10 +388,13 @@ static AppConfig parse_args(int argc, char** argv) {
         else if (key == "--fixed-distance") config.fixed_distance_mm = std::stod(next());
         else if (key == "--show") config.show = true;
         else if (key == "--display-fixed") config.display_fixed_pose = true;
+        else if (key == "--force-reference-box") config.force_reference_box = true;
+        else if (key == "--hole-mask") config.fit_hole_from_mask = true;
         else if (key == "--help" || key == "-h") {
             std::cout << "Usage: " << argv[0]
                       << " --model best.rknn --image input.jpg --output result [--show]"
-                         " [--display-fixed] [--fixed-distance 3000]\n";
+                         " [--display-fixed] [--fixed-distance 3000]"
+                         " [--force-reference-box] [--hole-mask]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown argument: " + key);
@@ -413,14 +414,14 @@ int main(int argc, char** argv) {
         // 一帧图像严格按照下面六步串行执行，模块间只通过 FrameContext 传递数据。
         ImageLoader loader;
         RknnInference inference(config.model_path);
-        EllipseFitter ellipse_fitter(config.ellipse_center_deviation_ratio);
+        EllipseStage ellipse_stage(config);
         PoseSolver pose_solver(config.fixed_distance_mm);
         Visualizer visualizer(config.display_fixed_pose);
         ResultWriter writer(config.output_path);
 
         if (!loader.run(config.image_path, frame)) throw std::runtime_error("Image loading failed");
         if (!inference.run(frame)) throw std::runtime_error("RKNN inference failed");
-        ellipse_fitter.run(frame);
+        ellipse_stage.run(frame);
         pose_solver.run(frame);
         visualizer.run(frame, pose_solver);
         if (!writer.run(config.image_path.stem().string(), frame)) {

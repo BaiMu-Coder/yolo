@@ -26,6 +26,8 @@ struct Args {
     int cam_id = 0;
     std::string video_path;
     int target_fps = 0; // 0=不限速
+    bool force_reference_box = false; // 外/中参考圈强制使用检测框内切圆
+    bool fit_hole_from_mask = false; // 内孔默认使用检测框
 };
 
 static Args parse_args(int argc, char** argv)
@@ -49,6 +51,10 @@ static Args parse_args(int argc, char** argv)
             a.video_path = argv[++i];
         } else if (s == "--fps" && i + 1 < argc) {
             a.target_fps = std::stoi(argv[++i]);
+        } else if (s == "--force-reference-box") {
+            a.force_reference_box = true;
+        } else if (s == "--hole-mask") {
+            a.fit_hole_from_mask = true;
         }
     }
     return a;
@@ -60,8 +66,8 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         std::cerr << "Usage:\n"
-                  << "  Video: " << argv[0] << " <model.rknn> --video <path> [--fps 40]\n"
-                  << "  Cam  : " << argv[0] << " <model.rknn> --cam <id>\n"
+                  << "  Video: " << argv[0] << " <model.rknn> --video <path> [--fps 40] [--force-reference-box] [--hole-mask]\n"
+                  << "  Cam  : " << argv[0] << " <model.rknn> --cam <id> [--force-reference-box] [--hole-mask]\n"
                   << "  (Compat) " << argv[0] << " <model.rknn> <video_path>\n";
         return 1;
     }
@@ -81,6 +87,8 @@ int main(int argc, char** argv)
 
     // 建 npu_pool
     npu_infer_pool pool(args.model, 6, 6);
+    pool.set_reference_ring_force_box_mode(args.force_reference_box);
+    pool.set_class2_mask_fit_mode(args.fit_hole_from_mask);
 
     // =======================
     // 多线程控制变量

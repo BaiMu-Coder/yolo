@@ -15,8 +15,10 @@
 #include <type_traits>
 #include <utility>
 #include <random>
+#include <mutex>
 
 #include "pose_estimator_lm.hpp"
+#include "ellipse_fitter.hpp"
 
 // 输出结构体 (使用 shared_ptr)
 struct InferOut
@@ -31,13 +33,6 @@ struct InferJob
 {
     uint64_t frame_id;
     std::unique_ptr<image_process> proc;
-};
-
-// 椭圆拟合结果结构体
-struct EllipseResult
-{
-    cv::RotatedRect rect; // 表示拟合出来的椭圆（中心、长短轴、角度）
-    bool is_from_mask;    // true=掩码拟合, false=Box保底
 };
 
 class npu_infer_pool
@@ -127,7 +122,27 @@ public:
         _min_expect_id_ptr = std::move(ptr);
     }
 
-    // 类别2是否优先使用掩码拟合 (true=尝试拟合, false=强制Box/内切圆)
+    // 参考外圈（cls0/cls1）是否强制使用检测框内切圆。
+    // 验收现场图像质量较差时可一键切换；默认 false，仍优先使用 Mask 拟合。
+    void set_reference_ring_force_box_mode(bool force_box)
+    {
+        _force_box_for_reference_ring = force_box;
+    }
+
+    // 分类别控制参考圈。true=尝试 Mask 拟合，false=强制检测框内切圆。
+    // 当 set_reference_ring_force_box_mode(true) 时，这两个开关会被全局强制模式覆盖。
+    void set_class0_mask_fit_mode(bool enable)
+    {
+        _enable_mask_fit_for_class0 = enable;
+    }
+
+    void set_class1_mask_fit_mode(bool enable)
+    {
+        _enable_mask_fit_for_class1 = enable;
+    }
+
+    // 类别2是否使用掩码拟合 (true=尝试拟合, false=强制Box/内切圆)
+    // 内孔 Mask 边界误差相对较大，默认 false。
     void set_class2_mask_fit_mode(bool enable)
     {
         _enable_mask_fit_for_class2 = enable;
@@ -137,6 +152,18 @@ public:
     void set_deviation_threshold(float ratio)
     {
         _max_deviation_ratio = ratio;
+    }
+
+    void set_temporal_filter_enabled(bool enable)
+    {
+        _enable_temporal_filter = enable;
+        if (!enable)
+        {
+            std::lock_guard<std::mutex> lock(_ellipse_filter_mutex);
+            _ellipse_temporal_filter.Reset();
+            _last_filtered_frame_id = 0;
+            _has_filtered_frame = false;
+        }
     }
 
     // =====姿态/深度 双轨显示控制 =====
@@ -239,7 +266,9 @@ private:
     }
 
     // 主最用就是找出最优的目标进行椭圆拟合姿态解算
-    static int pick_best_idx_by_class(const object_detect_result_list &result, int cls_id)
+    static int pick_best_idx_by_class(const object_detect_result_list &result,
+                                      const std::vector<EllipseFitResult> &ellipses,
+                                      int cls_id)
     { // 找结果里面 类别为cls_id 分最高的那一个检测框
         int best = -1;
         double best_s = -1e18;
@@ -248,7 +277,9 @@ private:
             const auto &d = result.results_box[i];
             if (d.cls_id != cls_id)
                 continue;
-            double s = det_score(d);
+            double s = i < static_cast<int>(ellipses.size())
+                           ? EllipseSelectionScore(ellipses[i], static_cast<float>(det_score(d)))
+                           : det_score(d);
             if (best < 0 || s > best_s)
             {
                 best = i;
@@ -256,306 +287,6 @@ private:
             }
         }
         return best;
-    }
-
-    // ============================================================
-    // 椭圆拟合（保留 deviation 校验
-    //  Box 保底改成 “内切圆/正方形” 更贴近 Python 逻辑
-    // ============================================================
-
-    ///////////////////////////////////////////////////////////////////////轻量RANSAC椭圆拟合工具
-    // 点到椭圆边界的“近似像素误差”
-    // 思路：把点变换到椭圆坐标系，r=sqrt((x/a)^2+(y/b)^2)，理想边界 r=1
-    // err_px ≈ |r-1| * min(a,b)
-    static inline float ellipse_radial_error_px(const cv::RotatedRect &e, const cv::Point2f &p)
-    {
-        float a = e.size.width * 0.5f;
-        float b = e.size.height * 0.5f;
-        if (a < 1e-3f || b < 1e-3f)
-            return 1e9f;
-
-        float x = p.x - e.center.x;
-        float y = p.y - e.center.y;
-
-        float ang = -e.angle * (float)CV_PI / 180.0f;
-        float c = std::cos(ang), s = std::sin(ang);
-        float xr = c * x - s * y;
-        float yr = s * x + c * y;
-
-        float r = std::sqrt((xr * xr) / (a * a) + (yr * yr) / (b * b));
-        float err = std::fabs(r - 1.0f) * std::min(a, b);
-        return err;
-    }
-
-    struct RansacEllipseFit
-    {
-        bool ok = false;
-        cv::RotatedRect ellipse;
-        int inliers = 0;
-        float mean_err = 1e9f;
-    };
-
-    // 轻量 RANSAC：
-    // - points：建议 <=150（实时要求）
-    // - iters：80~150
-    // - inlier_th_px：2~4 像素
-    // - min_inlier_ratio：0.35~0.6（越大越严格）
-    static inline RansacEllipseFit fit_ellipse_ransac(
-        const std::vector<cv::Point> &points,
-        int iters = 120,
-        float inlier_th_px = 3.0f,
-        float min_inlier_ratio = 0.45f,
-        float max_axis_ratio = 6.0f // 轴比上限，防止退化
-    )
-    {
-        RansacEllipseFit best;
-        const int N = (int)points.size();
-        if (N < 20)
-            return best; // 太少点别RANSAC，直接普通拟合更合适
-
-        std::mt19937 rng(12345); // 固定种子：可复现；想随机可用 std::random_device
-        std::uniform_int_distribution<int> uni(0, N - 1);
-
-        std::vector<cv::Point> sample(5);
-        std::vector<int> idx(5);
-
-        for (int t = 0; t < iters; ++t)
-        {
-            // 随机取5个不同点
-            for (int k = 0; k < 5;)
-            {
-                int r = uni(rng);
-                bool dup = false;
-                for (int j = 0; j < k; ++j)
-                    if (idx[j] == r)
-                    {
-                        dup = true;
-                        break;
-                    }
-                if (dup)
-                    continue;
-                idx[k] = r;
-                sample[k] = points[r];
-                ++k;
-            }
-
-            cv::RotatedRect e;
-            try
-            {
-                e = cv::fitEllipse(sample);
-            }
-            catch (...)
-            {
-                continue;
-            }
-
-            float a = e.size.width * 0.5f, b = e.size.height * 0.5f;
-            if (a < 2.f || b < 2.f)
-                continue;
-
-            float axis_ratio = std::max(a, b) / std::max(1e-3f, std::min(a, b));
-            if (axis_ratio > max_axis_ratio)
-                continue; // 过扁过长通常是坏解
-
-            // 统计inliers
-            int inl = 0;
-            float err_sum = 0.f;
-            for (int i = 0; i < N; ++i)
-            {
-                float err = ellipse_radial_error_px(e, (cv::Point2f)points[i]);
-                if (err <= inlier_th_px)
-                {
-                    ++inl;
-                    err_sum += err;
-                }
-            }
-
-            // 更新best（优先inliers，其次平均误差）
-            if (inl > best.inliers || (inl == best.inliers && inl > 0 && err_sum / inl < best.mean_err))
-            {
-                best.ok = true;
-                best.ellipse = e;
-                best.inliers = inl;
-                best.mean_err = (inl > 0) ? (err_sum / inl) : 1e9f;
-            }
-        }
-
-        if (!best.ok)
-            return best;
-
-        // inlier比例门槛
-        const int min_inliers = (int)std::ceil(min_inlier_ratio * N);
-        if (best.inliers < std::max(20, min_inliers)) // 至少20个inlier
-        {
-            best.ok = false;
-            return best;
-        }
-
-        // 用inliers再拟合一次（关键：稳定）
-        std::vector<cv::Point> inlier_pts;
-        inlier_pts.reserve(best.inliers);
-        for (int i = 0; i < N; ++i)
-        {
-            float err = ellipse_radial_error_px(best.ellipse, (cv::Point2f)points[i]);
-            if (err <= inlier_th_px)
-                inlier_pts.push_back(points[i]);
-        }
-
-        if ((int)inlier_pts.size() >= 5)
-        {
-            try
-            {
-                best.ellipse = cv::fitEllipse(inlier_pts);
-                best.ok = true;
-                best.inliers = (int)inlier_pts.size();
-            }
-            catch (...)
-            {
-                best.ok = false;
-            }
-        }
-        else
-        {
-            best.ok = false;
-        }
-        return best;
-    }
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////工具代码结尾
-
-    static EllipseResult calculate_best_ellipse(const cv::Mat &frame,                   // 原图像帧
-                                                const object_detect_result &det_result, // 检测框
-                                                uint8_t *mask_data,                     // 掩码数据
-                                                bool force_box_mode,                    // 标志位，是否强制走检测框的内切圆
-                                                float deviation_threshold_ratio)        // 偏差阈值比例：用于判断 mask 拟合的椭圆中心是否离 box 中心太远
-    {
-        EllipseResult result{};
-        bool fit_success = false;
-
-        cv::Point2f box_center(det_result.x + det_result.w / 2.0f, // 检测框中心点
-                               det_result.y + det_result.h / 2.0f);
-
-        // --- 策略 1: 尝试 Mask 拟合 ---
-        if (mask_data && !force_box_mode)
-        {
-            int x = std::max(0, det_result.x);
-            int y = std::max(0, det_result.y);
-            int w = std::min((int)det_result.w, frame.cols - x);
-            int h = std::min((int)det_result.h, frame.rows - y);
-
-            if (w > 0 && h > 0)
-            {
-                cv::Rect roi_rect(x, y, w, h);                                 // 一个矩形区域
-                cv::Mat full_mask(frame.rows, frame.cols, CV_8UC1, mask_data); // 用mask区域包装了一个Mat
-                cv::Mat roi_mask = full_mask(roi_rect);                        // 仍然是视图，没有拷贝，意思就是 用一个roi_mask 表示了 full_mask中roi_rect 的这个区域   （引用同一块内存的一部分）
-                cv::Mat contour_input = roi_mask.clone();                      // 深拷贝了一份
-
-                // 找轮廓   有多少个"白色孤岛"就扫描多少个轮廓
-                /*
-                段代码的核心函数 cv::findContours 基于著名的 Suzuki85 算法（Suzuki & Abe, 1985）。 findContours 的工作原理就像是一个机器人在遍历图像：
-                1.它逐行扫描图像，直到遇到一个非零像素（通常是白色，代表物体）。
-                2.一旦遇到，它就沿着这块白色区域的边缘行走，直到回到原点。
-                3.它把沿途经过的坐标点记录下来，这就形成了一个轮廓。
-                */
-                std::vector<std::vector<cv::Point>> contours;                                          // 轮廓点集
-                cv::findContours(contour_input, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE); // RETR_EXTERNAL：只找外轮廓（忽略洞/内轮廓）  CHAIN_APPROX_SIMPLE：压缩轮廓点（减少点数）
-
-                if (!contours.empty())
-                {
-                    // ------- 更鲁棒：合并多个轮廓 + 轻量RANSAC拟合椭圆 -------
-                    std::vector<cv::Point> all_pts;
-                    all_pts.reserve(1000);
-
-                    // ROI坐标系下 box_center（因为 contour 点在 ROI 内）   坐标变换一下
-                    const float cx_roi = box_center.x - (float)x;
-                    const float cy_roi = box_center.y - (float)y;
-
-                    // 过滤阈值（代价很低，但鲁棒性提升巨大）
-                    const double roi_area = (double)w * (double)h;
-                    const double area_min = 0.005 * roi_area;                      // ROI面积的0.5% 过滤小噪声
-                    const float dist_limit = 0.80f * std::min((float)w, (float)h); // 轮廓重心离box中心太远就不要
-
-                    for (auto &c : contours)
-                    {
-                        if (c.size() < 5)
-                            continue;
-                        double area = std::fabs(cv::contourArea(c));  //格林公式计算面积
-                        if (area < area_min)
-                            continue;
-
-                        cv::Moments mu = cv::moments(c);  //计算轮廓的图像距
-                        if (std::fabs(mu.m00) < 1e-6)   //m00代表0阶距，对于二值图像或轮廓来说，就是轮廓面积
-                            continue;
-                        float ccx = (float)(mu.m10 / mu.m00);
-                        float ccy = (float)(mu.m01 / mu.m00);  //计算重心位置        重心=力矩/总质量
-                        float dist = std::hypot(ccx - cx_roi, ccy - cy_roi);    //计算欧氏距离
-                        if (dist > dist_limit)
-                            continue;
-
-                        all_pts.insert(all_pts.end(), c.begin(), c.end());
-                    }
-
-                    // 点太少就算失败（走box保底）
-                    if ((int)all_pts.size() >= 20)
-                    {
-                        // downsample 到 <=150，保证实时性    下采样设置
-                        const int MAX_PTS = 150;
-                        std::vector<cv::Point> ds;
-                        ds.reserve(std::min((int)all_pts.size(), MAX_PTS));
-
-                        int step = std::max(1, (int)all_pts.size() / MAX_PTS);  //计算步长   就是每隔step间距取一个点
-                        for (int i = 0; i < (int)all_pts.size(); i += step)
-                            ds.push_back(all_pts[i]);
-
-
-                        // 轻量RANSAC参数：可以按机器性能调
-                        // iters 80~150；inlier阈值 2~4px
-                        auto rf = fit_ellipse_ransac(ds,
-                                                     120,   // iters   迭代次数
-                                                     3.0f,  // inlier_th_px    阈值。点距离椭圆边 3 像素以内算“自己人”。
-                                                     0.45f, // min_inlier_ratio   比例。至少 45% 的点要在椭圆上，才算拟合成功
-                                                     6.0f); // max_axis_ratio     形状限制。长轴/短轴不能超过6（防止拟合成一根长面条）。
-
-                        if (rf.ok)  //如果拟合出椭圆了，进行坐标还原
-                        {
-                            cv::RotatedRect local_ellipse = rf.ellipse;
-
-                            result.rect = local_ellipse;
-                            // ROI坐标 -> 全图坐标
-                            result.rect.center.x += (float)x;
-                            result.rect.center.y += (float)y;
-
-                            // 偏差校验：mask椭圆中心不能离box_center太远
-                            float distc = std::hypot(result.rect.center.x - box_center.x,
-                                                     result.rect.center.y - box_center.y);
-
-                            float limit_dist = std::min((float)det_result.w, (float)det_result.h) * deviation_threshold_ratio;
-
-                            if (distc <= limit_dist)
-                            {
-                                result.is_from_mask = true;
-                                fit_success = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- 策略 2: Box 保底（内切圆/正方形）---
-        if (!fit_success)
-        {
-            float min_s = std::min((float)det_result.w, (float)det_result.h);
-            cv::Size2f size(min_s, min_s);
-            result.rect = cv::RotatedRect(box_center, size, 0.0f);
-            result.is_from_mask = false;
-        }
-
-
-        //这里Cany方法单独罗列出来  如有需要自行添加, 对于我们本项目里面的处理逻辑，如果yolo都检测失败了，那也就没必要去拟合椭圆了，
-        //强行Cany拟合效果肯定很差，不如保持上一帧结果输出就行.
-
-
-        return result;
     }
 
     // 像素混合  alpha_beta为上色深度的占比
@@ -580,9 +311,13 @@ private:
     // 绘制结果： det + mask 绘制保留
     // 在最后追加：cls0/1/2 择优 + PoseSolve + Dist
     // ============================================================
-    void draw_results_on_frame(cv::Mat &frame,   //要绘制的图像帧
+    void draw_results_on_frame(uint64_t frame_id,
+                               cv::Mat &frame,   //要绘制的图像帧
                                const object_detect_result_list &result,
+                               bool use_mask_fit_class0,
+                               bool use_mask_fit_class1,
                                bool use_mask_fit_class2,   //对于最里面的小圆 是采用哪种方法拟合椭圆
+                               bool force_box_for_reference_ring,
                                float deviation_threshold_ratio) //mask 拟合椭圆的合理性门槛(中心偏差比例),用来判断mask拟合的椭圆离检测框的中心是否太远
     //直接把检测框、mask 着色、椭圆、姿态轴、文字信息画到 frame 上;
     //如果缺少关键目标，会在画面上显示 "Pose: --" "Dist: --" 然后 return;
@@ -612,10 +347,15 @@ private:
         color_weights[2][2] = 0; // 青
 
         const auto &seg_result = result.results_mask[0];
+        const cv::Mat fitting_image = frame.clone();
+
+        EllipseFitConfig ellipse_config;
+        ellipse_config.center_deviation_ratio = deviation_threshold_ratio;
+        const EllipseFitter ellipse_fitter(ellipse_config);
 
         //存储拟合的每个圆，共姿态结算使用，避免多次拟合
-        std::vector<EllipseResult> store_EllipseResult ;
-        store_EllipseResult.reserve(result.count);
+        std::vector<EllipseFitResult> ellipse_results;
+        ellipse_results.reserve(result.count);
 
         for (int i = 0; i < result.count; i++)
         {
@@ -625,32 +365,51 @@ private:
             int y = std::max(0, det_box.y);
             int w = std::min((int)det_box.w, frame.cols - x);
             int h = std::min((int)det_box.h, frame.rows - y);
-            cv::Rect box(x, y, w, h);
-            cv::rectangle(frame, box, cv::Scalar(0, 0, 255), 2);  //画检测框 2个像素宽
+            if (w > 0 && h > 0)
+            {
+                cv::Rect box(x, y, w, h);
+                cv::rectangle(frame, box, cv::Scalar(0, 0, 255), 2);  //画检测框 2个像素宽
+            }
 
             // mask 指针
             uint8_t *raw_mask_ptr = nullptr;
             int class_id = det_box.cls_id;
-            raw_mask_ptr = seg_result.each_of_mask[i].get();  //每个框和他的掩码是一一对应的
+            if (i < static_cast<int>(seg_result.each_of_mask.size()) &&
+                seg_result.each_of_mask[i])
+            {
+                raw_mask_ptr = seg_result.each_of_mask[i].get();  //每个框和它的掩码一一对应
+            }
             
             
             
-            // 类别2是否强制 box
-            bool force_box = false;
-            if (class_id == 2 && !use_mask_fit_class2)
-                force_box = true;
+            // 验收保底模式可同时强制 cls0/cls1 使用检测框内切圆。
+            const bool force_box =
+                (class_id == 0 && (force_box_for_reference_ring || !use_mask_fit_class0)) ||
+                (class_id == 1 && (force_box_for_reference_ring || !use_mask_fit_class1)) ||
+                (class_id == 2 && !use_mask_fit_class2);
 
 
                 
-            EllipseResult ellipse_res = calculate_best_ellipse(frame, det_box, raw_mask_ptr, force_box, deviation_threshold_ratio);
-            cv::Scalar e_color = ellipse_res.is_from_mask ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);  //cv::Scalar调色用  是掩码的话绿色，否则黄色
-            cv::ellipse(frame, ellipse_res.rect, e_color, 2);  //在图像上绘制一个椭圆  线宽为2
-            cv::circle(frame, ellipse_res.rect.center, 2, cv::Scalar(0, 0, 255), -1);  //画椭圆的中心点   -1表示填充，也就是一个实心圆心
+            const cv::Rect detection_rect(det_box.x, det_box.y, det_box.w, det_box.h);
+            const EllipseFitMode fit_mode = force_box
+                                                ? EllipseFitMode::ForceBox
+                                                : (class_id == 0 || class_id == 1
+                                                       ? EllipseFitMode::PreferMaskNoEdge
+                                                       : EllipseFitMode::PreferMask);
+            EllipseFitResult ellipse_result = ellipse_fitter.Fit(
+                fitting_image, detection_rect, raw_mask_ptr, fit_mode);
+            const cv::Scalar e_color = ellipse_result.source == EllipseSource::Mask
+                                           ? cv::Scalar(0, 255, 0)
+                                           : (ellipse_result.source == EllipseSource::Edge
+                                                  ? cv::Scalar(255, 0, 255)
+                                                  : cv::Scalar(0, 255, 255));
+            cv::ellipse(frame, ellipse_result.ellipse, e_color, 2);
+            cv::circle(frame, ellipse_result.ellipse.center, 2, cv::Scalar(0, 0, 255), -1);
 
-            store_EllipseResult.push_back(std::move(ellipse_res));
+            ellipse_results.push_back(std::move(ellipse_result));
 
             // ROI mask 上色
-            if (raw_mask_ptr && w > 0 && h > 0 && class_id >= 0)
+            if (raw_mask_ptr && w > 0 && h > 0 && class_id >= 0 && class_id < 3)
             {
                 cv::Mat full_mask(frame.rows, frame.cols, CV_8UC1, raw_mask_ptr);  //CV_8UC1单通道灰度图
                 #pragma omp parallel for  //开启多线程并行加速 告诉编译器，把下面的for循环拆开分给cpu的多个核心同时执行
@@ -677,10 +436,19 @@ private:
         const int CLS1_ID = 1; // 中圈
         const int CLS2_ID = 2; // 内孔
 
-        //找预测结果里面最优的目标（置信度最高）
-        int idx0 = pick_best_idx_by_class(result, CLS0_ID);
-        int idx1 = pick_best_idx_by_class(result, CLS1_ID);
-        int idx2 = pick_best_idx_by_class(result, CLS2_ID);
+        // 联合检测置信度、拟合质量和双圆几何一致性选择最优目标组合。
+        std::vector<int> class_ids(result.count);
+        std::vector<float> detection_confidences(result.count);
+        for (int i = 0; i < result.count; ++i)
+        {
+            class_ids[i] = result.results_box[i].cls_id;
+            detection_confidences[i] = result.results_box[i].prop;
+        }
+        const RingPairSelection ring_pair = _ring_pair_refiner.SelectAndRefine(
+            class_ids, detection_confidences, ellipse_results, CLS0_ID, CLS1_ID);
+        int idx0 = ring_pair.outer_index;
+        int idx1 = ring_pair.middle_index;
+        int idx2 = pick_best_idx_by_class(result, ellipse_results, CLS2_ID);
 
         // Python 同逻辑：必须有孔 + (外圈或中圈)  才能进行姿态解算
         if (idx2 < 0 || (idx0 < 0 && idx1 < 0))
@@ -689,84 +457,70 @@ private:
             draw_txt(frame, "Dist: --", 240, C_CYAN, 1.2);
             return;
         }
-
-
-
-        //定义在函数内部的“临时小函数”，Lambda表达式
-        //[&] : 按引用捕获外部作用域的所有变量
-        //(int cls_id) : 参数列表
-        //->uint8_t *  : 尾置返回类型
-        auto mask_ptr_of = [&](int index) -> uint8_t *
+        // 实时业务线程可能乱序：只允许更新 frame_id 更新的帧进入时序滤波状态。
+        if (_enable_temporal_filter)
         {
-            if (index < 0 || index >= (int)seg_result.each_of_mask.size())
-                return nullptr;
-            if (!seg_result.each_of_mask[index])
-                return nullptr;
-            return seg_result.each_of_mask[index].get();
-        };
-        ///////////Lambda表达式结束
-
-
+            std::lock_guard<std::mutex> lock(_ellipse_filter_mutex);
+            if (!_has_filtered_frame || frame_id > _last_filtered_frame_id)
+            {
+                if (idx0 >= 0) ellipse_results[idx0] = _ellipse_temporal_filter.Update(0, ellipse_results[idx0]);
+                if (idx1 >= 0) ellipse_results[idx1] = _ellipse_temporal_filter.Update(1, ellipse_results[idx1]);
+                ellipse_results[idx2] = _ellipse_temporal_filter.Update(2, ellipse_results[idx2]);
+                _last_filtered_frame_id = frame_id;
+                _has_filtered_frame = true;
+            }
+        }
 
         // cand0 / cand1
         bool has0 = (idx0 >= 0);
         bool has1 = (idx1 >= 0);
 
-        EllipseResult cand0{}, cand1{};
+        EllipseFitResult cand0{}, cand1{};
         if (has0)
         {
-            // cand0 = calculate_best_ellipse(frame, result.results_box[idx0], mask_ptr_of(idx0), false, deviation_threshold_ratio);
-            cand0 = store_EllipseResult[idx0];
+            cand0 = ellipse_results[idx0];
         }
         if (has1)
         {
-            // cand1 = calculate_best_ellipse(frame, result.results_box[idx1], mask_ptr_of(idx1), false, deviation_threshold_ratio);
-            cand1 = store_EllipseResult[idx1];
+            cand1 = ellipse_results[idx1];
         }
 
-        //// hole（cls2）：可选用 mask 拟合；如果开关关了就强制 box
-        // bool force_box2 = !use_mask_fit_class2;
-        // EllipseResult hole_e = calculate_best_ellipse(frame, result.results_box[idx2], mask_ptr_of(idx2), force_box2, deviation_threshold_ratio);
-          EllipseResult& hole_e=store_EllipseResult[idx2];
+        const EllipseFitResult &hole_ellipse = ellipse_results[idx2];
 
-        cv::Point2f hole_center = hole_e.rect.center;
+        cv::Point2f hole_center = hole_ellipse.ellipse.center;
        
 
-        // 择优策略：优先 cand0=Mask，否则 cand1=Mask，否则 cand0
+        // 在已通过联合约束的外/中圈中按综合质量选择位姿参考。
         cv::RotatedRect target;
         bool use_cls1 = false;
         bool ok_target = false;
 
         if (has0 && has1)
         {
-            if (cand0.is_from_mask)
+            const float outer_score = EllipseSelectionScore(cand0, result.results_box[idx0].prop);
+            const float middle_score = EllipseSelectionScore(cand1, result.results_box[idx1].prop);
+            if (outer_score >= middle_score)
             {
-                target = cand0.rect;
+                target = cand0.ellipse;
                 use_cls1 = false;
-                ok_target = true;
-            }
-            else if (cand1.is_from_mask)
-            {
-                target = cand1.rect;
-                use_cls1 = true;
                 ok_target = true;
             }
             else
             {
-                target = cand0.rect;
-                use_cls1 = false;
+                target = cand1.ellipse;
+                use_cls1 = true;
                 ok_target = true;
             }
         }
         else if (has0)
         {
-            target = cand0.rect;
+            target = cand0.ellipse;
             use_cls1 = false;
             ok_target = true;
         }
         else if (has1)
         {
-            target = cand1.rect;
+            target = cand1.ellipse;
             use_cls1 = true;
             ok_target = true;
         }
@@ -777,7 +531,7 @@ private:
 
         // 正主高亮  C_CYAN青色
         cv::ellipse(frame, target, C_CYAN, 4);
-        cv::ellipse(frame, hole_e.rect, C_CYAN, 4);
+        cv::ellipse(frame, hole_ellipse.ellipse, C_CYAN, 4);
         cv::circle(frame, hole_center, 6, C_CYAN, -1);
         cv::line(frame, target.center, hole_center, C_CYAN, 3);  //绘制姿态轴线，画一条直线连接 两个椭圆的中心
 
@@ -870,8 +624,11 @@ private:
                 {
                     cv::Mat &frame_to_draw = *(p->_src_image_frame);
 
-                    this->draw_results_on_frame(frame_to_draw, r,
+                    this->draw_results_on_frame(fid, frame_to_draw, r,
+                                                this->_enable_mask_fit_for_class0,
+                                                this->_enable_mask_fit_for_class1,
                                                 this->_enable_mask_fit_for_class2,
+                                                this->_force_box_for_reference_ring,
                                                 this->_max_deviation_ratio);
 
                     if (this->_biz_callback)
@@ -895,8 +652,17 @@ private:
     BusinessCallback _biz_callback = nullptr;
 
     // ===== 控制参数 =====
-    bool _enable_mask_fit_for_class2 = true;
+    bool _enable_mask_fit_for_class0 = true;
+    bool _enable_mask_fit_for_class1 = true;
+    bool _enable_mask_fit_for_class2 = false;
+    bool _force_box_for_reference_ring = false;
     float _max_deviation_ratio = 0.3f;
+    bool _enable_temporal_filter = true;
+    RingPairRefiner _ring_pair_refiner;
+    EllipseTemporalFilter _ellipse_temporal_filter;
+    std::mutex _ellipse_filter_mutex;
+    uint64_t _last_filtered_frame_id = 0;
+    bool _has_filtered_frame = false;
 
     // ===== 新增：Pose/Depth 控制参数 =====
     bool _display_fixed_mode = false;

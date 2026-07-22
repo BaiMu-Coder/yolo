@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import sys
@@ -56,13 +57,17 @@ class Config:
     hole_class_id: int = 2
 
     # 椭圆拟合（对应 C++ final_version 的参数）
-    mask_fit_hole: bool = True
+    mask_fit_hole: bool = False
+    force_reference_box: bool = False
     ellipse_deviation_ratio: float = 0.30
-    ellipse_ransac_iters: int = 120
+    ellipse_ransac_iters: int = 160
     ellipse_inlier_px: float = 3.0
-    ellipse_min_inlier_ratio: float = 0.45
+    ellipse_min_inlier_ratio: float = 0.42
     ellipse_max_axis_ratio: float = 6.0
-    ellipse_max_points: int = 150
+    ellipse_max_points: int = 180
+    ellipse_min_quality: float = 0.52
+    enable_edge_fallback: bool = True
+    enable_ellipse_smoothing: bool = True
 
     # 相机内参、畸变与锥套物理尺寸（单位 mm，完全对应 C++）
     fx: float = 1639.6
@@ -146,9 +151,19 @@ class Detection:
 @dataclass
 class EllipseResult:
     ellipse: Ellipse
-    from_mask: bool
+    source: str = "box"
     inliers: int = 0
     mean_error_px: Optional[float] = None
+    sampled_points: int = 0
+    inlier_ratio: float = 0.0
+    center_deviation_ratio: float = 0.0
+    quality: float = 0.0
+    geometry_consistent: bool = True
+    temporally_filtered: bool = False
+
+    @property
+    def from_mask(self) -> bool:
+        return self.source == "mask"
 
 
 @dataclass
@@ -252,7 +267,9 @@ def ransac_ellipse(points: np.ndarray, cfg: Config) -> Optional[EllipseResult]:
         count = int(np.count_nonzero(inlier_mask))
         mean = float(np.mean(errors[inlier_mask])) if count else math.inf
         if best is None or count > best.inliers or (count == best.inliers and mean < (best.mean_error_px or math.inf)):
-            best = EllipseResult(ellipse, True, count, mean)
+            best = EllipseResult(ellipse=ellipse, source="mask", inliers=count,
+                                 mean_error_px=mean, sampled_points=len(points),
+                                 inlier_ratio=count / len(points))
             best_inlier_mask = inlier_mask
     required = max(20, int(math.ceil(cfg.ellipse_min_inlier_ratio * len(points))))
     if best is None or best.inliers < required or best_inlier_mask is None:
@@ -262,12 +279,51 @@ def ransac_ellipse(points: np.ndarray, cfg: Config) -> Optional[EllipseResult]:
         refined = cv2.fitEllipse(refined_points.reshape(-1, 1, 2).astype(np.float32))
     except cv2.error:
         return None
-    return EllipseResult(refined, True, len(refined_points),
-                         float(np.mean(radial_errors(refined, refined_points))))
+    return EllipseResult(ellipse=refined, source="mask", inliers=len(refined_points),
+                         mean_error_px=float(np.mean(radial_errors(refined, refined_points))),
+                         sampled_points=len(points), inlier_ratio=len(refined_points) / len(points))
 
 
-def best_ellipse(det: Detection, cfg: Config, force_box: bool = False) -> EllipseResult:
+def _score_candidate(candidate: EllipseResult, det: Detection, cfg: Config) -> Optional[EllipseResult]:
+    cx, cy = candidate.ellipse[0]
     box_center = (det.x + det.w * 0.5, det.y + det.h * 0.5)
+    short_side = max(1.0, float(min(det.w, det.h)))
+    candidate.center_deviation_ratio = math.hypot(cx - box_center[0], cy - box_center[1]) / short_side
+    major, minor = max(candidate.ellipse[1]), min(candidate.ellipse[1])
+    if candidate.center_deviation_ratio > cfg.ellipse_deviation_ratio or minor < 0.2 * short_side:
+        return None
+    error = candidate.mean_error_px if candidate.mean_error_px is not None else math.inf
+    error_quality = math.exp(-error / max(0.5, cfg.ellipse_inlier_px))
+    center_quality = max(0.0, 1.0 - candidate.center_deviation_ratio / cfg.ellipse_deviation_ratio)
+    shape_quality = max(0.0, min(1.0, 1.0 - (major / max(minor, 1e-3) - 1.0) /
+                                 max(1.0, cfg.ellipse_max_axis_ratio - 1.0)))
+    bonus = 0.05 if candidate.source == "mask" else 0.0
+    candidate.quality = min(1.0, 0.42 * candidate.inlier_ratio + 0.25 * error_quality +
+                            0.20 * center_quality + 0.13 * shape_quality + bonus)
+    return candidate
+
+
+def _fit_points(points: np.ndarray, det: Detection, cfg: Config, source: str) -> Optional[EllipseResult]:
+    if len(points) < 20:
+        return None
+    step = max(1, len(points) // cfg.ellipse_max_points)
+    fitted = ransac_ellipse(points[::step][:cfg.ellipse_max_points], cfg)
+    if fitted is None:
+        return None
+    (cx, cy), size, angle = fitted.ellipse
+    fitted.ellipse = ((cx + det.x, cy + det.y), size, angle)
+    fitted.source = source
+    return _score_candidate(fitted, det, cfg)
+
+
+def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
+                 force_box: bool = False, allow_edge: bool = True) -> EllipseResult:
+    box_center = (det.x + det.w * 0.5, det.y + det.h * 0.5)
+    side = float(min(det.w, det.h))
+    fallback = EllipseResult((box_center, (side, side), 0.0), source="box", quality=0.38)
+    if force_box:
+        return fallback
+    candidates: List[EllipseResult] = []
     if det.mask is not None and not force_box:
         roi = det.mask[det.y:det.y + det.h, det.x:det.x + det.w].copy()
         contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -287,17 +343,24 @@ def best_ellipse(det: Detection, cfg: Config, force_box: bool = False) -> Ellips
         if selected:
             points = np.concatenate(selected)
             if len(points) >= 20:
-                step = max(1, len(points) // cfg.ellipse_max_points)
-                fitted = ransac_ellipse(points[::step][:cfg.ellipse_max_points], cfg)
+                fitted = _fit_points(points, det, cfg, "mask")
                 if fitted is not None:
-                    (cx, cy), size, angle = fitted.ellipse
-                    fitted.ellipse = ((cx + det.x, cy + det.y), size, angle)
-                    limit = min(det.w, det.h) * cfg.ellipse_deviation_ratio
-                    if math.hypot(fitted.ellipse[0][0] - box_center[0],
-                                  fitted.ellipse[0][1] - box_center[1]) <= limit:
-                        return fitted
-    side = float(min(det.w, det.h))
-    return EllipseResult((box_center, (side, side), 0.0), False)
+                    candidates.append(fitted)
+    if allow_edge and cfg.enable_edge_fallback and (not candidates or max(x.quality for x in candidates) < 0.72):
+        roi_gray = cv2.cvtColor(frame[det.y:det.y + det.h, det.x:det.x + det.w], cv2.COLOR_BGR2GRAY)
+        roi_gray = cv2.GaussianBlur(roi_gray, (5, 5), 1.2)
+        edges = cv2.Canny(cv2.equalizeHist(roi_gray), 45, 135, L2gradient=True)
+        edges[:3, :], edges[-3:, :], edges[:, :3], edges[:, -3:] = 0, 0, 0, 0
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        edge_points = [c.reshape(-1, 2) for c in contours if len(c) >= 18]
+        if edge_points:
+            fitted = _fit_points(np.concatenate(edge_points), det, cfg, "edge")
+            if fitted is not None:
+                candidates.append(fitted)
+    if not candidates:
+        return fallback
+    best = max(candidates, key=lambda item: item.quality + (0.03 if item.source == "mask" else 0.0))
+    return best if best.quality >= cfg.ellipse_min_quality else fallback
 
 
 class PoseEstimatorLM:
@@ -450,15 +513,105 @@ class PoseSmoother:
         return None, False
 
 
+def refine_ring_pair(outer: EllipseResult, middle: EllipseResult) -> bool:
+    """双圆环联合约束；一致时融合圆心，不一致时惩罚较差候选。"""
+    outer_major, outer_minor = max(outer.ellipse[1]), min(outer.ellipse[1])
+    middle_major, middle_minor = max(middle.ellipse[1]), min(middle.ellipse[1])
+    if min(outer_major, outer_minor, middle_major, middle_minor) <= 0:
+        return False
+    size_error = abs(middle_major / outer_major - 980.0 / 1200.0) / 0.22
+    center_error = math.dist(outer.ellipse[0], middle.ellipse[0]) / max(1.0, outer_major * 0.14)
+    axis_error = abs(outer_major / outer_minor - middle_major / middle_minor) / 0.28
+    ao = (outer.ellipse[2] + (90.0 if outer.ellipse[1][0] < outer.ellipse[1][1] else 0.0)) % 180.0
+    am = (middle.ellipse[2] + (90.0 if middle.ellipse[1][0] < middle.ellipse[1][1] else 0.0)) % 180.0
+    angle_error = min(abs(ao - am), 180.0 - abs(ao - am)) / 24.0
+    consistent = max(size_error, center_error, axis_error, angle_error) <= 1.0
+    outer.geometry_consistent = middle.geometry_consistent = consistent
+    if not consistent:
+        if outer.quality >= middle.quality:
+            middle.quality *= 0.35
+        else:
+            outer.quality *= 0.35
+        return False
+    score = max(0.0, 1.0 - (0.34 * size_error + 0.34 * center_error +
+                            0.18 * axis_error + 0.14 * angle_error))
+    weight_sum = max(0.05, outer.quality) + max(0.05, middle.quality)
+    common = ((np.asarray(outer.ellipse[0]) * max(0.05, outer.quality) +
+               np.asarray(middle.ellipse[0]) * max(0.05, middle.quality)) / weight_sum)
+    for ellipse in (outer, middle):
+        center = np.asarray(ellipse.ellipse[0])
+        fused = center + 0.35 * (common - center)
+        ellipse.ellipse = ((float(fused[0]), float(fused[1])), ellipse.ellipse[1], ellipse.ellipse[2])
+        ellipse.quality = min(1.0, ellipse.quality + 0.12 * score)
+    return True
+
+
+def select_ring_pair(detections: Sequence[Detection], ellipses: List[EllipseResult],
+                     outer_class_id: int, middle_class_id: int) -> Tuple[int, int]:
+    outers = [i for i, det in enumerate(detections) if det.class_id == outer_class_id]
+    middles = [i for i, det in enumerate(detections) if det.class_id == middle_class_id]
+    if not outers or not middles:
+        return (pick_best(detections, outer_class_id, ellipses),
+                pick_best(detections, middle_class_id, ellipses))
+    best_score, best_pair = -math.inf, (-1, -1)
+    for outer_idx in outers:
+        for middle_idx in middles:
+            outer, middle = copy.deepcopy(ellipses[outer_idx]), copy.deepcopy(ellipses[middle_idx])
+            consistent = refine_ring_pair(outer, middle)
+            score = (0.55 * detections[outer_idx].score + 0.45 * outer.quality +
+                     0.55 * detections[middle_idx].score + 0.45 * middle.quality +
+                     (0.45 if consistent else -0.35))
+            if score > best_score:
+                best_score, best_pair = score, (outer_idx, middle_idx)
+    refine_ring_pair(ellipses[best_pair[0]], ellipses[best_pair[1]])
+    return best_pair
+
+
+class EllipseSmoother:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.values: Dict[int, EllipseResult] = {}
+
+    def update(self, class_id: int, current: EllipseResult) -> EllipseResult:
+        previous = self.values.get(class_id)
+        if previous is None or not self.cfg.enable_ellipse_smoothing:
+            self.values[class_id] = current
+            return current
+        previous_major = max(1.0, max(previous.ellipse[1]))
+        jump = math.dist(previous.ellipse[0], current.ellipse[0]) / previous_major
+        size_change = abs(max(current.ellipse[1]) - previous_major) / previous_major
+        if (jump > 0.45 or size_change > 0.55) and current.quality < 0.62:
+            held = EllipseResult(**{**previous.__dict__})
+            held.quality *= 0.92
+            held.temporally_filtered = True
+            self.values[class_id] = held
+            return held
+        alpha = 0.18 + (0.72 - 0.18) * max(0.0, min(1.0, current.quality))
+        pc, cc = np.asarray(previous.ellipse[0]), np.asarray(current.ellipse[0])
+        ps, cs = np.asarray(previous.ellipse[1]), np.asarray(current.ellipse[1])
+        center, size = (1.0 - alpha) * pc + alpha * cc, (1.0 - alpha) * ps + alpha * cs
+        delta = ((current.ellipse[2] - previous.ellipse[2] + 90.0) % 180.0) - 90.0
+        current.ellipse = ((float(center[0]), float(center[1])),
+                           (float(size[0]), float(size[1])),
+                           float((previous.ellipse[2] + alpha * delta) % 180.0))
+        current.temporally_filtered = True
+        self.values[class_id] = current
+        return current
+
+
 def draw_text(image: np.ndarray, text: str, y: int, color: Tuple[int, int, int],
               scale: float = 1.0, thickness: int = 2) -> None:
     cv2.putText(image, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 3)
     cv2.putText(image, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
 
 
-def pick_best(detections: Sequence[Detection], class_id: int) -> int:
+def pick_best(detections: Sequence[Detection], class_id: int,
+              ellipses: Optional[Sequence[EllipseResult]] = None) -> int:
     indices = [i for i, det in enumerate(detections) if det.class_id == class_id]
-    return max(indices, key=lambda i: detections[i].score) if indices else -1
+    if not indices:
+        return -1
+    return max(indices, key=lambda i: detections[i].score if ellipses is None else
+               0.55 * detections[i].score + 0.45 * ellipses[i].quality)
 
 
 def pose_dict(pose: Optional[Pose6D]) -> Optional[Dict[str, float]]:
@@ -476,13 +629,16 @@ def valid_pose(pose: Optional[Pose6D]) -> Optional[Pose6D]:
 
 def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
                    estimator: PoseEstimatorLM, smoother: PoseSmoother,
+                   ellipse_smoother: EllipseSmoother,
                    frame_id: int, masks_dir: Path) -> Tuple[np.ndarray, Dict[str, Any]]:
     vis = frame.copy()
     colors = ((0, 0, 255), (0, 255, 0), (255, 255, 0))
     ellipses: List[EllipseResult] = []
     for i, det in enumerate(detections):
-        force_box = det.class_id == cfg.hole_class_id and not cfg.mask_fit_hole
-        ellipse = best_ellipse(det, cfg, force_box)
+        is_reference = det.class_id in (cfg.outer_class_id, cfg.middle_class_id)
+        force_box = ((is_reference and cfg.force_reference_box) or
+                     (det.class_id == cfg.hole_class_id and not cfg.mask_fit_hole))
+        ellipse = best_ellipse(frame, det, cfg, force_box, allow_edge=not is_reference)
         ellipses.append(ellipse)
         if cfg.draw_masks and det.mask is not None and 0 <= det.class_id < len(colors):
             active = det.mask > 0
@@ -495,20 +651,29 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
             cv2.putText(vis, f"{name} {det.score:.3f}", (det.x, max(18, det.y - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
         if cfg.draw_all_ellipses:
-            cv2.ellipse(vis, ellipse.ellipse, (0, 255, 0) if ellipse.from_mask else (0, 255, 255), 2)
+            color = (0, 255, 0) if ellipse.source == "mask" else ((255, 0, 255) if ellipse.source == "edge" else (0, 255, 255))
+            cv2.ellipse(vis, ellipse.ellipse, color, 2)
             cv2.circle(vis, tuple(np.rint(ellipse.ellipse[0]).astype(int)), 2, (0, 0, 255), -1)
         if cfg.save_masks and det.mask is not None and frame_id % max(1, cfg.mask_every) == 0:
             cv2.imwrite(str(masks_dir / f"frame_{frame_id:08d}_det_{i:03d}_cls_{det.class_id}.png"), det.mask)
 
-    idx0 = pick_best(detections, cfg.outer_class_id)
-    idx1 = pick_best(detections, cfg.middle_class_id)
-    idx2 = pick_best(detections, cfg.hole_class_id)
+    idx0, idx1 = select_ring_pair(detections, ellipses,
+                                  cfg.outer_class_id, cfg.middle_class_id)
+    idx2 = pick_best(detections, cfg.hole_class_id, ellipses)
+    if idx0 >= 0:
+        ellipses[idx0] = ellipse_smoother.update(cfg.outer_class_id, ellipses[idx0])
+    if idx1 >= 0:
+        ellipses[idx1] = ellipse_smoother.update(cfg.middle_class_id, ellipses[idx1])
+    if idx2 >= 0:
+        ellipses[idx2] = ellipse_smoother.update(cfg.hole_class_id, ellipses[idx2])
     target_idx = -1
     use_middle = False
     pose_auto = pose_fixed = None
     if idx2 >= 0 and (idx0 >= 0 or idx1 >= 0):
         if idx0 >= 0 and idx1 >= 0:
-            target_idx = idx0 if ellipses[idx0].from_mask else (idx1 if ellipses[idx1].from_mask else idx0)
+            score0 = 0.65 * ellipses[idx0].quality + 0.35 * detections[idx0].score
+            score1 = 0.65 * ellipses[idx1].quality + 0.35 * detections[idx1].score
+            target_idx = idx0 if score0 >= score1 else idx1
         else:
             target_idx = idx0 if idx0 >= 0 else idx1
         use_middle = detections[target_idx].class_id == cfg.middle_class_id
@@ -549,8 +714,12 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
             "class_name": cfg.class_names[det.class_id] if 0 <= det.class_id < len(cfg.class_names) else str(det.class_id),
             "ellipse": {"center": [float(x) for x in ellipse.ellipse[0]],
                         "size": [float(x) for x in ellipse.ellipse[1]],
-                        "angle_deg": float(ellipse.ellipse[2]), "from_mask": ellipse.from_mask,
-                        "inliers": ellipse.inliers, "mean_error_px": ellipse.mean_error_px},
+                        "angle_deg": float(ellipse.ellipse[2]), "source": ellipse.source,
+                        "from_mask": ellipse.from_mask, "quality": ellipse.quality,
+                        "inlier_ratio": ellipse.inlier_ratio, "inliers": ellipse.inliers,
+                        "mean_error_px": ellipse.mean_error_px,
+                        "geometry_consistent": ellipse.geometry_consistent,
+                        "temporally_filtered": ellipse.temporally_filtered},
         })
     return vis, {
         "frame_id": frame_id, "detections": det_details,
@@ -677,6 +846,10 @@ def parse_args(cfg: Config) -> Config:
     parser.add_argument("--output", help="覆盖输出目录")
     parser.add_argument("--no-show", action="store_true")
     parser.add_argument("--no-video", action="store_true")
+    parser.add_argument("--force-reference-box", action="store_true",
+                        help="外/中参考圈强制使用检测框内切圆")
+    parser.add_argument("--hole-mask", action="store_true",
+                        help="尝试使用 Mask 拟合内孔（默认使用检测框）")
     args = parser.parse_args()
     if args.model:
         cfg.model_path = args.model
@@ -696,6 +869,10 @@ def parse_args(cfg: Config) -> Config:
         cfg.show_window = False
     if args.no_video:
         cfg.save_video = False
+    if args.force_reference_box:
+        cfg.force_reference_box = True
+    if args.hole_mask:
+        cfg.mask_fit_hole = True
     return cfg
 
 
@@ -722,6 +899,7 @@ def main() -> int:
         source = FrameSource(cfg)
         model = PTModel(cfg)
         estimator, smoother = PoseEstimatorLM(cfg), PoseSmoother(cfg)
+        ellipse_smoother = EllipseSmoother(cfg)
         source_fps = source.fps if source.fps > 1e-3 else 25.0
         fps_out = cfg.output_fps if cfg.output_fps > 0 else source_fps / max(1, cfg.frame_step)
         if cfg.show_window:
@@ -734,7 +912,8 @@ def main() -> int:
             pose_file.write("\t".join(POSE_COLUMNS) + "\n")
             for frame_id, frame in source:
                 detections = model.infer(frame)
-                vis, detail = process_visual(frame, detections, cfg, estimator, smoother, frame_id, masks_dir)
+                vis, detail = process_visual(frame, detections, cfg, estimator, smoother,
+                                             ellipse_smoother, frame_id, masks_dir)
                 now = time.perf_counter()
                 instant_fps = 1.0 / max(now - last_time, 1e-9)
                 last_time = now

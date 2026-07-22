@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "ellipse_fitter.hpp"
 #include "image_process.hpp"
 #include "pose_estimator_lm.hpp"
 #include "yolov8seg.hpp"
@@ -34,7 +35,8 @@ struct Args {
     bool show = false;
     bool save_video_frames = false;
     bool display_fixed_pose = false;
-    bool fit_hole_from_mask = true;
+    bool fit_hole_from_mask = false;
+    bool force_reference_box = false;
     double fixed_distance_mm = 3000.0;
     float ellipse_deviation_ratio = 0.30f;
     int start_frame = 0;
@@ -56,7 +58,9 @@ static void print_help(const char* app) {
         << "  --save-video-frames        Also save every annotated video frame as JPG\n"
         << "  --display-fixed            Draw fixed-distance pose instead of auto pose\n"
         << "  --fixed-distance MM        Fixed distance, default 3000\n"
-        << "  --hole-box                 Force class-2 ellipse to use box inscribed circle\n"
+        << "  --hole-box                 Use box center/inscribed circle for cls2 (default)\n"
+        << "  --hole-mask                Try Mask ellipse fitting for cls2\n"
+        << "  --force-reference-box      Force cls0/cls1 to use box inscribed circles\n"
         << "  --start-frame N --end-frame N --frame-step N\n";
 }
 
@@ -81,6 +85,8 @@ static Args parse_args(int argc, char** argv) {
         else if (key == "--save-video-frames") args.save_video_frames = true;
         else if (key == "--display-fixed") args.display_fixed_pose = true;
         else if (key == "--hole-box") args.fit_hole_from_mask = false;
+        else if (key == "--hole-mask") args.fit_hole_from_mask = true;
+        else if (key == "--force-reference-box") args.force_reference_box = true;
         else if (key == "--help" || key == "-h") {
             print_help(argv[0]);
             std::exit(0);
@@ -101,136 +107,6 @@ static Args parse_args(int argc, char** argv) {
     return args;
 }
 
-struct EllipseResult {
-    cv::RotatedRect ellipse;
-    bool from_mask = false;
-    int inliers = 0;
-    float mean_error_px = std::numeric_limits<float>::infinity();
-};
-
-static float radial_error(const cv::RotatedRect& e, const cv::Point2f& p) {
-    const float a = e.size.width * 0.5f;
-    const float b = e.size.height * 0.5f;
-    if (a < 1e-3f || b < 1e-3f) return 1e9f;
-    const float x = p.x - e.center.x;
-    const float y = p.y - e.center.y;
-    const float angle = -e.angle * static_cast<float>(CV_PI) / 180.0f;
-    const float c = std::cos(angle), s = std::sin(angle);
-    const float xr = c * x - s * y;
-    const float yr = s * x + c * y;
-    const float r = std::sqrt(xr * xr / (a * a) + yr * yr / (b * b));
-    return std::abs(r - 1.0f) * std::min(a, b);
-}
-
-static bool fit_ellipse_ransac(const std::vector<cv::Point>& points, EllipseResult& result,
-                               int iterations = 120, float inlier_threshold = 3.0f,
-                               float min_inlier_ratio = 0.45f, float max_axis_ratio = 6.0f) {
-    const int count = static_cast<int>(points.size());
-    if (count < 20) return false;
-    std::mt19937 rng(12345);
-    std::uniform_int_distribution<int> pick(0, count - 1);
-    cv::RotatedRect best;
-    int best_inliers = 0;
-    float best_error = 1e9f;
-
-    for (int iteration = 0; iteration < iterations; ++iteration) {
-        std::vector<cv::Point> sample;
-        std::vector<int> indices;
-        while (sample.size() < 5) {
-            const int index = pick(rng);
-            if (std::find(indices.begin(), indices.end(), index) != indices.end()) continue;
-            indices.push_back(index);
-            sample.push_back(points[index]);
-        }
-        cv::RotatedRect candidate;
-        try { candidate = cv::fitEllipse(sample); }
-        catch (...) { continue; }
-        const float a = candidate.size.width * 0.5f;
-        const float b = candidate.size.height * 0.5f;
-        if (std::min(a, b) < 2.0f || std::max(a, b) / std::max(1e-3f, std::min(a, b)) > max_axis_ratio) continue;
-        int inliers = 0;
-        float error_sum = 0.0f;
-        for (const auto& point : points) {
-            const float error = radial_error(candidate, point);
-            if (error <= inlier_threshold) { ++inliers; error_sum += error; }
-        }
-        const float mean_error = inliers > 0 ? error_sum / inliers : 1e9f;
-        if (inliers > best_inliers || (inliers == best_inliers && mean_error < best_error)) {
-            best = candidate;
-            best_inliers = inliers;
-            best_error = mean_error;
-        }
-    }
-    const int required = std::max(20, static_cast<int>(std::ceil(min_inlier_ratio * count)));
-    if (best_inliers < required) return false;
-    std::vector<cv::Point> inlier_points;
-    for (const auto& point : points) {
-        if (radial_error(best, point) <= inlier_threshold) inlier_points.push_back(point);
-    }
-    if (inlier_points.size() < 5) return false;
-    try { best = cv::fitEllipse(inlier_points); }
-    catch (...) { return false; }
-    float error_sum = 0.0f;
-    for (const auto& point : inlier_points) error_sum += radial_error(best, point);
-    result.ellipse = best;
-    result.from_mask = true;
-    result.inliers = static_cast<int>(inlier_points.size());
-    result.mean_error_px = error_sum / inlier_points.size();
-    return true;
-}
-
-static EllipseResult calculate_ellipse(const cv::Mat& frame, const object_detect_result& detection,
-                                       const uint8_t* mask_data, bool force_box,
-                                       float deviation_ratio) {
-    EllipseResult result;
-    const cv::Point2f box_center(detection.x + detection.w * 0.5f,
-                                 detection.y + detection.h * 0.5f);
-    if (mask_data != nullptr && !force_box) {
-        const int x = std::max(0, detection.x);
-        const int y = std::max(0, detection.y);
-        const int width = std::min(detection.w, frame.cols - x);
-        const int height = std::min(detection.h, frame.rows - y);
-        if (width > 0 && height > 0) {
-            cv::Mat full_mask(frame.rows, frame.cols, CV_8UC1, const_cast<uint8_t*>(mask_data));
-            cv::Mat roi = full_mask(cv::Rect(x, y, width, height)).clone();
-            std::vector<std::vector<cv::Point>> contours;
-            cv::findContours(roi, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-            std::vector<cv::Point> all_points;
-            const double area_min = 0.005 * width * height;
-            const float distance_limit = 0.80f * std::min(width, height);
-            for (const auto& contour : contours) {
-                if (contour.size() < 5 || std::abs(cv::contourArea(contour)) < area_min) continue;
-                const cv::Moments moments = cv::moments(contour);
-                if (std::abs(moments.m00) < 1e-6) continue;
-                const float cx = static_cast<float>(moments.m10 / moments.m00);
-                const float cy = static_cast<float>(moments.m01 / moments.m00);
-                if (std::hypot(cx - (box_center.x - x), cy - (box_center.y - y)) <= distance_limit) {
-                    all_points.insert(all_points.end(), contour.begin(), contour.end());
-                }
-            }
-            if (all_points.size() >= 20) {
-                std::vector<cv::Point> sampled;
-                const int step = std::max(1, static_cast<int>(all_points.size()) / 150);
-                for (int i = 0; i < static_cast<int>(all_points.size()) && sampled.size() < 150; i += step) {
-                    sampled.push_back(all_points[i]);
-                }
-                if (fit_ellipse_ransac(sampled, result)) {
-                    result.ellipse.center.x += x;
-                    result.ellipse.center.y += y;
-                    const float deviation = std::hypot(result.ellipse.center.x - box_center.x,
-                                                       result.ellipse.center.y - box_center.y);
-                    if (deviation <= std::min(detection.w, detection.h) * deviation_ratio) return result;
-                }
-            }
-        }
-    }
-    const float side = static_cast<float>(std::min(detection.w, detection.h));
-    result.ellipse = cv::RotatedRect(box_center, cv::Size2f(side, side), 0.0f);
-    result.from_mask = false;
-    result.inliers = 0;
-    result.mean_error_px = std::numeric_limits<float>::quiet_NaN();
-    return result;
-}
 
 static void draw_text(cv::Mat& image, const std::string& text, int y,
                       const cv::Scalar& color, double scale = 0.8) {
@@ -238,14 +114,15 @@ static void draw_text(cv::Mat& image, const std::string& text, int y,
     cv::putText(image, text, {20, y}, cv::FONT_HERSHEY_SIMPLEX, scale, color, 2);
 }
 
-static int best_index(const object_detect_result_list& result, int class_id) {
+static int best_index(const object_detect_result_list& result,
+                      const std::vector<EllipseFitResult>& ellipses,
+                      int class_id) {
     int best = -1;
     float score = -1.0f;
     for (int i = 0; i < result.count; ++i) {
-        if (result.results_box[i].cls_id == class_id && result.results_box[i].prop > score) {
-            best = i;
-            score = result.results_box[i].prop;
-        }
+        if (result.results_box[i].cls_id != class_id || i >= static_cast<int>(ellipses.size())) continue;
+        const float candidate = EllipseSelectionScore(ellipses[i], result.results_box[i].prop);
+        if (candidate > score) { best = i; score = candidate; }
     }
     return best;
 }
@@ -275,6 +152,7 @@ public:
     bool process(const cv::Mat& input, const std::string& key, const OutputDirs& dirs,
                  cv::Mat& visualization) {
         if (input.empty()) return false;
+        if (args_.mode == "images") temporal_filter_.Reset();
         cv::Mat inference_frame = input.clone();
         image_process preprocessor(inference_frame);
         if (preprocessor.image_preprocessing(640, 640) != 0) return fail(key, "preprocess failed");
@@ -292,7 +170,10 @@ public:
         if (post_status != RKNN_SUCC) return fail(key, "postprocess failed");
 
         visualization = input.clone();
-        std::vector<EllipseResult> ellipse_results;
+        EllipseFitConfig fit_config;
+        fit_config.center_deviation_ratio = args_.ellipse_deviation_ratio;
+        const EllipseFitter ellipse_fitter(fit_config);
+        std::vector<EllipseFitResult> ellipse_results;
         ellipse_results.reserve(result.count);
         const cv::Scalar colors[3] = {{0, 0, 255}, {0, 255, 0}, {255, 255, 0}};
 
@@ -301,7 +182,7 @@ public:
         std::ofstream pose_file(dirs.poses / (key + ".txt"));
         if (!yolo_file || !ellipse_file || !pose_file) return fail(key, "cannot create txt output");
         yolo_file << std::fixed << std::setprecision(8);
-        ellipse_file << "# class_id center_x_px center_y_px major_axis_px minor_axis_px angle_deg confidence fit_source inliers mean_error_px\n"
+        ellipse_file << "# class_id center_x_px center_y_px major_axis_px minor_axis_px angle_deg confidence fit_source quality inlier_ratio inliers mean_error_px geometry_ok temporal\n"
                      << std::fixed << std::setprecision(6);
 
         for (int i = 0; i < result.count; ++i) {
@@ -311,9 +192,18 @@ public:
                 result.results_mask[0].each_of_mask[i]) {
                 mask = result.results_mask[0].each_of_mask[i].get();
             }
-            const bool force_box = detection.cls_id == 2 && !args_.fit_hole_from_mask;
-            EllipseResult ellipse = calculate_ellipse(input, detection, mask, force_box,
-                                                       args_.ellipse_deviation_ratio);
+            const bool is_reference = detection.cls_id == 0 || detection.cls_id == 1;
+            const bool force_box = (is_reference && args_.force_reference_box) ||
+                                   (detection.cls_id == 2 && !args_.fit_hole_from_mask);
+            const cv::Rect detection_rect(detection.x, detection.y,
+                                          detection.w, detection.h);
+            const EllipseFitMode fit_mode = force_box
+                                                ? EllipseFitMode::ForceBox
+                                                : (is_reference
+                                                       ? EllipseFitMode::PreferMaskNoEdge
+                                                       : EllipseFitMode::PreferMask);
+            EllipseFitResult ellipse = ellipse_fitter.Fit(
+                input, detection_rect, mask, fit_mode);
             ellipse_results.push_back(ellipse);
 
             const double center_x = (detection.x + detection.w * 0.5) / input.cols;
@@ -322,14 +212,6 @@ public:
             const double height = static_cast<double>(detection.h) / input.rows;
             yolo_file << detection.cls_id << ' ' << center_x << ' ' << center_y << ' '
                       << width << ' ' << height << ' ' << detection.prop << '\n';
-
-            const float major_axis = std::max(ellipse.ellipse.size.width, ellipse.ellipse.size.height);
-            const float minor_axis = std::min(ellipse.ellipse.size.width, ellipse.ellipse.size.height);
-            ellipse_file << detection.cls_id << ' ' << ellipse.ellipse.center.x << ' '
-                         << ellipse.ellipse.center.y << ' ' << major_axis << ' ' << minor_axis << ' '
-                         << ellipse.ellipse.angle << ' ' << detection.prop << ' '
-                         << (ellipse.from_mask ? "mask" : "box") << ' ' << ellipse.inliers << ' '
-                         << ellipse.mean_error_px << '\n';
 
             const int class_id = detection.cls_id;
             if (mask != nullptr && class_id >= 0 && class_id < 3) {
@@ -340,15 +222,50 @@ public:
                 cv::addWeighted(overlay, 0.5, visualization, 0.5, 0.0, visualization);
             }
             cv::rectangle(visualization, {detection.x, detection.y, detection.w, detection.h}, {0, 0, 255}, 2);
-            cv::ellipse(visualization, ellipse.ellipse, ellipse.from_mask ? cv::Scalar(0, 255, 0)
-                                                                         : cv::Scalar(0, 255, 255), 2);
+            const cv::Scalar fit_color = ellipse.source == EllipseSource::Mask
+                                             ? cv::Scalar(0, 255, 0)
+                                             : (ellipse.source == EllipseSource::Edge
+                                                    ? cv::Scalar(255, 0, 255)
+                                                    : cv::Scalar(0, 255, 255));
+            cv::ellipse(visualization, ellipse.ellipse, fit_color, 2);
             cv::circle(visualization, ellipse.ellipse.center, 2, {0, 0, 255}, -1);
             const std::string label = "cls=" + std::to_string(class_id) + " conf=" +
-                                      cv::format("%.3f", detection.prop);
+                                      cv::format("%.2f q=%.2f %s", detection.prop,
+                                                 ellipse.quality, EllipseSourceName(ellipse.source));
             cv::putText(visualization, label, {detection.x, std::max(18, detection.y - 5)},
                         cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 2);
         }
-        save_and_draw_pose(result, ellipse_results, visualization, pose_file);
+        std::vector<int> class_ids(result.count);
+        std::vector<float> detection_confidences(result.count);
+        for (int i = 0; i < result.count; ++i) {
+            class_ids[i] = result.results_box[i].cls_id;
+            detection_confidences[i] = result.results_box[i].prop;
+        }
+        const RingPairSelection pair = ring_refiner_.SelectAndRefine(
+            class_ids, detection_confidences, ellipse_results);
+        const int outer = pair.outer_index;
+        const int middle = pair.middle_index;
+        const int hole = best_index(result, ellipse_results, 2);
+        if (args_.mode == "video") {
+            if (outer >= 0) ellipse_results[outer] = temporal_filter_.Update(0, ellipse_results[outer]);
+            if (middle >= 0) ellipse_results[middle] = temporal_filter_.Update(1, ellipse_results[middle]);
+            if (hole >= 0) ellipse_results[hole] = temporal_filter_.Update(2, ellipse_results[hole]);
+        }
+        for (int i = 0; i < result.count; ++i) {
+            const auto& detection = result.results_box[i];
+            const auto& ellipse = ellipse_results[i];
+            ellipse_file << detection.cls_id << ' ' << ellipse.ellipse.center.x << ' '
+                         << ellipse.ellipse.center.y << ' '
+                         << std::max(ellipse.ellipse.size.width, ellipse.ellipse.size.height) << ' '
+                         << std::min(ellipse.ellipse.size.width, ellipse.ellipse.size.height) << ' '
+                         << ellipse.ellipse.angle << ' ' << detection.prop << ' '
+                         << EllipseSourceName(ellipse.source) << ' ' << ellipse.quality << ' '
+                         << ellipse.inlier_ratio << ' ' << ellipse.inliers << ' '
+                         << ellipse.mean_error_px << ' ' << ellipse.geometry_consistent << ' '
+                         << ellipse.temporally_filtered << '\n';
+        }
+        save_and_draw_pose(result, ellipse_results, outer, middle, hole,
+                           visualization, pose_file);
         return true;
     }
 
@@ -364,16 +281,14 @@ private:
     }
 
     void save_and_draw_pose(const object_detect_result_list& result,
-                            const std::vector<EllipseResult>& ellipses,
+                            const std::vector<EllipseFitResult>& ellipses,
+                            int outer, int middle, int hole,
                             cv::Mat& visualization, std::ofstream& pose_file) {
         pose_file << "# valid reference_class ref_center_x_px ref_center_y_px hole_center_x_px hole_center_y_px "
                      "auto_yaw_deg auto_pitch_deg auto_roll_deg auto_tx_mm auto_ty_mm auto_tz_mm "
                      "fixed_yaw_deg fixed_pitch_deg fixed_roll_deg fixed_tx_mm fixed_ty_mm fixed_tz_mm "
                      "display_mode\n"
                   << std::fixed << std::setprecision(9);
-        const int outer = best_index(result, 0);
-        const int middle = best_index(result, 1);
-        const int hole = best_index(result, 2);
         if (hole < 0 || (outer < 0 && middle < 0) || ellipses.size() < static_cast<size_t>(result.count)) {
             const double nan = std::numeric_limits<double>::quiet_NaN();
             pose_file << "0 -1 " << nan << ' ' << nan << ' ' << nan << ' ' << nan;
@@ -385,7 +300,9 @@ private:
         }
         int reference = -1;
         if (outer >= 0 && middle >= 0) {
-            reference = ellipses[outer].from_mask ? outer : (ellipses[middle].from_mask ? middle : outer);
+            const float outer_score = EllipseSelectionScore(ellipses[outer], result.results_box[outer].prop);
+            const float middle_score = EllipseSelectionScore(ellipses[middle], result.results_box[middle].prop);
+            reference = outer_score >= middle_score ? outer : middle;
         } else {
             reference = outer >= 0 ? outer : middle;
         }
@@ -424,6 +341,8 @@ private:
     cv::Mat K_, D_;
     DrogueModel drogue_;
     PoseEstimatorLM pose_estimator_;
+    RingPairRefiner ring_refiner_;
+    EllipseTemporalFilter temporal_filter_;
 };
 
 static bool is_image_file(const fs::path& path) {

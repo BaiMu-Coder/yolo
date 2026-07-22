@@ -1,46 +1,21 @@
-# 这里只写本目录的测试目标
+# 测试和可视化入口。所有涉及椭圆拟合的目标都链接统一的
+# ellipse_fitter 模块（已包含在 yolov8seg_core 中）。
 
+set(YOLO_TEST_TARGETS
+    batch_image_video
+    single_frame_pipeline
+    shipin_show
+)
 
-
-
-
-# add_executable(unit_test videofile_test.cpp)
-# add_executable(output_data_format_experiment output_data_format_experiment_int8.cpp)
-# add_executable(full_process full_process_test.cpp)
-# add_executable(model_output_test1 model_output_test.cpp)
-# add_executable(baogao_chutu baogao_chutu.cpp)
-# add_executable(test_new test.cpp)
-# add_executable(shipin_show final_version.cpp)
-add_executable(performance_test performance_test.cpp)
 add_executable(batch_image_video batch_image_video.cpp)
 add_executable(single_frame_pipeline single_frame_pipeline.cpp)
+add_executable(shipin_show final_version.cpp)
 
+foreach(target_name IN LISTS YOLO_TEST_TARGETS)
+    set_target_properties(${target_name} PROPERTIES
+        INSTALL_RPATH "\$ORIGIN/lib;\$ORIGIN/runtime"
+    )
+    target_link_libraries(${target_name} PRIVATE yolov8seg_core)
+endforeach()
 
-set_target_properties(performance_test PROPERTIES    #设置“安装后运行时找动态库的路径（RPATH）”
-    INSTALL_RPATH "\$ORIGIN/lib"
-    INSTALL_RPATH "\$ORIGIN/runtime"
-)
-
-target_link_libraries(performance_test
-      PRIVATE  yolov8seg_core          # 刚才在顶层定义的库
-)
-
-set_target_properties(batch_image_video PROPERTIES
-    INSTALL_RPATH "\$ORIGIN/lib"
-    INSTALL_RPATH "\$ORIGIN/runtime"
-)
-
-target_link_libraries(batch_image_video
-      PRIVATE yolov8seg_core
-)
-
-set_target_properties(single_frame_pipeline PROPERTIES
-    INSTALL_RPATH "\$ORIGIN/lib"
-    INSTALL_RPATH "\$ORIGIN/runtime"
-)
-
-target_link_libraries(single_frame_pipeline
-      PRIVATE yolov8seg_core
-)
-
-install(TARGETS performance_test batch_image_video single_frame_pipeline DESTINATION .)
+install(TARGETS ${YOLO_TEST_TARGETS} DESTINATION .)

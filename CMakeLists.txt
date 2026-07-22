@@ -59,6 +59,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/business
     ${CMAKE_CURRENT_SOURCE_DIR}/block_queue
     ${CMAKE_CURRENT_SOURCE_DIR}/pose_estimator
+    ${CMAKE_CURRENT_SOURCE_DIR}/ellipse_fitter
 
     #三方库
     ${OpenCV_INCLUDE_DIRS}   
@@ -72,6 +73,7 @@ file(GLOB CORE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/models/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/thread_pool/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/visual/*.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ellipse_fitter/*.cpp
 )
 
 add_library(yolov8seg_core STATIC ${CORE_SOURCES})
@@ -92,5 +94,4 @@ target_link_libraries(yolov8seg_core   #静态库本质就是一堆 .o文件   �
 
 # 2. 把 unit_test 子目录也加入构建
 add_subdirectory(unit_test)
-
 

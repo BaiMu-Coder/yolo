@@ -66,6 +66,8 @@ class Config:
     ellipse_max_axis_ratio: float = 6.0
     ellipse_max_points: int = 180
     ellipse_min_quality: float = 0.52
+    ellipse_min_coverage_deg: float = 160.0
+    ellipse_max_covariance_condition: float = 1e12
     enable_edge_fallback: bool = True
     enable_ellipse_smoothing: bool = True
 
@@ -146,6 +148,7 @@ class Detection:
     score: float
     class_id: int
     mask: Optional[np.ndarray] = field(default=None, repr=False)
+    mask_probability: Optional[np.ndarray] = field(default=None, repr=False)
 
 
 @dataclass
@@ -160,6 +163,14 @@ class EllipseResult:
     quality: float = 0.0
     geometry_consistent: bool = True
     temporally_filtered: bool = False
+    angular_coverage_deg: float = 0.0
+    occupied_quadrants: int = 0
+    center_std_px: float = math.inf
+    major_axis_std_px: float = math.inf
+    minor_axis_std_px: float = math.inf
+    angle_std_deg: float = math.inf
+    covariance_condition: float = math.inf
+    uncertainty_valid: bool = False
 
     @property
     def from_mask(self) -> bool:
@@ -222,14 +233,19 @@ class PTModel:
             if x2 <= x1 or y2 <= y1:
                 continue
             mask = None
+            mask_probability = None
             if masks is not None and i < len(masks):
-                mask = (masks[i] >= cfg.mask_binary_threshold).astype(np.uint8) * 255
+                probability = np.clip(masks[i], 0.0, 1.0).astype(np.float32)
+                mask = (probability >= cfg.mask_binary_threshold).astype(np.uint8) * 255
                 # 与 C++ 一致，只保留检测框内的实例 mask。
                 clipped = np.zeros_like(mask)
                 clipped[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
                 mask = clipped
+                mask_probability = np.zeros_like(probability)
+                mask_probability[y1:y2, x1:x2] = probability[y1:y2, x1:x2]
             detections.append(Detection(x1, y1, x2 - x1, y2 - y1,
-                                        float(scores[i]), int(classes[i]), mask))
+                                        float(scores[i]), int(classes[i]), mask,
+                                        mask_probability))
         return detections
 
 
@@ -247,16 +263,75 @@ def radial_errors(ellipse: Ellipse, points: np.ndarray) -> np.ndarray:
     return np.abs(radius - 1.0) * min(a, b)
 
 
+def signed_sampson_errors(ellipse: Ellipse, points: np.ndarray) -> np.ndarray:
+    (cx, cy), (width, height), angle = ellipse
+    a, b = max(width * 0.5, 1e-6), max(height * 0.5, 1e-6)
+    p = points.astype(np.float64) - np.asarray([cx, cy], dtype=np.float64)
+    rad = math.radians(angle)
+    c, s = math.cos(rad), math.sin(rad)
+    x, y = c * p[:, 0] + s * p[:, 1], -s * p[:, 0] + c * p[:, 1]
+    fx, fy = 2.0 * x / (a * a), 2.0 * y / (b * b)
+    gradient = np.hypot(c * fx - s * fy, s * fx + c * fy)
+    return (x * x / (a * a) + y * y / (b * b) - 1.0) / np.maximum(gradient, 1e-9)
+
+
+def update_ellipse_statistics(candidate: EllipseResult, points: np.ndarray,
+                              det: Detection, cfg: Config) -> None:
+    errors = np.abs(signed_sampson_errors(candidate.ellipse, points))
+    inliers = points[errors <= cfg.ellipse_inlier_px]
+    if len(inliers) < 6:
+        return
+    (cx, cy), (width, height), angle = candidate.ellipse
+    rad = math.radians(angle)
+    c, s = math.cos(rad), math.sin(rad)
+    local = inliers - np.asarray([cx, cy], dtype=np.float64)
+    theta = np.mod(np.arctan2((-s * local[:, 0] + c * local[:, 1]) / max(height * 0.5, 1e-6),
+                              (c * local[:, 0] + s * local[:, 1]) / max(width * 0.5, 1e-6)),
+                   2.0 * math.pi)
+    candidate.angular_coverage_deg = 5.0 * len(np.unique(np.minimum(71, (theta * 72 / (2 * math.pi)).astype(int))))
+    candidate.occupied_quadrants = len(np.unique(np.minimum(3, (theta * 4 / (2 * math.pi)).astype(int))))
+
+    parameters = np.asarray([cx, cy, math.log(max(width * 0.5, 1.0)),
+                             math.log(max(height * 0.5, 1.0)), rad], dtype=np.float64)
+    def ellipse_from(p: np.ndarray) -> Ellipse:
+        return ((float(p[0]), float(p[1])),
+                (float(2 * math.exp(p[2])), float(2 * math.exp(p[3]))),
+                float(math.degrees(p[4])))
+    residual = signed_sampson_errors(candidate.ellipse, inliers)
+    jacobian = np.empty((len(inliers), 5), dtype=np.float64)
+    for column, epsilon in enumerate((0.02, 0.02, 1e-4, 1e-4, 1e-5)):
+        perturbed = parameters.copy()
+        perturbed[column] += epsilon
+        jacobian[:, column] = (signed_sampson_errors(ellipse_from(perturbed), inliers) - residual) / epsilon
+    normal = jacobian.T @ jacobian
+    candidate.covariance_condition = float(np.linalg.cond(normal))
+    covariance = np.linalg.pinv(normal) * float(np.sum(residual * residual) / max(1, len(inliers) - 5))
+    candidate.center_std_px = float(math.sqrt(max(0.0, covariance[0, 0], covariance[1, 1])))
+    width_std = width * math.sqrt(max(0.0, covariance[2, 2]))
+    height_std = height * math.sqrt(max(0.0, covariance[3, 3]))
+    candidate.major_axis_std_px = float(max(width_std, height_std))
+    candidate.minor_axis_std_px = float(min(width_std, height_std))
+    candidate.angle_std_deg = float(math.degrees(math.sqrt(max(0.0, covariance[4, 4]))))
+    short_side = max(1.0, float(min(det.w, det.h)))
+    candidate.uncertainty_valid = (np.isfinite(candidate.covariance_condition) and
+        candidate.covariance_condition <= cfg.ellipse_max_covariance_condition and
+        candidate.center_std_px <= 0.10 * short_side and
+        candidate.major_axis_std_px <= 0.18 * short_side)
+
+
 def ransac_ellipse(points: np.ndarray, cfg: Config) -> Optional[EllipseResult]:
     if len(points) < 20:
         return None
     rng = np.random.default_rng(12345)
     best: Optional[EllipseResult] = None
     best_inlier_mask: Optional[np.ndarray] = None
-    for _ in range(cfg.ellipse_ransac_iters):
-        sample = points[rng.choice(len(points), 5, replace=False)].reshape(-1, 1, 2).astype(np.float32)
+    for iteration in range(cfg.ellipse_ransac_iters):
+        # points 按 mask 梯度质量排序；逐步扩展采样池形成 PROSAC 式初值。
+        pool_size = min(len(points), max(5, 5 + iteration * max(1, len(points) - 5) //
+                                         max(1, cfg.ellipse_ransac_iters - 1)))
+        sample = points[rng.choice(pool_size, 5, replace=False)].reshape(-1, 1, 2).astype(np.float32)
         try:
-            ellipse = cv2.fitEllipse(sample)
+            ellipse = cv2.fitEllipseDirect(sample)
         except cv2.error:
             continue
         a, b = ellipse[1][0] * 0.5, ellipse[1][1] * 0.5
@@ -276,7 +351,7 @@ def ransac_ellipse(points: np.ndarray, cfg: Config) -> Optional[EllipseResult]:
         return None
     refined_points = points[best_inlier_mask]
     try:
-        refined = cv2.fitEllipse(refined_points.reshape(-1, 1, 2).astype(np.float32))
+        refined = cv2.fitEllipseAMS(refined_points.reshape(-1, 1, 2).astype(np.float32))
     except cv2.error:
         return None
     return EllipseResult(ellipse=refined, source="mask", inliers=len(refined_points),
@@ -290,7 +365,9 @@ def _score_candidate(candidate: EllipseResult, det: Detection, cfg: Config) -> O
     short_side = max(1.0, float(min(det.w, det.h)))
     candidate.center_deviation_ratio = math.hypot(cx - box_center[0], cy - box_center[1]) / short_side
     major, minor = max(candidate.ellipse[1]), min(candidate.ellipse[1])
-    if candidate.center_deviation_ratio > cfg.ellipse_deviation_ratio or minor < 0.2 * short_side:
+    if (candidate.center_deviation_ratio > cfg.ellipse_deviation_ratio or minor < 0.2 * short_side or
+            candidate.angular_coverage_deg < cfg.ellipse_min_coverage_deg or
+            candidate.occupied_quadrants < 3 or not candidate.uncertainty_valid):
         return None
     error = candidate.mean_error_px if candidate.mean_error_px is not None else math.inf
     error_quality = math.exp(-error / max(0.5, cfg.ellipse_inlier_px))
@@ -298,8 +375,11 @@ def _score_candidate(candidate: EllipseResult, det: Detection, cfg: Config) -> O
     shape_quality = max(0.0, min(1.0, 1.0 - (major / max(minor, 1e-3) - 1.0) /
                                  max(1.0, cfg.ellipse_max_axis_ratio - 1.0)))
     bonus = 0.05 if candidate.source == "mask" else 0.0
-    candidate.quality = min(1.0, 0.42 * candidate.inlier_ratio + 0.25 * error_quality +
-                            0.20 * center_quality + 0.13 * shape_quality + bonus)
+    coverage_quality = min(1.0, candidate.angular_coverage_deg / 300.0)
+    uncertainty_quality = max(0.0, 1.0 - candidate.center_std_px / max(1.0, 0.10 * short_side))
+    candidate.quality = min(1.0, 0.32 * candidate.inlier_ratio + 0.22 * error_quality +
+                            0.16 * center_quality + 0.16 * coverage_quality +
+                            0.14 * uncertainty_quality + bonus)
     return candidate
 
 
@@ -313,6 +393,8 @@ def _fit_points(points: np.ndarray, det: Detection, cfg: Config, source: str) ->
     (cx, cy), size, angle = fitted.ellipse
     fitted.ellipse = ((cx + det.x, cy + det.y), size, angle)
     fitted.source = source
+    global_points = points.astype(np.float64) + np.asarray([det.x, det.y], dtype=np.float64)
+    update_ellipse_statistics(fitted, global_points, det, cfg)
     return _score_candidate(fitted, det, cfg)
 
 
@@ -320,13 +402,16 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
                  force_box: bool = False, allow_edge: bool = True) -> EllipseResult:
     box_center = (det.x + det.w * 0.5, det.y + det.h * 0.5)
     side = float(min(det.w, det.h))
-    fallback = EllipseResult((box_center, (side, side), 0.0), source="box", quality=0.38)
+    fallback = EllipseResult((box_center, (side, side), 0.0), source="box", quality=0.30,
+                             center_std_px=max(8.0, 0.12 * side),
+                             major_axis_std_px=max(10.0, 0.15 * side),
+                             minor_axis_std_px=max(10.0, 0.15 * side))
     if force_box:
         return fallback
     candidates: List[EllipseResult] = []
     if det.mask is not None and not force_box:
         roi = det.mask[det.y:det.y + det.h, det.x:det.x + det.w].copy()
-        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         selected: List[np.ndarray] = []
         area_min = 0.005 * det.w * det.h
         distance_limit = 0.80 * min(det.w, det.h)
@@ -341,7 +426,23 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
             if math.hypot(cx - det.w * 0.5, cy - det.h * 0.5) <= distance_limit:
                 selected.append(contour.reshape(-1, 2))
         if selected:
-            points = np.concatenate(selected)
+            points = np.concatenate(selected).astype(np.float32)
+            # 在软 mask 的 p=0.5 等值线上做一步法向亚像素修正。
+            # 梯度越清晰的点越靠前，供 PROSAC 优先采样。
+            if det.mask_probability is not None:
+                probability = det.mask_probability[det.y:det.y + det.h,
+                                                   det.x:det.x + det.w].astype(np.float32)
+                gx = cv2.Sobel(probability, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+                gy = cv2.Sobel(probability, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+                xi = np.clip(np.rint(points[:, 0]).astype(int), 0, max(0, det.w - 1))
+                yi = np.clip(np.rint(points[:, 1]).astype(int), 0, max(0, det.h - 1))
+                grad_x, grad_y = gx[yi, xi], gy[yi, xi]
+                magnitude = np.hypot(grad_x, grad_y)
+                safe = np.maximum(magnitude, 1e-6)
+                shift = np.clip((0.5 - probability[yi, xi]) / safe, -0.75, 0.75)
+                points[:, 0] += shift * grad_x / safe
+                points[:, 1] += shift * grad_y / safe
+                points = points[np.argsort(-magnitude)]
             if len(points) >= 20:
                 fitted = _fit_points(points, det, cfg, "mask")
                 if fitted is not None:
@@ -479,6 +580,95 @@ class PoseEstimatorLM:
         out = self._optimize(np.asarray([yaw, pitch, tx, ty]), ellipse, hole, points, fixed_distance)
         return Pose6D(out[0], out[1], 0.0, out[2], out[3], fixed_distance)
 
+    def _dual_residual(self, x: np.ndarray, outer: Optional[EllipseResult],
+                       middle: Optional[EllipseResult], hole: Tuple[float, float],
+                       hole_sigma: float, fixed_tz: Optional[float]) -> np.ndarray:
+        if fixed_tz is None:
+            yaw, pitch, tx, ty, tz = x
+        else:
+            yaw, pitch, tx, ty = x
+            tz = fixed_tz
+        observations = ((outer, self.points_outer), (middle, self.points_middle))
+        expected = sum(len(points) for observation, points in observations if observation is not None) + 2
+        if tz < 100.0:
+            return np.full(expected, 10000.0, dtype=np.float64)
+        rvec = self._rvec(float(yaw), float(pitch))
+        tvec = np.asarray([tx, ty, tz], dtype=np.float64)
+        residuals: List[np.ndarray] = []
+        for observation, points in observations:
+            if observation is None:
+                continue
+            projected, _ = cv2.projectPoints(points, rvec, tvec, self.k, self.d)
+            standardized = signed_sampson_errors(
+                observation.ellipse, projected.reshape(-1, 2)) / ellipse_observation_sigma(observation)
+            # 联合优化必须保留残差符号，否则雅可比方向会被破坏。
+            xh = standardized / 2.5
+            robust = np.sqrt(2.0 * 2.5 * 2.5 * (np.sqrt(1.0 + xh * xh) - 1.0))
+            residuals.append(np.copysign(robust, standardized))
+        hole_3d = np.asarray([[0.0, 0.0, -self.length]], dtype=np.float32)
+        projected_hole, _ = cv2.projectPoints(hole_3d, rvec, tvec, self.k, self.d)
+        center_error = (projected_hole.reshape(2) - np.asarray(hole)) / max(0.5, hole_sigma)
+        xh = center_error / 2.5
+        robust_center = np.sqrt(2.0 * 2.5 * 2.5 * (np.sqrt(1.0 + xh * xh) - 1.0))
+        residuals.append(np.copysign(robust_center, center_error))
+        return np.concatenate(residuals)
+
+    def _optimize_dual(self, initial: np.ndarray, outer: Optional[EllipseResult],
+                       middle: Optional[EllipseResult], hole: Tuple[float, float],
+                       hole_sigma: float, fixed_tz: Optional[float]) -> np.ndarray:
+        x = initial.astype(np.float64).copy()
+        damping = 1e-3
+        residual = self._dual_residual(x, outer, middle, hole, hole_sigma, fixed_tz)
+        cost = 0.5 * float(residual @ residual)
+        for _ in range(self.cfg.pose_max_iters):
+            jacobian = np.empty((len(residual), len(x)), dtype=np.float64)
+            for column in range(len(x)):
+                epsilon = 1e-4 * (abs(x[column]) + 1.0)
+                trial = x.copy()
+                trial[column] += epsilon
+                jacobian[:, column] = (self._dual_residual(
+                    trial, outer, middle, hole, hole_sigma, fixed_tz) - residual) / epsilon
+            normal = jacobian.T @ jacobian
+            gradient = jacobian.T @ residual
+            damped = normal + damping * np.diag(np.maximum(1.0, np.diag(normal)))
+            try:
+                delta = np.linalg.lstsq(damped, -gradient, rcond=None)[0]
+            except np.linalg.LinAlgError:
+                break
+            trial = x + delta
+            trial[0:2] = np.clip(trial[0:2], -60.0, 60.0)
+            if fixed_tz is None:
+                trial[4] = np.clip(trial[4], 100.0, 50000.0)
+            trial_residual = self._dual_residual(trial, outer, middle, hole, hole_sigma, fixed_tz)
+            trial_cost = 0.5 * float(trial_residual @ trial_residual)
+            if trial_cost < cost:
+                x, residual, cost = trial, trial_residual, trial_cost
+                damping = max(1e-9, damping * 0.5)
+                if float(delta @ delta) < 1e-12:
+                    break
+            else:
+                damping = min(1e9, damping * 3.0)
+        return x
+
+    def solve_dual(self, outer: Optional[EllipseResult], middle: Optional[EllipseResult],
+                   hole: Tuple[float, float], hole_sigma: float,
+                   fixed_distance: Optional[float] = None) -> Pose6D:
+        available = [(outer, False), (middle, True)]
+        available = [(item, is_middle) for item, is_middle in available if item is not None]
+        if not available:
+            return Pose6D()
+        initializer, use_middle = min(available,
+                                      key=lambda item: ellipse_observation_sigma(item[0]))
+        initial = self.solve(initializer.ellipse, hole, use_middle, fixed_distance)
+        values = initial.array()
+        x = values[[0, 1, 3, 4]] if fixed_distance is not None else values[[0, 1, 3, 4, 5]]
+        result = self._optimize_dual(x, outer, middle, hole, hole_sigma, fixed_distance)
+        tz = fixed_distance if fixed_distance is not None else float(result[4])
+        if not np.all(np.isfinite(result)) or tz < 100.0:
+            return initial
+        return Pose6D(float(result[0]), float(result[1]), 0.0,
+                      float(result[2]), float(result[3]), float(tz))
+
     def draw_axis(self, image: np.ndarray, pose: Pose6D, use_middle: bool) -> None:
         length = self.radius_middle if use_middle else self.radius_outer
         points = np.asarray([[0, 0, 0], [length, 0, 0], [0, length, 0],
@@ -514,7 +704,7 @@ class PoseSmoother:
 
 
 def refine_ring_pair(outer: EllipseResult, middle: EllipseResult) -> bool:
-    """双圆环联合约束；一致时融合圆心，不一致时惩罚较差候选。"""
+    """双圆环几何一致性门控；不强制图像椭圆同心。"""
     outer_major, outer_minor = max(outer.ellipse[1]), min(outer.ellipse[1])
     middle_major, middle_minor = max(middle.ellipse[1]), min(middle.ellipse[1])
     if min(outer_major, outer_minor, middle_major, middle_minor) <= 0:
@@ -535,13 +725,7 @@ def refine_ring_pair(outer: EllipseResult, middle: EllipseResult) -> bool:
         return False
     score = max(0.0, 1.0 - (0.34 * size_error + 0.34 * center_error +
                             0.18 * axis_error + 0.14 * angle_error))
-    weight_sum = max(0.05, outer.quality) + max(0.05, middle.quality)
-    common = ((np.asarray(outer.ellipse[0]) * max(0.05, outer.quality) +
-               np.asarray(middle.ellipse[0]) * max(0.05, middle.quality)) / weight_sum)
     for ellipse in (outer, middle):
-        center = np.asarray(ellipse.ellipse[0])
-        fused = center + 0.35 * (common - center)
-        ellipse.ellipse = ((float(fused[0]), float(fused[1])), ellipse.ellipse[1], ellipse.ellipse[2])
         ellipse.quality = min(1.0, ellipse.quality + 0.12 * score)
     return True
 
@@ -627,6 +811,17 @@ def valid_pose(pose: Optional[Pose6D]) -> Optional[Pose6D]:
     return pose
 
 
+def ellipse_observation_sigma(ellipse: EllipseResult) -> float:
+    """把拟合误差/协方差统一成像素标准差；Box 兜底自动降权。"""
+    major = max(ellipse.ellipse[1])
+    if ellipse.source == "box" or not ellipse.uncertainty_valid:
+        return max(8.0, 0.12 * major)
+    residual = ellipse.mean_error_px if ellipse.mean_error_px is not None else 3.0
+    sigma = max(0.5, math.hypot(residual, 0.5 * ellipse.center_std_px))
+    sigma /= max(0.25, ellipse.quality)
+    return sigma * (1.0 if ellipse.geometry_consistent else 3.0)
+
+
 def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
                    estimator: PoseEstimatorLM, smoother: PoseSmoother,
                    ellipse_smoother: EllipseSmoother,
@@ -679,8 +874,14 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
         use_middle = detections[target_idx].class_id == cfg.middle_class_id
         hole_center = ellipses[idx2].ellipse[0]
         target = ellipses[target_idx].ellipse
-        pose_auto = estimator.solve(target, hole_center, use_middle)
-        pose_fixed = estimator.solve(target, hole_center, use_middle, cfg.pose_fixed_distance_mm)
+        outer_observation = ellipses[idx0] if idx0 >= 0 else None
+        middle_observation = ellipses[idx1] if idx1 >= 0 else None
+        hole_sigma = ellipse_observation_sigma(ellipses[idx2])
+        pose_auto = estimator.solve_dual(outer_observation, middle_observation,
+                                         hole_center, hole_sigma)
+        pose_fixed = estimator.solve_dual(outer_observation, middle_observation,
+                                          hole_center, hole_sigma,
+                                          cfg.pose_fixed_distance_mm)
         pose_auto = valid_pose(pose_auto)
         pose_fixed = valid_pose(pose_fixed)
         cv2.ellipse(vis, target, (255, 255, 0), 4)
@@ -707,6 +908,9 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
         draw_text(vis, "Dist: --", 240, (255, 255, 0), 1.2)
 
     det_details = []
+    def finite_or_none(value: float) -> Optional[float]:
+        return float(value) if math.isfinite(value) else None
+
     for det, ellipse in zip(detections, ellipses):
         det_details.append({
             "x": det.x, "y": det.y, "w": det.w, "h": det.h,
@@ -719,7 +923,16 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
                         "inlier_ratio": ellipse.inlier_ratio, "inliers": ellipse.inliers,
                         "mean_error_px": ellipse.mean_error_px,
                         "geometry_consistent": ellipse.geometry_consistent,
-                        "temporally_filtered": ellipse.temporally_filtered},
+                        "temporally_filtered": ellipse.temporally_filtered,
+                        "angular_coverage_deg": ellipse.angular_coverage_deg,
+                        "occupied_quadrants": ellipse.occupied_quadrants,
+                        "uncertainty_valid": ellipse.uncertainty_valid,
+                        "center_std_px": finite_or_none(ellipse.center_std_px),
+                        "major_axis_std_px": finite_or_none(ellipse.major_axis_std_px),
+                        "minor_axis_std_px": finite_or_none(ellipse.minor_axis_std_px),
+                        "angle_std_deg": finite_or_none(ellipse.angle_std_deg),
+                        "covariance_condition": finite_or_none(ellipse.covariance_condition),
+                        "pose_sigma_px": ellipse_observation_sigma(ellipse)},
         })
     return vis, {
         "frame_id": frame_id, "detections": det_details,

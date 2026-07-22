@@ -116,11 +116,15 @@ public:
         frame.ellipses.clear();
         frame.ellipses.reserve(frame.detections.count);
         const auto& masks = frame.detections.results_mask[0].each_of_mask;
+        const auto& probabilities = frame.detections.results_mask[0].each_of_mask_probability;
         for (int i = 0; i < frame.detections.count; ++i) {
             const auto& detection = frame.detections.results_box[i];
             const uint8_t* mask = (i < static_cast<int>(masks.size()) && masks[i])
                                       ? masks[i].get()
                                       : nullptr;
+            const uint8_t* probability =
+                (i < static_cast<int>(probabilities.size()) && probabilities[i])
+                    ? probabilities[i].get() : nullptr;
             const bool is_reference = detection.cls_id == 0 || detection.cls_id == 1;
             const bool force_box = (is_reference && force_reference_box_) ||
                                    (detection.cls_id == 2 && !fit_hole_from_mask_);
@@ -130,7 +134,8 @@ public:
                                                 : (is_reference
                                                        ? EllipseFitMode::PreferMaskNoEdge
                                                        : EllipseFitMode::PreferMask);
-            frame.ellipses.push_back(fitter_.Fit(frame.image, box, mask, fit_mode));
+            frame.ellipses.push_back(fitter_.Fit(frame.image, box, mask, fit_mode,
+                                                 probability));
         }
     }
 
@@ -191,12 +196,21 @@ public:
         frame.pose.use_middle_ring = frame.pose.reference_class == 1;
         frame.pose.reference_center = frame.ellipses[reference].ellipse.center;
         frame.pose.hole_center = frame.ellipses[hole].ellipse.center;
-        frame.pose.automatic = estimator_.Solve(
-            frame.ellipses[reference].ellipse, frame.pose.hole_center,
-            frame.pose.use_middle_ring, std::nullopt);
-        frame.pose.fixed = estimator_.Solve(
-            frame.ellipses[reference].ellipse, frame.pose.hole_center,
-            frame.pose.use_middle_ring, fixed_distance_mm_);
+        std::optional<PoseEllipseObservation> outer_observation;
+        std::optional<PoseEllipseObservation> middle_observation;
+        if (outer >= 0)
+            outer_observation = PoseEllipseObservation{frame.ellipses[outer].ellipse,
+                EllipseObservationSigmaPx(frame.ellipses[outer]), true};
+        if (middle >= 0)
+            middle_observation = PoseEllipseObservation{frame.ellipses[middle].ellipse,
+                EllipseObservationSigmaPx(frame.ellipses[middle]), true};
+        const double hole_sigma = EllipseObservationSigmaPx(frame.ellipses[hole]);
+        frame.pose.automatic = estimator_.SolveDual(
+            outer_observation, middle_observation, frame.pose.hole_center,
+            hole_sigma, std::nullopt);
+        frame.pose.fixed = estimator_.SolveDual(
+            outer_observation, middle_observation, frame.pose.hole_center,
+            hole_sigma, fixed_distance_mm_);
     }
 
     void draw_axis(cv::Mat& image, const Pose6D& pose, bool use_middle_ring) const {
@@ -328,7 +342,7 @@ private:
 
     static void write_ellipses(const fs::path& path, const FrameContext& frame) {
         std::ofstream output(path);
-        output << "# class_id center_x center_y major_axis minor_axis angle confidence source quality inlier_ratio inliers mean_error_px geometry_ok temporal\n"
+        output << "# class_id center_x center_y major_axis minor_axis angle confidence source quality inlier_ratio inliers mean_error_px coverage_deg quadrants center_std major_std minor_std angle_std cov_condition geometry_ok temporal conic00 conic01 conic02 conic11 conic12 conic22\n"
                << std::fixed << std::setprecision(6);
         for (int i = 0; i < frame.detections.count; ++i) {
             const auto& d = frame.detections.results_box[i];
@@ -339,7 +353,14 @@ private:
                    << e.ellipse.angle << ' ' << d.prop << ' '
                    << EllipseSourceName(e.source) << ' ' << e.quality << ' '
                    << e.inlier_ratio << ' ' << e.inliers << ' ' << e.mean_error_px << ' '
-                   << e.geometry_consistent << ' ' << e.temporally_filtered << '\n';
+                   << e.angular_coverage_deg << ' ' << e.occupied_quadrants << ' '
+                   << e.center_std_px << ' ' << e.major_axis_std_px << ' '
+                   << e.minor_axis_std_px << ' ' << e.angle_std_deg << ' '
+                   << e.covariance_condition << ' ' << e.geometry_consistent << ' '
+                   << e.temporally_filtered << ' ' << e.conic(0, 0) << ' '
+                   << e.conic(0, 1) << ' ' << e.conic(0, 2) << ' '
+                   << e.conic(1, 1) << ' ' << e.conic(1, 2) << ' '
+                   << e.conic(2, 2) << '\n';
         }
     }
 

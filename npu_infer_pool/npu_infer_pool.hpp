@@ -373,11 +373,17 @@ private:
 
             // mask 指针
             uint8_t *raw_mask_ptr = nullptr;
+            uint8_t *mask_probability_ptr = nullptr;
             int class_id = det_box.cls_id;
             if (i < static_cast<int>(seg_result.each_of_mask.size()) &&
                 seg_result.each_of_mask[i])
             {
                 raw_mask_ptr = seg_result.each_of_mask[i].get();  //每个框和它的掩码一一对应
+            }
+            if (i < static_cast<int>(seg_result.each_of_mask_probability.size()) &&
+                seg_result.each_of_mask_probability[i])
+            {
+                mask_probability_ptr = seg_result.each_of_mask_probability[i].get();
             }
             
             
@@ -397,7 +403,8 @@ private:
                                                        ? EllipseFitMode::PreferMaskNoEdge
                                                        : EllipseFitMode::PreferMask);
             EllipseFitResult ellipse_result = ellipse_fitter.Fit(
-                fitting_image, detection_rect, raw_mask_ptr, fit_mode);
+                fitting_image, detection_rect, raw_mask_ptr, fit_mode,
+                mask_probability_ptr);
             const cv::Scalar e_color = ellipse_result.source == EllipseSource::Mask
                                            ? cv::Scalar(0, 255, 0)
                                            : (ellipse_result.source == EllipseSource::Edge
@@ -536,9 +543,21 @@ private:
         cv::line(frame, target.center, hole_center, C_CYAN, 3);  //绘制姿态轴线，画一条直线连接 两个椭圆的中心
 
 
-        // 双轨解算
-        Pose6D pose_auto = _pose_estimator.Solve(target, hole_center, use_cls1, std::nullopt);   //自己解算深度信息
-        Pose6D pose_fix = _pose_estimator.Solve(target, hole_center, use_cls1, _fixed_distance_mm);   //提供深度信息
+        std::optional<PoseEllipseObservation> outer_observation;
+        std::optional<PoseEllipseObservation> middle_observation;
+        if (has0)
+            outer_observation = PoseEllipseObservation{cand0.ellipse,
+                                                       EllipseObservationSigmaPx(cand0), true};
+        if (has1)
+            middle_observation = PoseEllipseObservation{cand1.ellipse,
+                                                        EllipseObservationSigmaPx(cand1), true};
+        const double hole_sigma = EllipseObservationSigmaPx(hole_ellipse);
+
+        // 双圆共享同一3D位姿，以各自协方差加权重投影残差。
+        Pose6D pose_auto = _pose_estimator.SolveDual(
+            outer_observation, middle_observation, hole_center, hole_sigma, std::nullopt);
+        Pose6D pose_fix = _pose_estimator.SolveDual(
+            outer_observation, middle_observation, hole_center, hole_sigma, _fixed_distance_mm);
         Pose6D pose_final = _display_fixed_mode ? pose_fix : pose_auto;
 
         // 画轴

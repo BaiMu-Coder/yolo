@@ -72,9 +72,42 @@ float EllipseSelectionScore(const EllipseFitResult &ellipse, float detection_con
            0.45f * clamp01(ellipse.quality) * geometry_penalty;
 }
 
+double EllipseObservationSigmaPx(const EllipseFitResult &ellipse)
+{
+    if (ellipse.source == EllipseSource::Box || !ellipse.uncertainty_valid)
+        return std::max(8.0, 0.12 * major_axis(ellipse.ellipse));
+    const double residual = std::isfinite(ellipse.mean_error_px) ? ellipse.mean_error_px : 3.0;
+    double sigma = std::max(0.5, std::hypot(residual, 0.5 * ellipse.center_std_px));
+    // 协方差衡量单个椭圆的局部稳定性；quality/双圈门控补充模型选错风险。
+    sigma /= std::max(0.25, static_cast<double>(ellipse.quality));
+    if (!ellipse.geometry_consistent) sigma *= 3.0;
+    return sigma;
+}
+
+cv::Matx33d EllipseConicMatrix(const cv::RotatedRect &ellipse)
+{
+    const double a = std::max(1e-6, ellipse.size.width * 0.5);
+    const double b = std::max(1e-6, ellipse.size.height * 0.5);
+    const double angle = ellipse.angle * CV_PI / 180.0;
+    const double c = std::cos(angle), s = std::sin(angle);
+    const cv::Matx22d rotation(c, -s, s, c);
+    const cv::Matx22d diagonal(1.0 / (a * a), 0.0, 0.0, 1.0 / (b * b));
+    const cv::Matx22d quadratic = rotation * diagonal * rotation.t();
+    const cv::Vec2d center(ellipse.center.x, ellipse.center.y);
+    const cv::Vec2d linear = -(quadratic * center);
+    cv::Matx33d conic(quadratic(0, 0), quadratic(0, 1), linear[0],
+                      quadratic(1, 0), quadratic(1, 1), linear[1],
+                      linear[0], linear[1], center.dot(quadratic * center) - 1.0);
+    double norm = 0.0;
+    for (double value : conic.val) norm += value * value;
+    return conic * (1.0 / std::max(1e-15, std::sqrt(norm)));
+}
+
 EllipseFitter::EllipseFitter(EllipseFitConfig config) : config_(std::move(config))
 {
     config_.ransac_iterations = std::max(1, config_.ransac_iterations);
+    config_.local_optimization_iterations = std::max(0, config_.local_optimization_iterations);
+    config_.refinement_iterations = std::max(1, config_.refinement_iterations);
     config_.maximum_points = std::max(20, config_.maximum_points);
     config_.inlier_threshold_px = std::max(0.1f, config_.inlier_threshold_px);
     config_.minimum_inlier_ratio = clamp01(config_.minimum_inlier_ratio);
@@ -82,6 +115,8 @@ EllipseFitter::EllipseFitter(EllipseFitConfig config) : config_(std::move(config
     config_.center_deviation_ratio = std::max(0.01f, config_.center_deviation_ratio);
     config_.minimum_candidate_quality = clamp01(config_.minimum_candidate_quality);
     config_.edge_search_quality_threshold = clamp01(config_.edge_search_quality_threshold);
+    config_.minimum_angular_coverage_deg = std::clamp(config_.minimum_angular_coverage_deg, 0.0f, 360.0f);
+    config_.minimum_occupied_quadrants = std::clamp(config_.minimum_occupied_quadrants, 1, 4);
 }
 
 EllipseFitResult EllipseFitter::BoxInscribedCircle(const cv::Rect &detection_box)
@@ -94,41 +129,61 @@ EllipseFitResult EllipseFitter::BoxInscribedCircle(const cv::Rect &detection_box
     result.ellipse = cv::RotatedRect(center, cv::Size2f(side, side), 0.0f);
     result.valid = side > 0.0f;
     result.source = EllipseSource::Box;
-    result.quality = result.valid ? 0.38f : 0.0f;
+    result.quality = result.valid ? 0.30f : 0.0f;
+    result.conic = EllipseToConic(result.ellipse);
+    const double center_sigma = std::max(2.0, side * 0.12);
+    result.covariance(0, 0) = center_sigma * center_sigma;
+    result.covariance(1, 1) = center_sigma * center_sigma;
+    result.covariance(2, 2) = 0.20 * 0.20;
+    result.covariance(3, 3) = 0.20 * 0.20;
+    result.covariance(4, 4) = CV_PI * CV_PI / 4.0;
+    result.center_std_px = center_sigma;
+    result.major_axis_std_px = result.minor_axis_std_px = side * 0.20f;
+    result.angle_std_deg = 90.0f;
+    result.angular_coverage_deg = 0.0f;
+    result.occupied_quadrants = 0;
+    result.uncertainty_valid = false;
     return result;
 }
 
-float EllipseFitter::RadialErrorPx(const cv::RotatedRect &ellipse,
-                                   const cv::Point2f &point)
+float EllipseFitter::SampsonResidualPx(const cv::RotatedRect &ellipse,
+                                       const cv::Point2f &point)
 {
-    const float a = ellipse.size.width * 0.5f;
-    const float b = ellipse.size.height * 0.5f;
-    if (a < 1e-3f || b < 1e-3f)
-        return std::numeric_limits<float>::infinity();
-    const float x = point.x - ellipse.center.x;
-    const float y = point.y - ellipse.center.y;
-    const float angle = -ellipse.angle * static_cast<float>(CV_PI) / 180.0f;
-    const float cosine = std::cos(angle);
-    const float sine = std::sin(angle);
-    const float xr = cosine * x - sine * y;
-    const float yr = sine * x + cosine * y;
-    const float radius = std::sqrt(xr * xr / (a * a) + yr * yr / (b * b));
-    return std::abs(radius - 1.0f) * std::min(a, b);
+    const double a = ellipse.size.width * 0.5;
+    const double b = ellipse.size.height * 0.5;
+    if (a < 1e-3 || b < 1e-3) return std::numeric_limits<float>::infinity();
+    const double angle = ellipse.angle * CV_PI / 180.0;
+    const double cosine = std::cos(angle), sine = std::sin(angle);
+    const double dx = point.x - ellipse.center.x, dy = point.y - ellipse.center.y;
+    const double x = cosine * dx + sine * dy;
+    const double y = -sine * dx + cosine * dy;
+    const double fx = 2.0 * x / (a * a), fy = 2.0 * y / (b * b);
+    const double gradient = std::hypot(cosine * fx - sine * fy,
+                                       sine * fx + cosine * fy);
+    if (gradient < 1e-9) return std::numeric_limits<float>::infinity();
+    return static_cast<float>((x * x / (a * a) + y * y / (b * b) - 1.0) / gradient);
 }
 
 EllipseFitter::RansacResult EllipseFitter::FitRansac(
-    const std::vector<cv::Point> &points) const
+    const std::vector<WeightedPoint> &input_points) const
 {
     RansacResult best;
-    const int count = static_cast<int>(points.size());
+    const int count = static_cast<int>(input_points.size());
     if (count < 20) return best;
+    std::vector<WeightedPoint> points = input_points;
+    std::stable_sort(points.begin(), points.end(), [](const WeightedPoint &a, const WeightedPoint &b) {
+        return a.weight > b.weight;
+    });
     std::mt19937 random(config_.random_seed);
-    std::uniform_int_distribution<int> pick(0, count - 1);
-    std::vector<cv::Point> sample(5);
-    std::array<int, 5> indices{};
+    double best_weighted_inliers = -1.0;
 
     for (int iteration = 0; iteration < config_.ransac_iterations; ++iteration)
     {
+        const int pool_size = std::min(count, std::max(20,
+            20 + iteration * std::max(0, count - 20) / std::max(1, config_.ransac_iterations - 1)));
+        std::uniform_int_distribution<int> pick(0, pool_size - 1);
+        std::vector<cv::Point2f> sample(5);
+        std::array<int, 5> indices{};
         for (int sample_index = 0; sample_index < 5;)
         {
             const int point_index = pick(random);
@@ -137,163 +192,351 @@ EllipseFitter::RansacResult EllipseFitter::FitRansac(
                 duplicate = duplicate || indices[previous] == point_index;
             if (duplicate) continue;
             indices[sample_index] = point_index;
-            sample[sample_index] = points[point_index];
+            sample[sample_index] = points[point_index].point;
             ++sample_index;
         }
-
         cv::RotatedRect candidate;
-        try { candidate = cv::fitEllipse(sample); }
+        try { candidate = cv::fitEllipseDirect(sample); }
         catch (const cv::Exception &) { continue; }
         if (minor_axis(candidate) < 2.0f || axis_ratio(candidate) > config_.maximum_axis_ratio)
             continue;
 
         int inliers = 0;
+        double weighted_inliers = 0.0;
         float error_sum = 0.0f;
-        for (const cv::Point &point : points)
+        for (const WeightedPoint &point : points)
         {
-            const float error = RadialErrorPx(candidate, point);
+            const float error = std::abs(SampsonResidualPx(candidate, point.point));
             if (error <= config_.inlier_threshold_px)
             {
                 ++inliers;
+                weighted_inliers += point.weight;
                 error_sum += error;
             }
         }
         const float mean_error = inliers > 0 ? error_sum / inliers
                                              : std::numeric_limits<float>::infinity();
-        if (inliers > best.inliers ||
-            (inliers == best.inliers && mean_error < best.mean_error_px))
+        if (weighted_inliers > best_weighted_inliers ||
+            (weighted_inliers == best_weighted_inliers && mean_error < best.mean_error_px))
         {
-            best.valid = true;
-            best.ellipse = candidate;
-            best.inliers = inliers;
-            best.sampled_points = count;
-            best.mean_error_px = mean_error;
+            best_weighted_inliers = weighted_inliers;
+            best = {true, candidate, inliers, count, mean_error};
         }
     }
 
-    const int required = std::max(20, static_cast<int>(std::ceil(
-                                          config_.minimum_inlier_ratio * count)));
+    const int required = std::max(20, static_cast<int>(std::ceil(config_.minimum_inlier_ratio * count)));
     if (!best.valid || best.inliers < required) return {};
 
-    std::vector<cv::Point> inlier_points;
-    inlier_points.reserve(best.inliers);
-    for (const cv::Point &point : points)
-        if (RadialErrorPx(best.ellipse, point) <= config_.inlier_threshold_px)
-            inlier_points.push_back(point);
-    if (inlier_points.size() < 5) return {};
-    try { best.ellipse = cv::fitEllipse(inlier_points); }
-    catch (const cv::Exception &) { return {}; }
-
+    // LO-RANSAC：用当前内点集稳定直接拟合，再重新计算内点。
+    for (int local = 0; local < config_.local_optimization_iterations; ++local)
+    {
+        std::vector<cv::Point2f> inliers;
+        for (const WeightedPoint &point : points)
+            if (std::abs(SampsonResidualPx(best.ellipse, point.point)) <= config_.inlier_threshold_px)
+                inliers.push_back(point.point);
+        if (inliers.size() < 5) return {};
+        try { best.ellipse = cv::fitEllipseDirect(inliers); }
+        catch (const cv::Exception &) { return {}; }
+    }
+    best.inliers = 0;
     float error_sum = 0.0f;
-    for (const cv::Point &point : inlier_points)
-        error_sum += RadialErrorPx(best.ellipse, point);
-    best.valid = true;
-    best.inliers = static_cast<int>(inlier_points.size());
-    best.sampled_points = count;
-    best.mean_error_px = error_sum / inlier_points.size();
+    for (const WeightedPoint &point : points)
+    {
+        const float error = std::abs(SampsonResidualPx(best.ellipse, point.point));
+        if (error <= config_.inlier_threshold_px) { ++best.inliers; error_sum += error; }
+    }
+    if (best.inliers < required) return {};
+    best.mean_error_px = error_sum / best.inliers;
     return best;
 }
 
-std::vector<cv::Point> EllipseFitter::CollectMaskPoints(
-    const cv::Mat &binary_roi, const cv::Point2f &box_center_roi) const
+std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
+    const cv::Mat &binary_roi, const cv::Mat &probability_roi,
+    const cv::Point2f &box_center_roi) const
 {
     cv::Mat work = binary_roi.clone();
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(work, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-    std::vector<cv::Point> points;
-    const double minimum_area = config_.minimum_contour_area_ratio *
-                                binary_roi.cols * binary_roi.rows;
+    cv::findContours(work, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    std::vector<WeightedPoint> points;
+    const double minimum_area = config_.minimum_contour_area_ratio * binary_roi.cols * binary_roi.rows;
     const float distance_limit = config_.contour_center_distance_ratio *
                                  std::min(binary_roi.cols, binary_roi.rows);
     for (const auto &contour : contours)
     {
-        if (contour.size() < 5 || std::abs(cv::contourArea(contour)) < minimum_area)
-            continue;
+        if (contour.size() < 5 || std::abs(cv::contourArea(contour)) < minimum_area) continue;
         const cv::Moments moments = cv::moments(contour);
         if (std::abs(moments.m00) < 1e-6) continue;
         const cv::Point2f center(static_cast<float>(moments.m10 / moments.m00),
                                  static_cast<float>(moments.m01 / moments.m00));
-        if (cv::norm(center - box_center_roi) <= distance_limit)
-            points.insert(points.end(), contour.begin(), contour.end());
+        if (cv::norm(center - box_center_roi) > distance_limit) continue;
+        for (const cv::Point &pixel : contour)
+        {
+            WeightedPoint point{cv::Point2f(pixel), 1.0f};
+            if (!probability_roi.empty() && pixel.x > 0 && pixel.y > 0 &&
+                pixel.x + 1 < probability_roi.cols && pixel.y + 1 < probability_roi.rows)
+            {
+                const float value = probability_roi.at<uint8_t>(pixel) / 255.0f;
+                const float gx = (probability_roi.at<uint8_t>(pixel.y, pixel.x + 1) -
+                                  probability_roi.at<uint8_t>(pixel.y, pixel.x - 1)) / 510.0f;
+                const float gy = (probability_roi.at<uint8_t>(pixel.y + 1, pixel.x) -
+                                  probability_roi.at<uint8_t>(pixel.y - 1, pixel.x)) / 510.0f;
+                const float gradient = std::hypot(gx, gy);
+                if (gradient > 1e-3f)
+                {
+                    const float shift = std::clamp((0.5f - value) / gradient, -0.75f, 0.75f);
+                    point.point.x += shift * gx / gradient;
+                    point.point.y += shift * gy / gradient;
+                    point.weight = std::clamp(gradient * 4.0f, 0.15f, 1.0f);
+                }
+            }
+            points.push_back(point);
+        }
     }
     return points;
 }
 
-std::vector<cv::Point> EllipseFitter::CollectEdgePoints(
+std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectEdgePoints(
     const cv::Mat &edge_roi, const cv::Point2f &box_center_roi) const
 {
     cv::Mat work = edge_roi.clone();
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(work, contours, cv::RETR_LIST, cv::CHAIN_APPROX_NONE);
-    std::vector<cv::Point> points;
+    std::vector<WeightedPoint> points;
     const float distance_limit = config_.contour_center_distance_ratio *
                                  std::min(edge_roi.cols, edge_roi.rows);
     for (const auto &contour : contours)
     {
         if (contour.size() < 18) continue;
         const cv::Rect bounds = cv::boundingRect(contour);
-        const cv::Point2f center(bounds.x + bounds.width * 0.5f,
-                                 bounds.y + bounds.height * 0.5f);
+        const cv::Point2f center(bounds.x + bounds.width * 0.5f, bounds.y + bounds.height * 0.5f);
         if (cv::norm(center - box_center_roi) <= distance_limit)
-            points.insert(points.end(), contour.begin(), contour.end());
+            for (const cv::Point &point : contour) points.push_back({cv::Point2f(point), 1.0f});
     }
     return points;
 }
 
-EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<cv::Point> &points,
+bool EllipseFitter::RefineSampson(const std::vector<WeightedPoint> &points,
+                                  cv::RotatedRect &ellipse,
+                                  cv::Matx<double, 5, 5> &covariance,
+                                  double &condition) const
+{
+    if (points.size() < 6) return false;
+    cv::Vec<double, 5> parameters(ellipse.center.x, ellipse.center.y,
+                                  std::log(std::max(1.0f, ellipse.size.width * 0.5f)),
+                                  std::log(std::max(1.0f, ellipse.size.height * 0.5f)),
+                                  ellipse.angle * CV_PI / 180.0);
+    auto make_ellipse = [](const cv::Vec<double, 5> &p) {
+        return cv::RotatedRect(cv::Point2f(p[0], p[1]),
+                               cv::Size2f(2.0f * std::exp(p[2]), 2.0f * std::exp(p[3])),
+                               p[4] * 180.0 / CV_PI);
+    };
+    double lambda = 1e-3;
+    cv::Mat final_normal;
+    double final_sse = 0.0;
+    int final_count = 0;
+    for (int iteration = 0; iteration < config_.refinement_iterations; ++iteration)
+    {
+        const cv::RotatedRect current = make_ellipse(parameters);
+        cv::Mat normal = cv::Mat::zeros(5, 5, CV_64F);
+        cv::Mat gradient = cv::Mat::zeros(5, 1, CV_64F);
+        double cost = 0.0, sse = 0.0;
+        int used = 0;
+        for (const WeightedPoint &point : points)
+        {
+            const double residual = SampsonResidualPx(current, point.point);
+            if (!std::isfinite(residual)) continue;
+            const double absolute = std::abs(residual);
+            const double robust_weight = absolute <= config_.robust_delta_px
+                                             ? 1.0 : config_.robust_delta_px / absolute;
+            const double weight = std::max(0.01, static_cast<double>(point.weight)) * robust_weight;
+            cv::Vec<double, 5> jacobian;
+            for (int parameter = 0; parameter < 5; ++parameter)
+            {
+                cv::Vec<double, 5> perturbed = parameters;
+                const double epsilon = parameter < 2 ? 0.02 : (parameter < 4 ? 1e-4 : 1e-5);
+                perturbed[parameter] += epsilon;
+                jacobian[parameter] = (SampsonResidualPx(make_ellipse(perturbed), point.point) - residual) / epsilon;
+            }
+            for (int row = 0; row < 5; ++row)
+            {
+                gradient.at<double>(row) += weight * jacobian[row] * residual;
+                for (int col = 0; col < 5; ++col)
+                    normal.at<double>(row, col) += weight * jacobian[row] * jacobian[col];
+            }
+            cost += point.weight * (absolute <= config_.robust_delta_px
+                        ? 0.5 * residual * residual
+                        : config_.robust_delta_px * (absolute - 0.5 * config_.robust_delta_px));
+            sse += weight * residual * residual;
+            ++used;
+        }
+        if (used < 6) return false;
+        // 即使初值已在极小值附近、后续没有任何一步被接受，
+        // 当前法方程仍然是有效的协方差估计，不应把拟合误判为失败。
+        final_normal = normal.clone();
+        final_sse = sse;
+        final_count = used;
+        cv::Mat damped = normal.clone();
+        for (int diagonal = 0; diagonal < 5; ++diagonal)
+            damped.at<double>(diagonal, diagonal) += lambda *
+                std::max(1.0, normal.at<double>(diagonal, diagonal));
+        cv::Mat delta;
+        if (!cv::solve(damped, -gradient, delta, cv::DECOMP_SVD)) return false;
+        cv::Vec<double, 5> trial = parameters;
+        double step = 0.0;
+        for (int i = 0; i < 5; ++i) { trial[i] += delta.at<double>(i); step += delta.at<double>(i) * delta.at<double>(i); }
+        if (std::exp(trial[2]) < 1.0 || std::exp(trial[3]) < 1.0) { lambda *= 5.0; continue; }
+
+        double trial_cost = 0.0;
+        const cv::RotatedRect trial_ellipse = make_ellipse(trial);
+        for (const WeightedPoint &point : points)
+        {
+            const double r = std::abs(SampsonResidualPx(trial_ellipse, point.point));
+            if (!std::isfinite(r)) continue;
+            trial_cost += point.weight * (r <= config_.robust_delta_px
+                              ? 0.5 * r * r
+                              : config_.robust_delta_px * (r - 0.5 * config_.robust_delta_px));
+        }
+        if (trial_cost < cost)
+        {
+            parameters = trial;
+            lambda = std::max(1e-9, lambda * 0.4);
+            if (step < 1e-10) break;
+        }
+        else lambda = std::min(1e9, lambda * 5.0);
+    }
+    ellipse = make_ellipse(parameters);
+    if (final_normal.empty()) return false;
+    cv::SVD svd(final_normal, cv::SVD::NO_UV);
+    const double largest = svd.w.at<double>(0);
+    const double smallest = svd.w.at<double>(svd.w.rows - 1);
+    condition = largest / std::max(1e-15, smallest);
+    cv::Mat inverse;
+    if (!cv::invert(final_normal, inverse, cv::DECOMP_SVD)) return false;
+    inverse *= final_sse / std::max(1, final_count - 5);
+    for (int row = 0; row < 5; ++row)
+        for (int col = 0; col < 5; ++col)
+            covariance(row, col) = inverse.at<double>(row, col);
+    return std::isfinite(condition) && cv::checkRange(inverse);
+}
+
+cv::Matx33d EllipseFitter::EllipseToConic(const cv::RotatedRect &ellipse)
+{
+    return EllipseConicMatrix(ellipse);
+}
+
+void EllipseFitter::UpdateGeometryStatistics(const std::vector<WeightedPoint> &points,
+                                             const cv::Rect &detection_box,
+                                             EllipseFitResult &result) const
+{
+    std::array<bool, 72> bins{};
+    std::array<bool, 4> quadrants{};
+    const double angle = result.ellipse.angle * CV_PI / 180.0;
+    const double c = std::cos(angle), s = std::sin(angle);
+    const double a = result.ellipse.size.width * 0.5, b = result.ellipse.size.height * 0.5;
+    for (const WeightedPoint &weighted : points)
+    {
+        if (std::abs(SampsonResidualPx(result.ellipse, weighted.point)) > config_.inlier_threshold_px) continue;
+        const double dx = weighted.point.x - result.ellipse.center.x;
+        const double dy = weighted.point.y - result.ellipse.center.y;
+        const double x = (c * dx + s * dy) / std::max(1e-6, a);
+        const double y = (-s * dx + c * dy) / std::max(1e-6, b);
+        double theta = std::atan2(y, x);
+        if (theta < 0.0) theta += 2.0 * CV_PI;
+        bins[std::min(71, static_cast<int>(theta * 72.0 / (2.0 * CV_PI)))] = true;
+        quadrants[std::min(3, static_cast<int>(theta * 4.0 / (2.0 * CV_PI)))] = true;
+    }
+    result.angular_coverage_deg = 5.0f * std::count(bins.begin(), bins.end(), true);
+    result.occupied_quadrants = std::count(quadrants.begin(), quadrants.end(), true);
+    result.conic = EllipseToConic(result.ellipse);
+    const double center_variance = std::max(result.covariance(0, 0), result.covariance(1, 1));
+    result.center_std_px = std::sqrt(std::max(0.0, center_variance));
+    const double width_std = result.ellipse.size.width * std::sqrt(std::max(0.0, result.covariance(2, 2)));
+    const double height_std = result.ellipse.size.height * std::sqrt(std::max(0.0, result.covariance(3, 3)));
+    result.major_axis_std_px = std::max(width_std, height_std);
+    result.minor_axis_std_px = std::min(width_std, height_std);
+    result.angle_std_deg = std::sqrt(std::max(0.0, result.covariance(4, 4))) * 180.0 / CV_PI;
+    const float short_side = std::max(1.0f, static_cast<float>(std::min(detection_box.width, detection_box.height)));
+    result.uncertainty_valid = std::isfinite(result.center_std_px) &&
+        result.center_std_px <= config_.maximum_center_std_ratio * short_side &&
+        result.major_axis_std_px <= config_.maximum_axis_std_ratio * short_side &&
+        result.covariance_condition <= config_.maximum_covariance_condition;
+}
+
+EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> &points,
                                                 const cv::Rect &roi,
                                                 const cv::Rect &detection_box,
                                                 EllipseSource source) const
 {
     if (points.size() < 20) return {};
-    std::vector<cv::Point> sampled;
+    std::vector<WeightedPoint> sampled;
     sampled.reserve(std::min(static_cast<int>(points.size()), config_.maximum_points));
     const int step = std::max(1, static_cast<int>(points.size()) / config_.maximum_points);
     for (int index = 0; index < static_cast<int>(points.size()) &&
                         static_cast<int>(sampled.size()) < config_.maximum_points; index += step)
         sampled.push_back(points[index]);
-
     const RansacResult fit = FitRansac(sampled);
     if (!fit.valid) return {};
+
+    std::vector<WeightedPoint> inliers;
+    for (const WeightedPoint &point : sampled)
+        if (std::abs(SampsonResidualPx(fit.ellipse, point.point)) <= config_.inlier_threshold_px)
+            inliers.push_back(point);
+    cv::RotatedRect refined = fit.ellipse;
+    cv::Matx<double, 5, 5> covariance = cv::Matx<double, 5, 5>::zeros();
+    double condition = std::numeric_limits<double>::infinity();
+    if (!RefineSampson(inliers, refined, covariance, condition)) return {};
+
     EllipseFitResult result;
-    result.ellipse = fit.ellipse;
-    result.ellipse.center.x += roi.x;
-    result.ellipse.center.y += roi.y;
+    result.ellipse = refined;
+    result.ellipse.center += cv::Point2f(roi.x, roi.y);
     result.valid = true;
     result.source = source;
     result.from_mask = source == EllipseSource::Mask;
-    result.inliers = fit.inliers;
-    result.sampled_points = fit.sampled_points;
-    result.inlier_ratio = fit.sampled_points > 0
-                              ? static_cast<float>(fit.inliers) / fit.sampled_points : 0.0f;
-    result.mean_error_px = fit.mean_error_px;
+    result.covariance = covariance;
+    result.covariance_condition = condition;
+    result.sampled_points = sampled.size();
+    std::vector<WeightedPoint> global_points = sampled;
+    float error_sum = 0.0f;
+    for (WeightedPoint &point : global_points)
+    {
+        point.point += cv::Point2f(roi.x, roi.y);
+        const float error = std::abs(SampsonResidualPx(result.ellipse, point.point));
+        if (error <= config_.inlier_threshold_px) { ++result.inliers; error_sum += error; }
+    }
+    result.inlier_ratio = result.sampled_points > 0
+                              ? static_cast<float>(result.inliers) / result.sampled_points : 0.0f;
+    result.mean_error_px = result.inliers > 0 ? error_sum / result.inliers
+                                               : std::numeric_limits<float>::infinity();
+    UpdateGeometryStatistics(global_points, detection_box, result);
 
     const cv::Point2f box_center(detection_box.x + detection_box.width * 0.5f,
                                  detection_box.y + detection_box.height * 0.5f);
-    const float short_side = std::max(1.0f, static_cast<float>(
-                                              std::min(detection_box.width, detection_box.height)));
+    const float short_side = std::max(1.0f, static_cast<float>(std::min(detection_box.width, detection_box.height)));
     result.center_deviation_ratio = cv::norm(result.ellipse.center - box_center) / short_side;
     if (result.center_deviation_ratio > config_.center_deviation_ratio ||
         minor_axis(result.ellipse) < 0.20f * short_side ||
-        major_axis(result.ellipse) > 1.45f * std::max(detection_box.width, detection_box.height))
+        major_axis(result.ellipse) > 1.45f * std::max(detection_box.width, detection_box.height) ||
+        result.angular_coverage_deg < config_.minimum_angular_coverage_deg ||
+        result.occupied_quadrants < config_.minimum_occupied_quadrants || !result.uncertainty_valid)
         return {};
 
-    const float error_quality = std::exp(-result.mean_error_px /
-                                         std::max(0.5f, config_.inlier_threshold_px));
-    const float center_quality = clamp01(1.0f - result.center_deviation_ratio /
-                                         config_.center_deviation_ratio);
-    const float shape_quality = clamp01(1.0f - (axis_ratio(result.ellipse) - 1.0f) /
-                                        std::max(1.0f, config_.maximum_axis_ratio - 1.0f));
-    const float source_bonus = source == EllipseSource::Mask ? 0.05f : 0.0f;
-    result.quality = clamp01(0.42f * result.inlier_ratio + 0.25f * error_quality +
-                             0.20f * center_quality + 0.13f * shape_quality + source_bonus);
+    const float error_quality = std::exp(-result.mean_error_px / std::max(0.5f, config_.inlier_threshold_px));
+    const float center_quality = clamp01(1.0f - result.center_deviation_ratio / config_.center_deviation_ratio);
+    const float coverage_quality = clamp01(result.angular_coverage_deg / 300.0f);
+    const float uncertainty_quality = clamp01(1.0f - result.center_std_px /
+        std::max(1.0f, config_.maximum_center_std_ratio * short_side));
+    const float source_bonus = source == EllipseSource::Mask ? 0.04f : 0.0f;
+    result.quality = clamp01(0.32f * result.inlier_ratio + 0.22f * error_quality +
+                             0.16f * center_quality + 0.16f * coverage_quality +
+                             0.14f * uncertainty_quality + source_bonus);
     return result;
 }
 
 EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
                                     const cv::Rect &detection_box,
                                     const uint8_t *mask_data,
-                                    EllipseFitMode mode) const
+                                    EllipseFitMode mode,
+                                    const uint8_t *mask_probability) const
 {
     const cv::Size image_size = image.empty() ? cv::Size() : image.size();
     EllipseFitResult fallback = BoxInscribedCircle(detection_box);
@@ -308,7 +551,14 @@ EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
     if (mask_data != nullptr)
     {
         cv::Mat full_mask(image.size(), CV_8UC1, const_cast<uint8_t *>(mask_data));
-        best = BuildCandidate(CollectMaskPoints(full_mask(roi), box_center_roi),
+        cv::Mat probability_roi;
+        if (mask_probability != nullptr)
+        {
+            cv::Mat full_probability(image.size(), CV_8UC1,
+                                     const_cast<uint8_t *>(mask_probability));
+            probability_roi = full_probability(roi);
+        }
+        best = BuildCandidate(CollectMaskPoints(full_mask(roi), probability_roi, box_center_roi),
                               roi, detection_box, EllipseSource::Mask);
     }
 
@@ -352,7 +602,7 @@ EllipseFitResult EllipseFitter::Fit(cv::Size image_size,
     cv::Mat placeholder(image_size, CV_8UC1, cv::Scalar(0));
     EllipseFitConfig no_edge_config = config_;
     no_edge_config.enable_edge_fallback = false;
-    return EllipseFitter(no_edge_config).Fit(placeholder, detection_box, mask_data, mode);
+    return EllipseFitter(no_edge_config).Fit(placeholder, detection_box, mask_data, mode, nullptr);
 }
 
 RingPairRefiner::RingPairRefiner(RingConsistencyConfig config) : config_(std::move(config)) {}
@@ -389,13 +639,7 @@ RingConsistencyResult RingPairRefiner::Refine(EllipseFitResult &outer,
         return result;
     }
 
-    const float outer_weight = std::max(0.05f, outer.quality);
-    const float middle_weight = std::max(0.05f, middle.quality);
-    const cv::Point2f common_center =
-        (outer.ellipse.center * outer_weight + middle.ellipse.center * middle_weight) /
-        (outer_weight + middle_weight);
-    outer.ellipse.center += (common_center - outer.ellipse.center) * config_.center_fusion_strength;
-    middle.ellipse.center += (common_center - middle.ellipse.center) * config_.center_fusion_strength;
+    // 不在图像平面强制同心；真正的共轴约束应在相机投影模型中施加。
     outer.quality = clamp01(outer.quality + 0.12f * result.score);
     middle.quality = clamp01(middle.quality + 0.12f * result.score);
     return result;
@@ -503,6 +747,7 @@ EllipseFitResult EllipseTemporalFilter::Update(int class_id,
                                    measurement.ellipse.size.height * alpha;
     filtered.ellipse.angle = blend_angle(state.value.ellipse.angle,
                                          measurement.ellipse.angle, alpha);
+    filtered.conic = EllipseConicMatrix(filtered.ellipse);
     filtered.temporally_filtered = true;
     state.value = filtered;
     return filtered;

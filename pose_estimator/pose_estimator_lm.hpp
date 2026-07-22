@@ -24,6 +24,13 @@ struct Pose6D
     double tz_mm = 0.0;
 };
 
+struct PoseEllipseObservation
+{
+    cv::RotatedRect ellipse;
+    double sigma_px = 10.0;
+    bool valid = false;
+};
+
 inline static double pose_estimator_clamp(double val, double min, double max)
 {
     double f = val <= min ? min : (val >= max ? max : val);
@@ -125,6 +132,39 @@ public:
         }
     }
 
+    // 外圈和中圈共享同一3D位姿/法向，在同一个LM目标中联合优化。
+    // sigma_px 来自各自的拟合协方差；Box兜底应传入明显更大的sigma。
+    Pose6D SolveDual(const std::optional<PoseEllipseObservation> &outer,
+                     const std::optional<PoseEllipseObservation> &middle,
+                     const cv::Point2f &hole_center_px,
+                     double hole_sigma_px,
+                     std::optional<double> known_dist_mm = std::nullopt,
+                     int max_iters = 30) const
+    {
+        const PoseEllipseObservation *initializer = nullptr;
+        bool initializer_is_middle = false;
+        if (outer && outer->valid) initializer = &*outer;
+        if (middle && middle->valid &&
+            (initializer == nullptr || middle->sigma_px < initializer->sigma_px))
+        {
+            initializer = &*middle;
+            initializer_is_middle = true;
+        }
+        if (initializer == nullptr) return {};
+        Pose6D initial = Solve(initializer->ellipse, hole_center_px,
+                               initializer_is_middle, known_dist_mm, 8);
+        std::vector<double> x;
+        if (known_dist_mm) x = {initial.yaw_deg, initial.pitch_deg, initial.tx_mm, initial.ty_mm};
+        else x = {initial.yaw_deg, initial.pitch_deg, initial.tx_mm, initial.ty_mm, initial.tz_mm};
+        lmOptimizeDual(x, outer, middle, hole_center_px,
+                       std::max(0.5, hole_sigma_px), known_dist_mm, max_iters);
+        const double tz = known_dist_mm ? *known_dist_mm : x[4];
+        for (double value : x)
+            if (!std::isfinite(value)) return initial;
+        if (tz < 100.0) return initial;
+        return {x[0], x[1], 0.0, x[2], x[3], tz};
+    }
+
     void DrawAxis(cv::Mat &img, const Pose6D &pose, bool use_cls1) const
     {
         const double length = use_cls1 ? model_.radius_cls1_mm : model_.radius_cls0_mm;
@@ -206,6 +246,142 @@ private:
         // delta: 像素级阈值（建议 2~5）
         const double x = r / delta;
         return std::sqrt(2.0 * delta * delta * (std::sqrt(1.0 + x * x) - 1.0));
+    }
+
+    static inline double signed_pseudo_huber(double residual, double delta)
+    {
+        const double magnitude = pseudo_huber(residual, delta);
+        return std::copysign(magnitude, residual);
+    }
+
+    static double ellipse_sampson_residual(const cv::RotatedRect &ellipse,
+                                           const cv::Point2f &point)
+    {
+        const double a = ellipse.size.width * 0.5;
+        const double b = ellipse.size.height * 0.5;
+        if (a < 1e-6 || b < 1e-6) return 1e6;
+        const double angle = deg2rad(ellipse.angle);
+        const double c = std::cos(angle), s = std::sin(angle);
+        const double dx = point.x - ellipse.center.x, dy = point.y - ellipse.center.y;
+        const double x = c * dx + s * dy, y = -s * dx + c * dy;
+        const double gx = 2.0 * x / (a * a), gy = 2.0 * y / (b * b);
+        const double gradient = std::hypot(c * gx - s * gy, s * gx + c * gy);
+        if (gradient < 1e-9) return 1e6;
+        return (x * x / (a * a) + y * y / (b * b) - 1.0) / gradient;
+    }
+
+    void computeResidualDual(const std::vector<double> &x,
+                             const std::optional<PoseEllipseObservation> &outer,
+                             const std::optional<PoseEllipseObservation> &middle,
+                             const cv::Point2f &hole_center_px,
+                             double hole_sigma_px,
+                             std::optional<double> fixed_tz,
+                             std::vector<double> &residual) const
+    {
+        const double yaw = x[0], pitch = x[1], tx = x[2], ty = x[3];
+        const double tz = fixed_tz ? *fixed_tz : x[4];
+        residual.clear();
+        if (tz < 100.0)
+        {
+            size_t expected = 2;
+            if (outer && outer->valid) expected += pts3d_cls0_.size();
+            if (middle && middle->valid) expected += pts3d_cls1_.size();
+            residual.assign(expected, 1e4);
+            return;
+        }
+        const cv::Vec3d rvec = eulerYXZ_to_rvec(yaw, pitch, 0.0);
+        const cv::Vec3d tvec(tx, ty, tz);
+        auto append_ring = [&](const std::optional<PoseEllipseObservation> &observation,
+                               const std::vector<cv::Point3f> &circle)
+        {
+            if (!observation || !observation->valid) return;
+            std::vector<cv::Point2f> projected;
+            cv::projectPoints(circle, rvec, tvec, K_, D_, projected);
+            const double sigma = std::max(0.5, observation->sigma_px);
+            for (const cv::Point2f &point : projected)
+            {
+                const double standardized = ellipse_sampson_residual(observation->ellipse, point) / sigma;
+                residual.push_back(signed_pseudo_huber(standardized, 2.5));
+            }
+        };
+        append_ring(outer, pts3d_cls0_);
+        append_ring(middle, pts3d_cls1_);
+        std::vector<cv::Point3f> hole3d = {{0.0f, 0.0f, static_cast<float>(-model_.length_L_mm)}};
+        std::vector<cv::Point2f> projected_hole;
+        cv::projectPoints(hole3d, rvec, tvec, K_, D_, projected_hole);
+        const double sigma = std::max(0.5, hole_sigma_px);
+        residual.push_back(signed_pseudo_huber((projected_hole[0].x - hole_center_px.x) / sigma, 2.5));
+        residual.push_back(signed_pseudo_huber((projected_hole[0].y - hole_center_px.y) / sigma, 2.5));
+    }
+
+    void lmOptimizeDual(std::vector<double> &x,
+                        const std::optional<PoseEllipseObservation> &outer,
+                        const std::optional<PoseEllipseObservation> &middle,
+                        const cv::Point2f &hole_center_px,
+                        double hole_sigma_px,
+                        std::optional<double> fixed_tz,
+                        int max_iters) const
+    {
+        const int n = static_cast<int>(x.size());
+        double lambda = 1e-3;
+        std::vector<double> residual, trial_residual;
+        computeResidualDual(x, outer, middle, hole_center_px, hole_sigma_px, fixed_tz, residual);
+        auto cost = [](const std::vector<double> &values) {
+            double result = 0.0;
+            for (double value : values) result += value * value;
+            return 0.5 * result;
+        };
+        double current_cost = cost(residual);
+        for (int iteration = 0; iteration < max_iters; ++iteration)
+        {
+            const int m = static_cast<int>(residual.size());
+            if (m < n) break;
+            cv::Mat jacobian(m, n, CV_64F), residual_matrix(m, 1, CV_64F);
+            for (int row = 0; row < m; ++row) residual_matrix.at<double>(row) = residual[row];
+            for (int parameter = 0; parameter < n; ++parameter)
+            {
+                std::vector<double> perturbed = x;
+                const double epsilon = 1e-4 * (std::abs(x[parameter]) + 1.0);
+                perturbed[parameter] += epsilon;
+                computeResidualDual(perturbed, outer, middle, hole_center_px,
+                                    hole_sigma_px, fixed_tz, trial_residual);
+                for (int row = 0; row < m; ++row)
+                    jacobian.at<double>(row, parameter) =
+                        (trial_residual[row] - residual[row]) / epsilon;
+            }
+            cv::Mat normal = jacobian.t() * jacobian;
+            cv::Mat gradient = jacobian.t() * residual_matrix;
+            for (int diagonal = 0; diagonal < n; ++diagonal)
+                normal.at<double>(diagonal, diagonal) += lambda *
+                    std::max(1.0, normal.at<double>(diagonal, diagonal));
+            cv::Mat delta;
+            if (!cv::solve(normal, -gradient, delta, cv::DECOMP_SVD)) break;
+            std::vector<double> trial = x;
+            double step = 0.0;
+            for (int parameter = 0; parameter < n; ++parameter)
+            {
+                trial[parameter] += delta.at<double>(parameter);
+                step += delta.at<double>(parameter) * delta.at<double>(parameter);
+            }
+            trial[0] = std::clamp(trial[0], -60.0, 60.0);
+            trial[1] = std::clamp(trial[1], -60.0, 60.0);
+            if (!fixed_tz) trial[4] = std::clamp(trial[4], 100.0, 50000.0);
+            computeResidualDual(trial, outer, middle, hole_center_px,
+                                hole_sigma_px, fixed_tz, trial_residual);
+            const double trial_cost = cost(trial_residual);
+            if (trial_cost < current_cost)
+            {
+                x = std::move(trial);
+                residual = std::move(trial_residual);
+                current_cost = trial_cost;
+                lambda = std::max(1e-9, lambda * 0.5);
+                if (step < 1e-12) break;
+            }
+            else
+            {
+                lambda = std::min(1e9, lambda * 3.0);
+            }
+        }
     }
 
     // 误差函数

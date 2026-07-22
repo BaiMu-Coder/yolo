@@ -3,8 +3,9 @@
 
 ## Python/PT 效果优先版本
 
-`unit_test/final_version.py` 直接加载转换前的实例分割 `.pt` 模型，保留 mask、RANSAC
-椭圆拟合和 LM 位姿解算，并保存标注视频、逐帧图片、mask、位姿 TXT、检测 JSONL 和位姿曲线。
+`unit_test/final_version.py` 直接加载转换前的实例分割 `.pt` 模型，保留软 mask、
+亚像素椭圆拟合、不确定度评估和双圆环联合 LM 位姿解算，并保存标注视频、逐帧图片、
+mask、位姿 TXT、检测 JSONL 和位姿曲线。
 
 项目已创建 `.venv-yolo` 环境。把 PT 模型放到项目目录（默认文件名 `best.pt`），然后运行：
 
@@ -34,9 +35,9 @@ video_name = "test01.mp4"
 
 ## C++ 串行图片/视频处理
 
-`unit_test/batch_image_video.cpp` 接入现有 RKNN、YOLOv8-seg 后处理、Mask、RANSAC
-椭圆拟合及 LM 位姿解算框架，并通过现有 CMake 生成 `batch_image_video`。
-C++ 的 Mask/RANSAC、质量评分和内切圆保底逻辑已统一抽离到
+`unit_test/batch_image_video.cpp` 接入现有 RKNN、YOLOv8-seg 后处理、Mask、稳健椭圆拟合
+及联合 LM 位姿解算框架，并通过现有 CMake 生成 `batch_image_video`。
+C++ 的软 Mask/亚像素轮廓、PROSAC/LO-RANSAC、Sampson LM、质量评分和内切圆保底逻辑已统一抽离到
 `ellipse_fitter/ellipse_fitter.hpp/.cpp`，在线推理池、批处理和单帧测试不再各自保留副本。
 
 编译：
@@ -75,7 +76,8 @@ cmake --install build
 
 - `visual/原图名.*`：图片文件夹逐图可视化结果；视频加 `--save-video-frames` 时保存逐帧 JPG。
 - `labels/原图名.txt`：YOLO 格式 `class x_center y_center width height confidence`，坐标归一化。
-- `ellipses/原图名.txt`：类别、椭圆中心、长轴、短轴、角度、置信度、拟合来源及误差。
+- `ellipses/原图名.txt`：类别、椭圆参数、拟合来源/误差、轮廓覆盖角、协方差标准差、
+  条件数、时序/几何门控状态和二次曲线系数。
 - `poses/原图名.txt`：参考类别与中心、孔中心，以及自动/固定距离两套 yaw、pitch、roll、tx、ty、tz。
 - 视频输入还会在输出根目录生成 `<视频名>_result.mp4`，编码不可用时自动回退为 AVI。
 
@@ -102,7 +104,15 @@ cmake --build build --target single_frame_pipeline -j
 
 `npu_infer_pool` 默认对参考外/中圈（cls0/cls1）优先使用 Mask 拟合，内孔（cls2）使用检测框中心和内切圆。验收现场图像质量不足时，可在提交推理任务前开启参考圈保底模式：
 
-默认外圈/中圈只采用两级策略：Mask-RANSAC 综合内点率、平均边界误差、圆心偏差和轴比得到质量分，低于门槛时直接改用检测框内切圆，不执行灰度边缘拟合。两圈同时存在时再检查同心度、物理直径比、轴比和方向一致性。视频/摄像头模式最后使用随质量自适应的椭圆 EMA，并拒绝低质量突变。可视化中绿色为 Mask、黄色为检测框内切圆。
+默认外圈/中圈只采用两级策略：高质量 Mask 椭圆，或检测框内切圆。参考圈不执行灰度 Edge 拟合。
+Mask 路径先从分割概率的 0.5 等值线获得亚像素轮廓，再用质量排序采样、直接最小二乘初值、
+LO-RANSAC 局部重拟合和 Huber-Sampson LM 精修。候选必须通过内点率、轮廓角度/象限覆盖、检测框偏差、
+轴比及协方差条件数门控；任一关键项不合格就回退到内切圆。
+
+两圈同时存在时，先做尺寸比、中心偏移、轴比和方向的几何门控，但不强制两个投影椭圆在图像上同心。
+位姿层把外圈和中圈作为同一组共轴 3D 圆，在同一 LM 中联合重投影，并用各自拟合协方差换算的像素标准差加权。
+Mask 拟合可信时权重高，Box 兜底时自动降权。视频/摄像头模式最后使用随质量自适应的椭圆 EMA，
+并拒绝低质量突变。可视化中绿色为 Mask、黄色为检测框内切圆。
 
 ```cpp
 npu_infer_pool pool(model_path);

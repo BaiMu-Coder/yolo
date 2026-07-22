@@ -178,7 +178,7 @@ xx.print_time("index == 12");
         }
         offset += grid_len;
       }
- 
+
 
       if (max_class_id != -1 && max_score > score_threshold_u8) // 满足这两个说明这个检测框是有效的  则进行检测框的解码  以及proto的系数提取
       {
@@ -678,33 +678,45 @@ int real_y=letter_box.src_h;
 int len=real_x*real_y;
 int n=result.count;
 
-if(n>result.results_mask->each_of_mask.size())
-{
-  result.results_mask->each_of_mask.reserve(n+3);
-  result.results_mask->each_of_mask_clsid.reserve(n+3);
-}
+result.results_mask->each_of_mask.clear();
+result.results_mask->each_of_mask_probability.clear();
+result.results_mask->each_of_mask_clsid.clear();
+result.results_mask->each_of_mask.reserve(n);
+result.results_mask->each_of_mask_probability.reserve(n);
+result.results_mask->each_of_mask_clsid.reserve(n);
 
 
 for(int i=0; i<n; ++i)
 {
-int x1=result.results_box[i].x;
-int y1=result.results_box[i].y;
-int x2=result.results_box[i].w+x1;
-int y2=result.results_box[i].h+y1;
-if (x2 <= x1 || y2 <= y1) continue;
+int x1=std::clamp(result.results_box[i].x, 0, real_x);
+int y1=std::clamp(result.results_box[i].y, 0, real_y);
+int x2=std::clamp(result.results_box[i].w+result.results_box[i].x, 0, real_x);
+int y2=std::clamp(result.results_box[i].h+result.results_box[i].y, 0, real_y);
+if (x2 <= x1 || y2 <= y1)
+{
+result.results_mask->each_of_mask.push_back(nullptr);
+result.results_mask->each_of_mask_probability.push_back(nullptr);
+result.results_mask->each_of_mask_clsid.push_back(result.results_box[i].cls_id);
+continue;
+}
 
 auto tem_mask=std::make_unique<uint8_t[]>(real_x*real_y);
+auto tem_probability=std::make_unique<uint8_t[]>(real_x*real_y);
 
 for(int y=y1; y<y2; ++y)
 {
 for(int x=x1; x<x2; ++x)
 {
-if(all_mask[i*len+y*real_x+x]>0)
+const float logit = all_mask[i*len+y*real_x+x];
+const float probability = 1.0f / (1.0f + std::exp(-std::clamp(logit, -12.0f, 12.0f)));
+tem_probability[y*real_x+x] = static_cast<uint8_t>(std::lround(probability * 255.0f));
+if(logit>0)
  tem_mask[y*real_x+x]=result.results_box[i].cls_id+1;   //记录每一个单独的掩码
 
 }
 }
 result.results_mask->each_of_mask.push_back(std::move(tem_mask));  
+result.results_mask->each_of_mask_probability.push_back(std::move(tem_probability));
 result.results_mask->each_of_mask_clsid.push_back(result.results_box[i].cls_id);  
 
 }
@@ -811,24 +823,10 @@ void resize_by_opencv_fp(std::unique_ptr<float[]>& mask_matrix_mult_result,int l
                     cv::Mat cropped = proto(roi_rect);  // cropped 也是“视图”，指向 proto 的子区域
 
                     cv::Mat dst(letter_box.src_h, letter_box.src_w, CV_32F,(void*)(dst_ptr + i * dst_stride)); //让输出 Mat 直接指向 all_mask 对应区域 
- 
+
                     cv::resize(cropped, dst, dst_size, 0, 0, cv::INTER_LINEAR); //// 把 cropped 放缩到 dst_size，并写入 dst（也就是 all_mask 的那段内存）
 
                       }
 
                       return ;
- } 
-
-
-
-
-
-
-
-
-
-
-
-
-
- 
+}

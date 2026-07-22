@@ -182,15 +182,20 @@ public:
         std::ofstream pose_file(dirs.poses / (key + ".txt"));
         if (!yolo_file || !ellipse_file || !pose_file) return fail(key, "cannot create txt output");
         yolo_file << std::fixed << std::setprecision(8);
-        ellipse_file << "# class_id center_x_px center_y_px major_axis_px minor_axis_px angle_deg confidence fit_source quality inlier_ratio inliers mean_error_px geometry_ok temporal\n"
+        ellipse_file << "# class_id center_x_px center_y_px major_axis_px minor_axis_px angle_deg confidence fit_source quality inlier_ratio inliers mean_error_px coverage_deg quadrants center_std_px major_std_px minor_std_px angle_std_deg cov_condition geometry_ok temporal conic00 conic01 conic02 conic11 conic12 conic22\n"
                      << std::fixed << std::setprecision(6);
 
         for (int i = 0; i < result.count; ++i) {
             const auto& detection = result.results_box[i];
             const uint8_t* mask = nullptr;
+            const uint8_t* mask_probability = nullptr;
             if (i < static_cast<int>(result.results_mask[0].each_of_mask.size()) &&
                 result.results_mask[0].each_of_mask[i]) {
                 mask = result.results_mask[0].each_of_mask[i].get();
+            }
+            if (i < static_cast<int>(result.results_mask[0].each_of_mask_probability.size()) &&
+                result.results_mask[0].each_of_mask_probability[i]) {
+                mask_probability = result.results_mask[0].each_of_mask_probability[i].get();
             }
             const bool is_reference = detection.cls_id == 0 || detection.cls_id == 1;
             const bool force_box = (is_reference && args_.force_reference_box) ||
@@ -203,7 +208,7 @@ public:
                                                        ? EllipseFitMode::PreferMaskNoEdge
                                                        : EllipseFitMode::PreferMask);
             EllipseFitResult ellipse = ellipse_fitter.Fit(
-                input, detection_rect, mask, fit_mode);
+                input, detection_rect, mask, fit_mode, mask_probability);
             ellipse_results.push_back(ellipse);
 
             const double center_x = (detection.x + detection.w * 0.5) / input.cols;
@@ -261,8 +266,14 @@ public:
                          << ellipse.ellipse.angle << ' ' << detection.prop << ' '
                          << EllipseSourceName(ellipse.source) << ' ' << ellipse.quality << ' '
                          << ellipse.inlier_ratio << ' ' << ellipse.inliers << ' '
-                         << ellipse.mean_error_px << ' ' << ellipse.geometry_consistent << ' '
-                         << ellipse.temporally_filtered << '\n';
+                         << ellipse.mean_error_px << ' ' << ellipse.angular_coverage_deg << ' '
+                         << ellipse.occupied_quadrants << ' ' << ellipse.center_std_px << ' '
+                         << ellipse.major_axis_std_px << ' ' << ellipse.minor_axis_std_px << ' '
+                         << ellipse.angle_std_deg << ' ' << ellipse.covariance_condition << ' '
+                         << ellipse.geometry_consistent << ' ' << ellipse.temporally_filtered << ' '
+                         << ellipse.conic(0, 0) << ' ' << ellipse.conic(0, 1) << ' '
+                         << ellipse.conic(0, 2) << ' ' << ellipse.conic(1, 1) << ' '
+                         << ellipse.conic(1, 2) << ' ' << ellipse.conic(2, 2) << '\n';
         }
         save_and_draw_pose(result, ellipse_results, outer, middle, hole,
                            visualization, pose_file);
@@ -309,8 +320,20 @@ private:
         const bool use_middle = result.results_box[reference].cls_id == 1;
         const cv::RotatedRect& target = ellipses[reference].ellipse;
         const cv::Point2f hole_center = ellipses[hole].ellipse.center;
-        const Pose6D pose_auto = pose_estimator_.Solve(target, hole_center, use_middle, std::nullopt);
-        const Pose6D pose_fixed = pose_estimator_.Solve(target, hole_center, use_middle, args_.fixed_distance_mm);
+        std::optional<PoseEllipseObservation> outer_observation;
+        std::optional<PoseEllipseObservation> middle_observation;
+        if (outer >= 0)
+            outer_observation = PoseEllipseObservation{ellipses[outer].ellipse,
+                EllipseObservationSigmaPx(ellipses[outer]), true};
+        if (middle >= 0)
+            middle_observation = PoseEllipseObservation{ellipses[middle].ellipse,
+                EllipseObservationSigmaPx(ellipses[middle]), true};
+        const double hole_sigma = EllipseObservationSigmaPx(ellipses[hole]);
+        const Pose6D pose_auto = pose_estimator_.SolveDual(
+            outer_observation, middle_observation, hole_center, hole_sigma, std::nullopt);
+        const Pose6D pose_fixed = pose_estimator_.SolveDual(
+            outer_observation, middle_observation, hole_center, hole_sigma,
+            args_.fixed_distance_mm);
         const Pose6D& displayed = args_.display_fixed_pose ? pose_fixed : pose_auto;
 
         pose_file << "1 " << result.results_box[reference].cls_id << ' ' << target.center.x << ' '

@@ -61,6 +61,8 @@ typedef struct
 {
   std::unique_ptr<uint8_t[]> seg_mask;
   std::vector<std::unique_ptr<uint8_t[]>> each_of_mask;   //此项目定制 记录每个类别的掩码     其实这里每一个框和每一个单独的掩码也是对应的关系
+  // 与 each_of_mask 一一对应的 sigmoid 概率量化值 [0,255]，用于亚像素边界拟合。
+  std::vector<std::unique_ptr<uint8_t[]>> each_of_mask_probability;
   std::vector<int> each_of_mask_clsid;   //记录each_of_mask里面每一个掩码属于哪个类别
 } object_segment_result;
 
@@ -70,7 +72,6 @@ typedef struct
     object_detect_result results_box[OBJ_NUMB_MAX_SIZE];
     object_segment_result results_mask[1];  //所有mask
 } object_detect_result_list;
-
 
 
 

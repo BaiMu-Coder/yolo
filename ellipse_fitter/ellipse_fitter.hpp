@@ -28,7 +28,10 @@ struct EllipseFitConfig
 {
     float center_deviation_ratio = 0.30f;
     int ransac_iterations = 160;
+    int local_optimization_iterations = 2;
+    int refinement_iterations = 15;
     float inlier_threshold_px = 3.0f;
+    float robust_delta_px = 2.5f;
     float minimum_inlier_ratio = 0.42f;
     float maximum_axis_ratio = 6.0f;
     int maximum_points = 180;
@@ -37,6 +40,11 @@ struct EllipseFitConfig
     float minimum_candidate_quality = 0.52f;
     bool enable_edge_fallback = true;
     float edge_search_quality_threshold = 0.72f;
+    float minimum_angular_coverage_deg = 160.0f;
+    int minimum_occupied_quadrants = 3;
+    float maximum_center_std_ratio = 0.10f;
+    float maximum_axis_std_ratio = 0.18f;
+    double maximum_covariance_condition = 1e12;
     double canny_low_threshold = 45.0;
     double canny_high_threshold = 135.0;
     uint32_t random_seed = 12345;
@@ -56,9 +64,21 @@ struct EllipseFitResult
     float quality = 0.0f;
     bool geometry_consistent = true;
     bool temporally_filtered = false;
+    cv::Matx33d conic = cv::Matx33d::zeros();
+    cv::Matx<double, 5, 5> covariance = cv::Matx<double, 5, 5>::zeros();
+    bool uncertainty_valid = false;
+    float center_std_px = std::numeric_limits<float>::infinity();
+    float major_axis_std_px = std::numeric_limits<float>::infinity();
+    float minor_axis_std_px = std::numeric_limits<float>::infinity();
+    float angle_std_deg = std::numeric_limits<float>::infinity();
+    float angular_coverage_deg = 0.0f;
+    int occupied_quadrants = 0;
+    double covariance_condition = std::numeric_limits<double>::infinity();
 };
 
 float EllipseSelectionScore(const EllipseFitResult &ellipse, float detection_confidence);
+double EllipseObservationSigmaPx(const EllipseFitResult &ellipse);
+cv::Matx33d EllipseConicMatrix(const cv::RotatedRect &ellipse);
 
 // 统一候选器：支持 Mask、可选灰度边缘和检测框内切圆。
 // 外/中圈生产路径使用 PreferMaskNoEdge：Mask 不合格时直接回退内切圆。
@@ -70,7 +90,8 @@ public:
     EllipseFitResult Fit(const cv::Mat &image,
                          const cv::Rect &detection_box,
                          const uint8_t *mask_data,
-                         EllipseFitMode mode = EllipseFitMode::PreferMask) const;
+                         EllipseFitMode mode = EllipseFitMode::PreferMask,
+                         const uint8_t *mask_probability = nullptr) const;
 
     // 兼容没有原图的调用；该重载无法启用灰度边缘候选。
     EllipseFitResult Fit(cv::Size image_size,
@@ -81,6 +102,12 @@ public:
     static EllipseFitResult BoxInscribedCircle(const cv::Rect &detection_box);
 
 private:
+    struct WeightedPoint
+    {
+        cv::Point2f point;
+        float weight = 1.0f;
+    };
+
     struct RansacResult
     {
         bool valid = false;
@@ -90,17 +117,26 @@ private:
         float mean_error_px = std::numeric_limits<float>::infinity();
     };
 
-    static float RadialErrorPx(const cv::RotatedRect &ellipse,
-                               const cv::Point2f &point);
-    RansacResult FitRansac(const std::vector<cv::Point> &points) const;
-    std::vector<cv::Point> CollectMaskPoints(const cv::Mat &binary_roi,
-                                             const cv::Point2f &box_center_roi) const;
-    std::vector<cv::Point> CollectEdgePoints(const cv::Mat &edge_roi,
-                                             const cv::Point2f &box_center_roi) const;
-    EllipseFitResult BuildCandidate(const std::vector<cv::Point> &points,
+    static float SampsonResidualPx(const cv::RotatedRect &ellipse,
+                                   const cv::Point2f &point);
+    RansacResult FitRansac(const std::vector<WeightedPoint> &points) const;
+    std::vector<WeightedPoint> CollectMaskPoints(const cv::Mat &binary_roi,
+                                                 const cv::Mat &probability_roi,
+                                                 const cv::Point2f &box_center_roi) const;
+    std::vector<WeightedPoint> CollectEdgePoints(const cv::Mat &edge_roi,
+                                                 const cv::Point2f &box_center_roi) const;
+    EllipseFitResult BuildCandidate(const std::vector<WeightedPoint> &points,
                                     const cv::Rect &roi,
                                     const cv::Rect &detection_box,
                                     EllipseSource source) const;
+    bool RefineSampson(const std::vector<WeightedPoint> &points,
+                       cv::RotatedRect &ellipse,
+                       cv::Matx<double, 5, 5> &covariance,
+                       double &condition) const;
+    void UpdateGeometryStatistics(const std::vector<WeightedPoint> &points,
+                                  const cv::Rect &detection_box,
+                                  EllipseFitResult &result) const;
+    static cv::Matx33d EllipseToConic(const cv::RotatedRect &ellipse);
 
     EllipseFitConfig config_;
 };
@@ -112,7 +148,8 @@ struct RingConsistencyConfig
     float maximum_center_offset_ratio = 0.14f;
     float maximum_axis_ratio_difference = 0.28f;
     float maximum_angle_difference_deg = 24.0f;
-    float center_fusion_strength = 0.35f;
+    // 透视投影下同轴圆的图像椭圆中心不必相同，默认禁止图像平面圆心融合。
+    float center_fusion_strength = 0.0f;
 };
 
 struct RingConsistencyResult

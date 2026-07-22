@@ -27,6 +27,7 @@ build/*
 install/*
 !install/.gitkeep
 video/*
+data/*
 
 _build/
 out/

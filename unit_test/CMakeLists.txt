@@ -3,11 +3,13 @@
 
 set(YOLO_TEST_TARGETS
     batch_image_video
+    batch_mask_ring_visualization
     single_frame_pipeline
     shipin_show
 )
 
 add_executable(batch_image_video batch_image_video.cpp)
+add_executable(batch_mask_ring_visualization batch_mask_ring_visualization.cpp)
 add_executable(single_frame_pipeline single_frame_pipeline.cpp)
 add_executable(shipin_show final_version.cpp)
 

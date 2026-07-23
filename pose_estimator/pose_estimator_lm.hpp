@@ -1,6 +1,7 @@
 #pragma once
 #include <opencv2/opencv.hpp>
 #include <opencv2/calib3d.hpp>
+#include <algorithm>
 #include <array>
 #include <vector>
 #include <cmath>
@@ -36,6 +37,7 @@ struct PoseEllipseObservation
     // 可见的弧段内点传到这里，位姿优化可直接约束这些像素点到预测圆锥曲线的距离。
     std::vector<cv::Point2f> visible_arc_points;
     bool partial_visibility = false;
+    double visible_arc_ratio = 0.0;
 };
 
 inline static double pose_estimator_clamp(double val, double min, double max)
@@ -146,7 +148,8 @@ public:
                      const cv::Point2f &hole_center_px,
                      double hole_sigma_px,
                      std::optional<double> known_dist_mm = std::nullopt,
-                     int max_iters = 30) const
+                     int max_iters = 30,
+                     bool enable_multistart = true) const
     {
         const PoseEllipseObservation *initializer = nullptr;
         bool initializer_is_middle = false;
@@ -174,7 +177,17 @@ public:
         const bool has_partial =
             (outer && outer->valid && outer->partial_visibility) ||
             (middle && middle->valid && middle->partial_visibility);
-        if (has_partial)
+        const bool has_complete =
+            (outer && outer->valid && !outer->partial_visibility) ||
+            (middle && middle->valid && !middle->partial_visibility);
+        const double shortest_visible_ratio = std::min(
+            outer && outer->valid && outer->partial_visibility
+                ? outer->visible_arc_ratio : 1.0,
+            middle && middle->valid && middle->partial_visibility
+                ? middle->visible_arc_ratio : 1.0);
+        // 完整圈已经能提供可靠吸引域；超过约半圈的部分弧通常也不需要多初值。
+        if (enable_multistart && has_partial && !has_complete &&
+            shortest_visible_ratio < 0.55)
         {
             const std::array<std::array<double, 2>, 5> offsets{{
                 {{0.0, 0.0}}, {{-12.0, 0.0}}, {{12.0, 0.0}},
@@ -188,7 +201,7 @@ public:
                 seed[0] += offset[0];
                 seed[1] += offset[1];
                 lmOptimizeDual(seed, outer, middle, hole_center_px,
-                               std::max(0.5, hole_sigma_px), known_dist_mm, 8);
+                               std::max(0.5, hole_sigma_px), known_dist_mm, 3);
                 std::vector<double> seed_residual;
                 computeResidualDual(seed, outer, middle, hole_center_px,
                                     std::max(0.5, hole_sigma_px), known_dist_mm,
@@ -203,13 +216,46 @@ public:
             }
             x = std::move(best_seed);
         }
+        const int effective_iterations = has_partial
+            ? std::min(max_iters, has_complete ? 20 : 18)
+            : max_iters;
         lmOptimizeDual(x, outer, middle, hole_center_px,
-                       std::max(0.5, hole_sigma_px), known_dist_mm, max_iters);
+                       std::max(0.5, hole_sigma_px), known_dist_mm,
+                       effective_iterations);
         const double tz = known_dist_mm ? *known_dist_mm : x[4];
         for (double value : x)
             if (!std::isfinite(value)) return initial;
         if (tz < 100.0) return initial;
         return {x[0], x[1], 0.0, x[2], x[3], tz};
+    }
+
+    double EvaluateDualReprojectionScore(
+        const std::optional<PoseEllipseObservation> &outer,
+        const std::optional<PoseEllipseObservation> &middle,
+        const cv::Point2f &hole_center_px,
+        double hole_sigma_px,
+        int max_iters = 6) const
+    {
+        if ((!outer || !outer->valid) && (!middle || !middle->valid)) return 0.0;
+        const Pose6D pose = SolveDual(outer, middle, hole_center_px,
+                                      hole_sigma_px, std::nullopt, max_iters,
+                                      false);
+        if (!std::isfinite(pose.tz_mm) || pose.tz_mm < 100.0) return 0.0;
+        const std::vector<double> x = {
+            pose.yaw_deg, pose.pitch_deg, pose.tx_mm, pose.ty_mm, pose.tz_mm};
+        std::vector<double> residual;
+        computeResidualDual(x, outer, middle, hole_center_px,
+                            std::max(0.5, hole_sigma_px), std::nullopt, residual);
+        if (residual.empty()) return 0.0;
+        double squared_sum = 0.0;
+        for (const double value : residual)
+        {
+            if (!std::isfinite(value)) return 0.0;
+            squared_sum += value * value;
+        }
+        const double rms = std::sqrt(squared_sum / residual.size());
+        // 标准化稳健残差 RMS≈0 为满分，RMS>3 时迅速接近0。
+        return std::exp(-0.5 * rms * rms);
     }
 
     void DrawAxis(cv::Mat &img, const Pose6D &pose, bool use_cls1) const
@@ -317,6 +363,99 @@ private:
         return (x * x / (a * a) + y * y / (b * b) - 1.0) / gradient;
     }
 
+    static double conic_sampson_residual(const cv::Matx33d &conic,
+                                         const cv::Point2f &point)
+    {
+        const double x = point.x, y = point.y;
+        const double value =
+            conic(0, 0) * x * x + 2.0 * conic(0, 1) * x * y +
+            2.0 * conic(0, 2) * x + conic(1, 1) * y * y +
+            2.0 * conic(1, 2) * y + conic(2, 2);
+        const double gx = 2.0 * (conic(0, 0) * x + conic(0, 1) * y + conic(0, 2));
+        const double gy = 2.0 * (conic(0, 1) * x + conic(1, 1) * y + conic(1, 2));
+        const double gradient = std::hypot(gx, gy);
+        return gradient > 1e-12 ? value / gradient : 1e6;
+    }
+
+    bool projectCircleConic(const cv::Vec3d &rvec,
+                            const cv::Vec3d &tvec,
+                            double radius,
+                            cv::Matx33d &image_conic) const
+    {
+        // 对无畸变针孔相机，平面圆锥曲线可通过单应矩阵精确投影：
+        // C_image = H^{-T} C_circle H^{-1}，
+        // H = K [r1 r2 t]，C_circle = diag(1/R², 1/R², -1)。
+        // 这比“投影离散圆周点后再次 fitEllipse”少一层拟合误差，残差也更平滑。
+        if (radius <= 1e-6 || K_.empty() || (!D_.empty() && cv::norm(D_) > 1e-12))
+            return false;
+        cv::Mat rotation_mat;
+        cv::Rodrigues(rvec, rotation_mat);
+        cv::Matx33d rotation;
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col)
+                rotation(row, col) = rotation_mat.at<double>(row, col);
+        cv::Matx33d camera;
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col)
+                camera(row, col) = K_.at<double>(row, col);
+        const cv::Matx33d plane_pose(
+            rotation(0, 0), rotation(0, 1), tvec[0],
+            rotation(1, 0), rotation(1, 1), tvec[1],
+            rotation(2, 0), rotation(2, 1), tvec[2]);
+        const cv::Matx33d homography = camera * plane_pose;
+        const double determinant = cv::determinant(cv::Mat(homography));
+        if (!std::isfinite(determinant) || std::abs(determinant) < 1e-12)
+            return false;
+        const cv::Matx33d inverse = homography.inv();
+        const double inverse_radius_sq = 1.0 / (radius * radius);
+        const cv::Matx33d circle_conic(
+            inverse_radius_sq, 0.0, 0.0,
+            0.0, inverse_radius_sq, 0.0,
+            0.0, 0.0, -1.0);
+        image_conic = inverse.t() * circle_conic * inverse;
+        double norm = 0.0;
+        for (double value : image_conic.val) norm += value * value;
+        norm = std::sqrt(norm);
+        if (!std::isfinite(norm) || norm < 1e-15) return false;
+        image_conic *= 1.0 / norm;
+        return true;
+    }
+
+    static size_t reverseArcResidualCount(const PoseEllipseObservation &observation,
+                                          size_t projected_count)
+    {
+        if (!observation.partial_visibility ||
+            observation.visible_arc_points.size() < 5 || projected_count == 0)
+            return 0;
+        const double ratio = pose_estimator_clamp(observation.visible_arc_ratio,
+                                                  0.10, 1.0);
+        // 只取与可见比例相当的一段预测圆周，避免要求出视场的不可见部分也匹配 Mask。
+        return std::min(projected_count,
+                        std::max<size_t>(5, static_cast<size_t>(
+                            std::lround(projected_count * ratio))));
+    }
+
+    static size_t poseArcSupportCount(const PoseEllipseObservation &observation)
+    {
+        // 椭圆拟合仍可保留最多180个内点用于统计；数值雅可比每个参数都会重复
+        // 计算残差，位姿层均匀抽取48点已经足够描述弧形，可显著降低实时开销。
+        constexpr size_t kMaximumPoseArcPoints = 48;
+        return std::min(kMaximumPoseArcPoints,
+                        observation.visible_arc_points.size());
+    }
+
+    static const cv::Point2f &poseArcSupportPoint(
+        const PoseEllipseObservation &observation,
+        size_t support_index,
+        size_t support_count)
+    {
+        const size_t source_index = std::min(
+            observation.visible_arc_points.size() - 1,
+            support_index * observation.visible_arc_points.size() /
+                std::max<size_t>(1, support_count));
+        return observation.visible_arc_points[source_index];
+    }
+
     void computeResidualDual(const std::vector<double> &x,
                              const std::optional<PoseEllipseObservation> &outer,
                              const std::optional<PoseEllipseObservation> &middle,
@@ -337,7 +476,8 @@ private:
                 if (!observation || !observation->valid) return size_t{0};
                 if (observation->partial_visibility &&
                     observation->visible_arc_points.size() >= 5)
-                    return observation->visible_arc_points.size();
+                    return poseArcSupportCount(*observation) +
+                           reverseArcResidualCount(*observation, complete_ring_count);
                 return complete_ring_count;
             };
             expected += residual_count(outer, pts3d_cls0_.size());
@@ -348,7 +488,8 @@ private:
         const cv::Vec3d rvec = eulerYXZ_to_rvec(yaw, pitch, 0.0);
         const cv::Vec3d tvec(tx, ty, tz);
         auto append_ring = [&](const std::optional<PoseEllipseObservation> &observation,
-                               const std::vector<cv::Point3f> &circle)
+                               const std::vector<cv::Point3f> &circle,
+                               double radius)
         {
             if (!observation || !observation->valid) return;
             std::vector<cv::Point2f> projected;
@@ -362,23 +503,56 @@ private:
             if (observation->partial_visibility &&
                 observation->visible_arc_points.size() >= 5)
             {
-                try
+                cv::Matx33d predicted_conic;
+                bool conic_valid = projectCircleConic(rvec, tvec, radius,
+                                                       predicted_conic);
+                cv::RotatedRect predicted_ellipse;
+                if (!conic_valid)
                 {
-                    const cv::RotatedRect predicted = cv::fitEllipseDirect(projected);
-                    for (const cv::Point2f &point : observation->visible_arc_points)
+                    try
                     {
-                        const double standardized =
-                            ellipse_sampson_residual(predicted, point) / sigma;
-                        residual.push_back(signed_pseudo_huber(standardized, 2.5));
+                        predicted_ellipse = cv::fitEllipseDirect(projected);
                     }
+                    catch (const cv::Exception &) {}
                 }
-                catch (const cv::Exception &)
+                const size_t support_count = poseArcSupportCount(*observation);
+                for (size_t support_index = 0;
+                     support_index < support_count; ++support_index)
                 {
-                    // 极端退化姿态下 fitEllipseDirect 可能失败。保持残差维度不变并
-                    // 返回大代价，让 LM 自动拒绝该次试探步。
-                    residual.insert(residual.end(),
-                                    observation->visible_arc_points.size(), 1e4);
+                    const cv::Point2f &point = poseArcSupportPoint(
+                        *observation, support_index, support_count);
+                    const double distance = conic_valid
+                        ? conic_sampson_residual(predicted_conic, point)
+                        : (predicted_ellipse.size.width > 0.0f
+                               ? ellipse_sampson_residual(predicted_ellipse, point)
+                               : 1e4);
+                    residual.push_back(signed_pseudo_huber(distance / sigma, 2.5));
                 }
+
+                // 反向裁剪 Chamfer：对每个预测圆周采样点寻找最近的真实可见弧点，
+                // 仅保留与 visible_arc_ratio 对应的最小距离。它不会约束不可见圆周，
+                // 却能防止一个过大/偏心的预测椭圆仅在局部“擦过”观测短弧。
+                std::vector<double> nearest_distances;
+                nearest_distances.reserve(projected.size());
+                for (const cv::Point2f &model_point : projected)
+                {
+                    double nearest = std::numeric_limits<double>::infinity();
+                    for (size_t support_index = 0;
+                         support_index < support_count; ++support_index)
+                    {
+                        const cv::Point2f &observed_point = poseArcSupportPoint(
+                            *observation, support_index, support_count);
+                        nearest = std::min(nearest,
+                            static_cast<double>(cv::norm(model_point - observed_point)));
+                    }
+                    nearest_distances.push_back(nearest);
+                }
+                std::sort(nearest_distances.begin(), nearest_distances.end());
+                const size_t reverse_count =
+                    reverseArcResidualCount(*observation, projected.size());
+                for (size_t index = 0; index < reverse_count; ++index)
+                    residual.push_back(signed_pseudo_huber(
+                        nearest_distances[index] / (1.5 * sigma), 2.5));
                 return;
             }
 
@@ -389,8 +563,8 @@ private:
                 residual.push_back(signed_pseudo_huber(standardized, 2.5));
             }
         };
-        append_ring(outer, pts3d_cls0_);
-        append_ring(middle, pts3d_cls1_);
+        append_ring(outer, pts3d_cls0_, model_.radius_cls0_mm);
+        append_ring(middle, pts3d_cls1_, model_.radius_cls1_mm);
         std::vector<cv::Point3f> hole3d = {{0.0f, 0.0f, static_cast<float>(-model_.length_L_mm)}};
         std::vector<cv::Point2f> projected_hole;
         cv::projectPoints(hole3d, rvec, tvec, K_, D_, projected_hole);

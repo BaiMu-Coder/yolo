@@ -97,7 +97,9 @@ class Config:
     length_base_mm: float = 920.0
     pose_fixed_distance_mm: float = 3000.0
     pose_display_fixed: bool = False
+    compute_both_pose_modes: bool = False  # 实时默认只解算当前显示模式；离线对比可开启
     pose_max_iters: int = 30
+    pose_max_arc_points: int = 48       # 位姿数值雅可比用的均匀弧点上限
     signed_robust_residual: bool = False  # False 精确复现 C++；True 可试验改进
 
     # 抗抖：原始值和平滑值都会保存，画面默认显示平滑值
@@ -294,6 +296,18 @@ def signed_sampson_errors(ellipse: Ellipse, points: np.ndarray) -> np.ndarray:
     fx, fy = 2.0 * x / (a * a), 2.0 * y / (b * b)
     gradient = np.hypot(c * fx - s * fy, s * fx + c * fy)
     return (x * x / (a * a) + y * y / (b * b) - 1.0) / np.maximum(gradient, 1e-9)
+
+
+def conic_sampson_errors(conic: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """点到一般二次曲线的带符号 Sampson 像素距离。"""
+    points = points.astype(np.float64)
+    x, y = points[:, 0], points[:, 1]
+    value = (conic[0, 0] * x * x + 2.0 * conic[0, 1] * x * y +
+             2.0 * conic[0, 2] * x + conic[1, 1] * y * y +
+             2.0 * conic[1, 2] * y + conic[2, 2])
+    gx = 2.0 * (conic[0, 0] * x + conic[0, 1] * y + conic[0, 2])
+    gy = 2.0 * (conic[0, 1] * x + conic[1, 1] * y + conic[1, 2])
+    return value / np.maximum(np.hypot(gx, gy), 1e-12)
 
 
 def ellipse_from_parameters(parameters: np.ndarray) -> Ellipse:
@@ -709,6 +723,24 @@ class PoseEstimatorLM:
         rvec, _ = cv2.Rodrigues(rx @ ry)  # roll=0: Rz * Rx * Ry
         return rvec
 
+    def _project_circle_conic(self, rvec: np.ndarray, tvec: np.ndarray,
+                              radius: float) -> Optional[np.ndarray]:
+        """无畸变针孔模型下解析投影平面圆，避免再次拟合离散投影点。"""
+        if radius <= 1e-6 or np.linalg.norm(self.d) > 1e-12:
+            return None
+        rotation, _ = cv2.Rodrigues(rvec)
+        homography = self.k @ np.column_stack(
+            (rotation[:, 0], rotation[:, 1], tvec.reshape(3)))
+        determinant = float(np.linalg.det(homography))
+        if not math.isfinite(determinant) or abs(determinant) < 1e-12:
+            return None
+        inverse = np.linalg.inv(homography)
+        circle = np.diag((1.0 / (radius * radius),
+                          1.0 / (radius * radius), -1.0))
+        conic = inverse.T @ circle @ inverse
+        norm = float(np.linalg.norm(conic))
+        return conic / norm if math.isfinite(norm) and norm > 1e-15 else None
+
     def _robust(self, values: np.ndarray, delta: float) -> np.ndarray:
         x = values / delta
         out = np.sqrt(2.0 * delta * delta * (np.sqrt(1.0 + x * x) - 1.0))
@@ -807,37 +839,51 @@ class PoseEstimatorLM:
         else:
             yaw, pitch, tx, ty = x
             tz = fixed_tz
-        observations = ((outer, self.points_outer), (middle, self.points_middle))
+        observations = ((outer, self.points_outer, self.radius_outer),
+                        (middle, self.points_middle, self.radius_middle))
+        def pose_support(observation: EllipseResult) -> np.ndarray:
+            points = observation.visible_arc_points
+            maximum = max(5, self.cfg.pose_max_arc_points)
+            if len(points) <= maximum:
+                return points
+            indices = np.floor(np.arange(maximum) * len(points) / maximum).astype(int)
+            return points[indices]
         def observation_count(observation: Optional[EllipseResult],
                               complete_count: int) -> int:
             if observation is None or not observation.valid:
                 return 0
             if observation.partial_visibility and len(observation.visible_arc_points) >= 5:
-                return len(observation.visible_arc_points)
+                reverse_count = min(complete_count, max(
+                    5, int(round(complete_count * max(
+                        0.10, min(1.0, observation.visible_arc_ratio))))))
+                return len(pose_support(observation)) + reverse_count
             return complete_count
         expected = sum(observation_count(observation, len(points))
-                       for observation, points in observations) + 2
+                       for observation, points, _ in observations) + 2
         if tz < 100.0:
             return np.full(expected, 10000.0, dtype=np.float64)
         rvec = self._rvec(float(yaw), float(pitch))
         tvec = np.asarray([tx, ty, tz], dtype=np.float64)
         residuals: List[np.ndarray] = []
-        for observation, points in observations:
+        for observation, points, radius in observations:
             if observation is None or not observation.valid:
                 continue
             projected, _ = cv2.projectPoints(points, rvec, tvec, self.k, self.d)
             if observation.partial_visibility and len(observation.visible_arc_points) >= 5:
-                # 与 C++ 相同：当前位姿投影完整 3D 圆得到预测椭圆，再让真实可见
-                # 弧点贴近它。无需建立圆周点对应，也不会盲信短弧外推的完整椭圆。
-                try:
-                    predicted = cv2.fitEllipseDirect(projected.astype(np.float32))
-                    standardized = signed_sampson_errors(
-                        predicted, observation.visible_arc_points
-                    ) / ellipse_observation_sigma(observation)
-                except cv2.error:
-                    residuals.append(np.full(len(observation.visible_arc_points),
-                                             10000.0, dtype=np.float64))
-                    continue
+                support = pose_support(observation)
+                sigma = ellipse_observation_sigma(observation)
+                predicted_conic = self._project_circle_conic(rvec, tvec, radius)
+                if predicted_conic is not None:
+                    standardized = conic_sampson_errors(
+                        predicted_conic, support) / sigma
+                else:
+                    try:
+                        predicted = cv2.fitEllipseDirect(projected.astype(np.float32))
+                        standardized = signed_sampson_errors(
+                            predicted, support) / sigma
+                    except cv2.error:
+                        standardized = np.full(len(support),
+                                               10000.0, dtype=np.float64)
             else:
                 standardized = signed_sampson_errors(
                     observation.ellipse,
@@ -846,6 +892,22 @@ class PoseEstimatorLM:
             xh = standardized / 2.5
             robust = np.sqrt(2.0 * 2.5 * 2.5 * (np.sqrt(1.0 + xh * xh) - 1.0))
             residuals.append(np.copysign(robust, standardized))
+            if observation.partial_visibility and len(observation.visible_arc_points) >= 5:
+                # 反向裁剪 Chamfer：只选择与可见比例相当的预测弧段。
+                model_points = projected.reshape(-1, 2).astype(np.float64)
+                observed = support.astype(np.float64)
+                nearest = np.sqrt(np.min(np.sum(
+                    (model_points[:, None, :] - observed[None, :, :]) ** 2,
+                    axis=2), axis=1))
+                reverse_count = min(len(nearest), max(
+                    5, int(round(len(nearest) * max(
+                        0.10, min(1.0, observation.visible_arc_ratio))))))
+                reverse_standardized = np.sort(nearest)[:reverse_count] / (1.5 * sigma)
+                reverse_xh = reverse_standardized / 2.5
+                reverse_robust = np.sqrt(
+                    2.0 * 2.5 * 2.5 *
+                    (np.sqrt(1.0 + reverse_xh * reverse_xh) - 1.0))
+                residuals.append(reverse_robust)
         hole_3d = np.asarray([[0.0, 0.0, -self.length]], dtype=np.float32)
         projected_hole, _ = cv2.projectPoints(hole_3d, rvec, tvec, self.k, self.d)
         center_error = (projected_hole.reshape(2) - np.asarray(hole)) / max(0.5, hole_sigma)
@@ -894,7 +956,9 @@ class PoseEstimatorLM:
 
     def solve_dual(self, outer: Optional[EllipseResult], middle: Optional[EllipseResult],
                    hole: Tuple[float, float], hole_sigma: float,
-                   fixed_distance: Optional[float] = None) -> Pose6D:
+                   fixed_distance: Optional[float] = None,
+                   max_iters: Optional[int] = None,
+                   enable_multistart: bool = True) -> Pose6D:
         available = [(outer, False), (middle, True)]
         available = [(item, is_middle) for item, is_middle in available if item is not None]
         if not available:
@@ -905,8 +969,16 @@ class PoseEstimatorLM:
                              0 if initializer.partial_visibility else 8)
         values = initial.array()
         x = values[[0, 1, 3, 4]] if fixed_distance is not None else values[[0, 1, 3, 4, 5]]
-        if any(item is not None and item.partial_visibility for item in (outer, middle)):
-            # 部分弧的吸引域较窄，使用与 C++ 相同的五个轻量姿态假设粗搜索。
+        partial_items = [item for item in (outer, middle)
+                         if item is not None and item.partial_visibility]
+        has_partial = bool(partial_items)
+        has_complete = any(item is not None and not item.partial_visibility
+                           for item in (outer, middle))
+        shortest_visible = min((item.visible_arc_ratio for item in partial_items),
+                               default=1.0)
+        if (enable_multistart and has_partial and not has_complete and
+                shortest_visible < 0.55):
+            # 仅对缺少完整圆且短于约半圈的困难帧做多初值，粗搜索每组只跑3轮。
             best_seed, best_cost = x, math.inf
             for yaw_offset, pitch_offset in ((0.0, 0.0), (-12.0, 0.0),
                                              (12.0, 0.0), (0.0, -12.0),
@@ -915,19 +987,39 @@ class PoseEstimatorLM:
                 seed[0] += yaw_offset
                 seed[1] += pitch_offset
                 seed = self._optimize_dual(seed, outer, middle, hole, hole_sigma,
-                                           fixed_distance, 8)
+                                           fixed_distance, 3)
                 residual = self._dual_residual(seed, outer, middle, hole,
                                                hole_sigma, fixed_distance)
                 cost = float(residual @ residual)
                 if math.isfinite(cost) and cost < best_cost:
                     best_seed, best_cost = seed, cost
             x = best_seed
-        result = self._optimize_dual(x, outer, middle, hole, hole_sigma, fixed_distance)
+        requested_iters = self.cfg.pose_max_iters if max_iters is None else max_iters
+        effective_iters = (min(requested_iters, 20 if has_complete else 18)
+                           if has_partial else requested_iters)
+        result = self._optimize_dual(x, outer, middle, hole, hole_sigma,
+                                     fixed_distance, effective_iters)
         tz = fixed_distance if fixed_distance is not None else float(result[4])
         if not np.all(np.isfinite(result)) or tz < 100.0:
             return initial
         return Pose6D(float(result[0]), float(result[1]), 0.0,
                       float(result[2]), float(result[3]), float(tz))
+
+    def evaluate_dual_reprojection_score(
+            self, outer: Optional[EllipseResult], middle: Optional[EllipseResult],
+            hole: Tuple[float, float], hole_sigma: float) -> float:
+        """共享三维位姿下的标准化稳健残差分数，用于多双环候选复核。"""
+        pose = self.solve_dual(outer, middle, hole, hole_sigma, max_iters=6,
+                               enable_multistart=False)
+        if not np.all(np.isfinite(pose.array())) or pose.tz_mm < 100.0:
+            return 0.0
+        x = np.asarray([pose.yaw_deg, pose.pitch_deg, pose.tx_mm,
+                        pose.ty_mm, pose.tz_mm], dtype=np.float64)
+        residual = self._dual_residual(x, outer, middle, hole, hole_sigma, None)
+        if not len(residual) or not np.all(np.isfinite(residual)):
+            return 0.0
+        rms = math.sqrt(float(residual @ residual) / len(residual))
+        return math.exp(-0.5 * rms * rms)
 
     def draw_axis(self, image: np.ndarray, pose: Pose6D, use_middle: bool) -> None:
         length = self.radius_middle if use_middle else self.radius_outer
@@ -1000,7 +1092,10 @@ def ellipse_selection_score(ellipse: EllipseResult, detection_score: float) -> f
 
 
 def select_ring_pair(detections: Sequence[Detection], ellipses: List[EllipseResult],
-                     outer_class_id: int, middle_class_id: int) -> Tuple[int, int]:
+                     outer_class_id: int, middle_class_id: int,
+                     estimator: Optional[PoseEstimatorLM] = None,
+                     hole: Optional[Tuple[float, float]] = None,
+                     hole_sigma: float = 10.0) -> Tuple[int, int]:
     outers = [i for i, det in enumerate(detections)
               if det.class_id == outer_class_id and ellipses[i].valid]
     middles = [i for i, det in enumerate(detections)
@@ -1014,9 +1109,16 @@ def select_ring_pair(detections: Sequence[Detection], ellipses: List[EllipseResu
             outer, middle = copy.deepcopy(ellipses[outer_idx]), copy.deepcopy(ellipses[middle_idx])
             consistent, consistency_score = refine_ring_pair(outer, middle)
             geometry_term = 0.45 * consistency_score if consistent else -0.35
+            pose_term = 0.0
+            pair_count = len(outers) * len(middles)
+            if (estimator is not None and hole is not None and
+                    1 < pair_count <= 4):
+                pose_term = 0.65 * estimator.evaluate_dual_reprojection_score(
+                    outer, middle, hole, hole_sigma) * math.sqrt(
+                        max(0.0, outer.quality * middle.quality))
             score = (ellipse_selection_score(outer, detections[outer_idx].score) +
                      ellipse_selection_score(middle, detections[middle_idx].score) +
-                     geometry_term)
+                     geometry_term + pose_term)
             if score > best_score:
                 best_score, best_pair = score, (outer_idx, middle_idx)
     refine_ring_pair(ellipses[best_pair[0]], ellipses[best_pair[1]])
@@ -1142,9 +1244,12 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
         if cfg.save_masks and det.mask is not None and frame_id % max(1, cfg.mask_every) == 0:
             cv2.imwrite(str(masks_dir / f"frame_{frame_id:08d}_det_{i:03d}_cls_{det.class_id}.png"), det.mask)
 
-    idx0, idx1 = select_ring_pair(detections, ellipses,
-                                  cfg.outer_class_id, cfg.middle_class_id)
     idx2 = pick_best(detections, cfg.hole_class_id, ellipses)
+    pair_hole = ellipses[idx2].ellipse[0] if idx2 >= 0 else None
+    pair_hole_sigma = ellipse_observation_sigma(ellipses[idx2]) if idx2 >= 0 else 10.0
+    idx0, idx1 = select_ring_pair(
+        detections, ellipses, cfg.outer_class_id, cfg.middle_class_id,
+        estimator, pair_hole, pair_hole_sigma)
     # C++ 图片批处理每张图都会 Reset；只有视频/摄像头才跨帧使用椭圆 EMA。
     if cfg.source_mode.lower() != "images":
         if idx0 >= 0:
@@ -1173,11 +1278,13 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
         outer_observation = ellipses[idx0] if idx0 >= 0 else None
         middle_observation = ellipses[idx1] if idx1 >= 0 else None
         hole_sigma = ellipse_observation_sigma(ellipses[idx2])
-        pose_auto = estimator.solve_dual(outer_observation, middle_observation,
-                                         hole_center, hole_sigma)
-        pose_fixed = estimator.solve_dual(outer_observation, middle_observation,
-                                          hole_center, hole_sigma,
-                                          cfg.pose_fixed_distance_mm)
+        if cfg.compute_both_pose_modes or not cfg.pose_display_fixed:
+            pose_auto = estimator.solve_dual(
+                outer_observation, middle_observation, hole_center, hole_sigma)
+        if cfg.compute_both_pose_modes or cfg.pose_display_fixed:
+            pose_fixed = estimator.solve_dual(
+                outer_observation, middle_observation, hole_center, hole_sigma,
+                cfg.pose_fixed_distance_mm)
         pose_auto = valid_pose(pose_auto)
         pose_fixed = valid_pose(pose_fixed)
         cv2.ellipse(vis, target, (255, 255, 0), 4)
@@ -1317,7 +1424,8 @@ def write_batch_frame_outputs(key: str, frame: np.ndarray,
         handle.write(POSE_FRAME_HEADER)
         automatic, fixed = detail["pose_auto"], detail["pose_fixed"]
         center, hole = detail["selected_reference_center"], detail["selected_hole_center"]
-        valid = automatic is not None and fixed is not None and center is not None and hole is not None
+        selected = fixed if cfg.pose_display_fixed else automatic
+        valid = selected is not None and center is not None and hole is not None
         if not valid:
             handle.write("0 -1 " + " ".join(["nan"] * 16) + " invalid\n")
             return
@@ -1326,9 +1434,11 @@ def write_batch_frame_outputs(key: str, frame: np.ndarray,
             return [pose[name] for name in
                     ("yaw_deg", "pitch_deg", "roll_deg", "tx_mm", "ty_mm", "tz_mm")]
 
+        missing_pose = [math.nan] * 6
         values: List[Any] = [
             1, detail["selected_reference_class"], center[0], center[1], hole[0], hole[1],
-            *pose_values(automatic), *pose_values(fixed),
+            *(pose_values(automatic) if automatic is not None else missing_pose),
+            *(pose_values(fixed) if fixed is not None else missing_pose),
             "fixed" if cfg.pose_display_fixed else "auto",
         ]
         handle.write(" ".join(str(value) if isinstance(value, str)

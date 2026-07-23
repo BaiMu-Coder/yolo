@@ -26,6 +26,10 @@
 
 namespace fs = std::filesystem;
 
+#ifndef BATCH_RING_MASK_ONLY
+#define BATCH_RING_MASK_ONLY 0
+#endif
+
 struct Args {
     std::string model_path;
     fs::path input_path;
@@ -37,6 +41,9 @@ struct Args {
     bool display_fixed_pose = false;
     bool fit_hole_from_mask = false;
     bool force_reference_box = false;
+    // 独立的 batch_mask_ring_visualization 入口会把该默认值编译为 true。
+    // 处理和保存格式保持一致，只改变最终画面叠加内容。
+    bool ring_mask_only = BATCH_RING_MASK_ONLY != 0;
     double fixed_distance_mm = 3000.0;
     float ellipse_deviation_ratio = 0.30f;
     int start_frame = 0;
@@ -61,6 +68,10 @@ static void print_help(const char* app) {
         << "  --hole-box                 Use box center/inscribed circle for cls2 (default)\n"
         << "  --hole-mask                Try Mask ellipse fitting for cls2\n"
         << "  --force-reference-box      Force cls0/cls1 to use box inscribed circles\n"
+        << "  Visualization: "
+        << (BATCH_RING_MASK_ONLY
+                ? "Mask + cls0/cls1 fitted ellipses only\n"
+                : "Full detection + ellipse + pose\n")
         << "  --start-frame N --end-frame N --frame-step N\n";
 }
 
@@ -231,7 +242,6 @@ public:
                 overlay.setTo(colors[class_id], active);
                 cv::addWeighted(overlay, 0.5, visualization, 0.5, 0.0, visualization);
             }
-            cv::rectangle(visualization, {detection.x, detection.y, detection.w, detection.h}, {0, 0, 255}, 2);
             const cv::Scalar fit_color = !ellipse.valid
                                              ? cv::Scalar(0, 0, 255)
                                          : ellipse.partial_visibility
@@ -241,19 +251,40 @@ public:
                                              : (ellipse.source == EllipseSource::Edge
                                                     ? cv::Scalar(255, 0, 255)
                                                     : cv::Scalar(0, 255, 255));
-            cv::ellipse(visualization, ellipse.ellipse, fit_color, 2);
-            cv::circle(visualization, ellipse.ellipse.center, 2, {0, 0, 255}, -1);
-            if (ellipse.partial_visibility) {
-                for (size_t p = 0; p < ellipse.visible_arc_points.size(); p += 4)
-                    cv::circle(visualization, ellipse.visible_arc_points[p], 1,
-                               {0, 165, 255}, -1);
+            if (args_.ring_mask_only) {
+                // 纯展示入口只画外圈(cls0)和中圈(cls1)的最终拟合椭圆：
+                // 外圈青色、中圈紫色。检测框、中心点、弧点、文字和内孔均不叠加。
+                if (is_reference && ellipse.valid) {
+                    const cv::Scalar ring_color = class_id == 0
+                                                      ? cv::Scalar(255, 255, 0)
+                                                      : cv::Scalar(255, 0, 255);
+                    cv::ellipse(visualization, ellipse.ellipse, ring_color, 3);
+                }
+            } else {
+                cv::rectangle(visualization,
+                              {detection.x, detection.y, detection.w, detection.h},
+                              {0, 0, 255}, 2);
+                cv::ellipse(visualization, ellipse.ellipse, fit_color, 2);
+                cv::circle(visualization, ellipse.ellipse.center, 2,
+                           {0, 0, 255}, -1);
+                if (ellipse.partial_visibility) {
+                    for (size_t p = 0;
+                         p < ellipse.visible_arc_points.size(); p += 4)
+                        cv::circle(visualization,
+                                   ellipse.visible_arc_points[p], 1,
+                                   {0, 165, 255}, -1);
+                }
+                const std::string label =
+                    "cls=" + std::to_string(class_id) + " conf=" +
+                    cv::format("%.2f q=%.2f %s%s", detection.prop,
+                               ellipse.quality,
+                               EllipseSourceName(ellipse.source),
+                               ellipse.partial_visibility ? " PARTIAL" : "");
+                cv::putText(visualization, label,
+                            {detection.x, std::max(18, detection.y - 5)},
+                            cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                            {255, 255, 255}, 2);
             }
-            const std::string label = "cls=" + std::to_string(class_id) + " conf=" +
-                                      cv::format("%.2f q=%.2f %s%s", detection.prop,
-                                                 ellipse.quality, EllipseSourceName(ellipse.source),
-                                                 ellipse.partial_visibility ? " PARTIAL" : "");
-            cv::putText(visualization, label, {detection.x, std::max(18, detection.y - 5)},
-                        cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 2);
         }
         std::vector<int> class_ids(result.count);
         std::vector<float> detection_confidences(result.count);
@@ -261,11 +292,40 @@ public:
             class_ids[i] = result.results_box[i].cls_id;
             detection_confidences[i] = result.results_box[i].prop;
         }
+        const int hole = best_index(result, ellipse_results, 2);
+        int outer_count = 0, middle_count = 0;
+        for (int i = 0; i < result.count; ++i) {
+            if (!ellipse_results[i].valid) continue;
+            outer_count += class_ids[i] == 0;
+            middle_count += class_ids[i] == 1;
+        }
+        std::function<float(int, int)> pose_pair_score;
+        if (hole >= 0 && outer_count * middle_count > 1 &&
+            outer_count * middle_count <= 4) {
+            pose_pair_score = [&](int outer_index, int middle_index) {
+                const auto& outer_fit = ellipse_results[outer_index];
+                const auto& middle_fit = ellipse_results[middle_index];
+                const PoseEllipseObservation outer_obs{
+                    outer_fit.ellipse, EllipseObservationSigmaPx(outer_fit), true,
+                    outer_fit.visible_arc_points, outer_fit.partial_visibility,
+                    outer_fit.visible_arc_ratio};
+                const PoseEllipseObservation middle_obs{
+                    middle_fit.ellipse, EllipseObservationSigmaPx(middle_fit), true,
+                    middle_fit.visible_arc_points, middle_fit.partial_visibility,
+                    middle_fit.visible_arc_ratio};
+                const float reprojection = static_cast<float>(
+                    pose_estimator_.EvaluateDualReprojectionScore(
+                    outer_obs, middle_obs, ellipse_results[hole].ellipse.center,
+                    EllipseObservationSigmaPx(ellipse_results[hole])));
+                return reprojection * std::sqrt(
+                    std::max(0.0f, outer_fit.quality * middle_fit.quality));
+            };
+        }
         const RingPairSelection pair = ring_refiner_.SelectAndRefine(
-            class_ids, detection_confidences, ellipse_results);
+            class_ids, detection_confidences, ellipse_results, 0, 1,
+            pose_pair_score);
         const int outer = pair.outer_index;
         const int middle = pair.middle_index;
-        const int hole = best_index(result, ellipse_results, 2);
         if (args_.mode == "video") {
             if (outer >= 0) ellipse_results[outer] = temporal_filter_.Update(0, ellipse_results[outer]);
             if (middle >= 0) ellipse_results[middle] = temporal_filter_.Update(1, ellipse_results[middle]);
@@ -295,7 +355,7 @@ public:
                          << ellipse.conic(1, 2) << ' ' << ellipse.conic(2, 2) << '\n';
         }
         save_and_draw_pose(result, ellipse_results, outer, middle, hole,
-                           visualization, pose_file);
+                           visualization, pose_file, !args_.ring_mask_only);
         return true;
     }
 
@@ -313,7 +373,8 @@ private:
     void save_and_draw_pose(const object_detect_result_list& result,
                             const std::vector<EllipseFitResult>& ellipses,
                             int outer, int middle, int hole,
-                            cv::Mat& visualization, std::ofstream& pose_file) {
+                            cv::Mat& visualization, std::ofstream& pose_file,
+                            bool draw_pose_visualization) {
         pose_file << "# valid reference_class ref_center_x_px ref_center_y_px hole_center_x_px hole_center_y_px "
                      "auto_yaw_deg auto_pitch_deg auto_roll_deg auto_tx_mm auto_ty_mm auto_tz_mm "
                      "fixed_yaw_deg fixed_pitch_deg fixed_roll_deg fixed_tx_mm fixed_ty_mm fixed_tz_mm "
@@ -324,8 +385,10 @@ private:
             pose_file << "0 -1 " << nan << ' ' << nan << ' ' << nan << ' ' << nan;
             for (int i = 0; i < 12; ++i) pose_file << ' ' << nan;
             pose_file << " invalid\n";
-            draw_text(visualization, "Pose: --", 190, {255, 255, 0}, 1.2);
-            draw_text(visualization, "Dist: --", 240, {255, 255, 0}, 1.2);
+            if (draw_pose_visualization) {
+                draw_text(visualization, "Pose: --", 190, {255, 255, 0}, 1.2);
+                draw_text(visualization, "Dist: --", 240, {255, 255, 0}, 1.2);
+            }
             return;
         }
         int reference = -1;
@@ -344,11 +407,13 @@ private:
         if (outer >= 0)
             outer_observation = PoseEllipseObservation{ellipses[outer].ellipse,
                 EllipseObservationSigmaPx(ellipses[outer]), true,
-                ellipses[outer].visible_arc_points, ellipses[outer].partial_visibility};
+                ellipses[outer].visible_arc_points, ellipses[outer].partial_visibility,
+                ellipses[outer].visible_arc_ratio};
         if (middle >= 0)
             middle_observation = PoseEllipseObservation{ellipses[middle].ellipse,
                 EllipseObservationSigmaPx(ellipses[middle]), true,
-                ellipses[middle].visible_arc_points, ellipses[middle].partial_visibility};
+                ellipses[middle].visible_arc_points, ellipses[middle].partial_visibility,
+                ellipses[middle].visible_arc_ratio};
         const double hole_sigma = EllipseObservationSigmaPx(ellipses[hole]);
         const Pose6D pose_auto = pose_estimator_.SolveDual(
             outer_observation, middle_observation, hole_center, hole_sigma, std::nullopt);
@@ -364,6 +429,7 @@ private:
         write_pose_values(pose_file, pose_fixed);
         pose_file << ' ' << (args_.display_fixed_pose ? "fixed" : "auto") << '\n';
 
+        if (!draw_pose_visualization) return;
         cv::ellipse(visualization, target, {255, 255, 0}, 4);
         cv::ellipse(visualization, ellipses[hole].ellipse, {255, 255, 0}, 4);
         cv::circle(visualization, hole_center, 6, {255, 255, 0}, -1);

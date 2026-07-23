@@ -870,7 +870,8 @@ RingPairSelection RingPairRefiner::SelectAndRefine(
     const std::vector<float> &detection_confidences,
     std::vector<EllipseFitResult> &ellipses,
     int outer_class_id,
-    int middle_class_id) const
+    int middle_class_id,
+    const std::function<float(int, int)> &pair_pose_score) const
 {
     // 可能存在同类别多个检测框。先记录每个类别各自最佳项，再遍历所有外圈×中圈
     // 组合，用“两个单体分数 + 双环一致性分数”选择物理上最合理的一对。
@@ -911,9 +912,16 @@ RingPairSelection RingPairRefiner::SelectAndRefine(
             const RingConsistencyResult consistency = Refine(outer_copy, middle_copy);
             const float geometry_term = consistency.consistent
                                             ? 0.45f * consistency.score : -0.35f;
+            // 可选的三维复核由上层注入，因为只有上层持有相机内参、孔中心和物理
+            // 尺寸。返回值约定为[0,1]；多检测候选时优先选择共享位姿重投影更好的组合。
+            const float pose_term = pair_pose_score
+                                        ? 0.65f * clamp01(pair_pose_score(
+                                              static_cast<int>(outer),
+                                              static_cast<int>(middle)))
+                                        : 0.0f;
             const float score = EllipseSelectionScore(outer_copy, detection_confidences[outer]) +
                                 EllipseSelectionScore(middle_copy, detection_confidences[middle]) +
-                                geometry_term;
+                                geometry_term + pose_term;
             if (score > best_pair_score)
             {
                 best_pair_score = score;

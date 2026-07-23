@@ -473,11 +473,43 @@ private:
             class_ids[i] = result.results_box[i].cls_id;
             detection_confidences[i] = result.results_box[i].prop;
         }
+        int idx2 = pick_best_idx_by_class(result, ellipse_results, CLS2_ID);
+        int outer_count = 0, middle_count = 0;
+        for (int i = 0; i < result.count; ++i)
+        {
+            if (!ellipse_results[i].valid) continue;
+            outer_count += class_ids[i] == CLS0_ID;
+            middle_count += class_ids[i] == CLS1_ID;
+        }
+        std::function<float(int, int)> pose_pair_score;
+        if (idx2 >= 0 && outer_count * middle_count > 1 &&
+            outer_count * middle_count <= 4)
+        {
+            pose_pair_score = [&](int outer_index, int middle_index)
+            {
+                const EllipseFitResult &outer_fit = ellipse_results[outer_index];
+                const EllipseFitResult &middle_fit = ellipse_results[middle_index];
+                const PoseEllipseObservation outer_obs{
+                    outer_fit.ellipse, EllipseObservationSigmaPx(outer_fit), true,
+                    outer_fit.visible_arc_points, outer_fit.partial_visibility,
+                    outer_fit.visible_arc_ratio};
+                const PoseEllipseObservation middle_obs{
+                    middle_fit.ellipse, EllipseObservationSigmaPx(middle_fit), true,
+                    middle_fit.visible_arc_points, middle_fit.partial_visibility,
+                    middle_fit.visible_arc_ratio};
+                const float reprojection = static_cast<float>(
+                    _pose_estimator.EvaluateDualReprojectionScore(
+                    outer_obs, middle_obs, ellipse_results[idx2].ellipse.center,
+                    EllipseObservationSigmaPx(ellipse_results[idx2])));
+                return reprojection * std::sqrt(
+                    std::max(0.0f, outer_fit.quality * middle_fit.quality));
+            };
+        }
         const RingPairSelection ring_pair = _ring_pair_refiner.SelectAndRefine(
-            class_ids, detection_confidences, ellipse_results, CLS0_ID, CLS1_ID);
+            class_ids, detection_confidences, ellipse_results, CLS0_ID, CLS1_ID,
+            pose_pair_score);
         int idx0 = ring_pair.outer_index;
         int idx1 = ring_pair.middle_index;
-        int idx2 = pick_best_idx_by_class(result, ellipse_results, CLS2_ID);
 
         // Python 同逻辑：必须有孔 + (外圈或中圈)  才能进行姿态解算
         if (idx2 < 0 || (idx0 < 0 && idx1 < 0))
@@ -571,20 +603,25 @@ private:
             outer_observation = PoseEllipseObservation{cand0.ellipse,
                                                        EllipseObservationSigmaPx(cand0), true,
                                                        cand0.visible_arc_points,
-                                                       cand0.partial_visibility};
+                                                       cand0.partial_visibility,
+                                                       cand0.visible_arc_ratio};
         if (has1)
             middle_observation = PoseEllipseObservation{cand1.ellipse,
                                                         EllipseObservationSigmaPx(cand1), true,
                                                         cand1.visible_arc_points,
-                                                        cand1.partial_visibility};
+                                                        cand1.partial_visibility,
+                                                        cand1.visible_arc_ratio};
         const double hole_sigma = EllipseObservationSigmaPx(hole_ellipse);
 
-        // 双圆共享同一3D位姿，以各自协方差加权重投影残差。
-        Pose6D pose_auto = _pose_estimator.SolveDual(
-            outer_observation, middle_observation, hole_center, hole_sigma, std::nullopt);
-        Pose6D pose_fix = _pose_estimator.SolveDual(
-            outer_observation, middle_observation, hole_center, hole_sigma, _fixed_distance_mm);
-        Pose6D pose_final = _display_fixed_mode ? pose_fix : pose_auto;
+        // 在线画面每帧只消费一种位姿模式。以前无条件同时求 auto/fixed，相当于
+        // 完整执行两次 LM；改为只计算当前显示模式，直接节省约一半位姿耗时。
+        const Pose6D pose_final = _display_fixed_mode
+            ? _pose_estimator.SolveDual(
+                  outer_observation, middle_observation, hole_center,
+                  hole_sigma, _fixed_distance_mm)
+            : _pose_estimator.SolveDual(
+                  outer_observation, middle_observation, hole_center,
+                  hole_sigma, std::nullopt);
 
         // 画轴
         _pose_estimator.DrawAxis(frame, pose_final, use_cls1);
@@ -602,16 +639,16 @@ private:
 
             if (_display_fixed_mode)
             {
-                std::snprintf(buf, sizeof(buf), "Yaw:%.1f Pit:%.1f", pose_fix.yaw_deg, pose_fix.pitch_deg);
+                std::snprintf(buf, sizeof(buf), "Yaw:%.1f Pit:%.1f", pose_final.yaw_deg, pose_final.pitch_deg);
                 draw_txt(frame, buf, 190, C_YEL, 1.3);
-                std::snprintf(buf, sizeof(buf), "Dist: %.2fm (Fixed)", pose_fix.tz_mm / 1000.0);
+                std::snprintf(buf, sizeof(buf), "Dist: %.2fm (Fixed)", pose_final.tz_mm / 1000.0);
                 draw_txt(frame, buf, 240, C_YEL, 1.3);
             }
             else
             {
-                std::snprintf(buf, sizeof(buf), "Yaw:%.1f Pit:%.1f", pose_auto.yaw_deg, pose_auto.pitch_deg);
+                std::snprintf(buf, sizeof(buf), "Yaw:%.1f Pit:%.1f", pose_final.yaw_deg, pose_final.pitch_deg);
                 draw_txt(frame, buf, 190, C_GRN, 1.3);
-                std::snprintf(buf, sizeof(buf), "Dist: %.2fm (Auto)", pose_auto.tz_mm / 1000.0);
+                std::snprintf(buf, sizeof(buf), "Dist: %.2fm (Auto)", pose_final.tz_mm / 1000.0);
                 draw_txt(frame, buf, 240, C_GRN, 1.3);
             }
         }

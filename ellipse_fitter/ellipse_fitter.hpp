@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <vector>
 
@@ -235,7 +236,9 @@ public:
                                       const std::vector<float> &detection_confidences,
                                       std::vector<EllipseFitResult> &ellipses,
                                       int outer_class_id = 0,
-                                      int middle_class_id = 1) const;
+                                      int middle_class_id = 1,
+                                      const std::function<float(int, int)> &
+                                          pair_pose_score = {}) const;
 
 private:
     RingConsistencyConfig config_;

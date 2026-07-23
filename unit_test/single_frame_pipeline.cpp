@@ -175,11 +175,40 @@ public:
             class_ids[i] = frame.detections.results_box[i].cls_id;
             detection_confidences[i] = frame.detections.results_box[i].prop;
         }
+        const int hole = best_detection(frame.detections, frame.ellipses, 2);
+        int outer_count = 0, middle_count = 0;
+        for (int i = 0; i < frame.detections.count; ++i) {
+            if (!frame.ellipses[i].valid) continue;
+            outer_count += class_ids[i] == 0;
+            middle_count += class_ids[i] == 1;
+        }
+        std::function<float(int, int)> pose_pair_score;
+        if (hole >= 0 && outer_count * middle_count > 1 &&
+            outer_count * middle_count <= 4) {
+            pose_pair_score = [&](int outer_index, int middle_index) {
+                const auto& outer_fit = frame.ellipses[outer_index];
+                const auto& middle_fit = frame.ellipses[middle_index];
+                const PoseEllipseObservation outer_obs{
+                    outer_fit.ellipse, EllipseObservationSigmaPx(outer_fit), true,
+                    outer_fit.visible_arc_points, outer_fit.partial_visibility,
+                    outer_fit.visible_arc_ratio};
+                const PoseEllipseObservation middle_obs{
+                    middle_fit.ellipse, EllipseObservationSigmaPx(middle_fit), true,
+                    middle_fit.visible_arc_points, middle_fit.partial_visibility,
+                    middle_fit.visible_arc_ratio};
+                const float reprojection = static_cast<float>(
+                    estimator_.EvaluateDualReprojectionScore(
+                    outer_obs, middle_obs, frame.ellipses[hole].ellipse.center,
+                    EllipseObservationSigmaPx(frame.ellipses[hole])));
+                return reprojection * std::sqrt(
+                    std::max(0.0f, outer_fit.quality * middle_fit.quality));
+            };
+        }
         const RingPairSelection pair = ring_refiner_.SelectAndRefine(
-            class_ids, detection_confidences, frame.ellipses);
+            class_ids, detection_confidences, frame.ellipses, 0, 1,
+            pose_pair_score);
         const int outer = pair.outer_index;
         const int middle = pair.middle_index;
-        const int hole = best_detection(frame.detections, frame.ellipses, 2);
         frame.pose = {};
         if (hole < 0 || (outer < 0 && middle < 0) ||
             frame.ellipses.size() < static_cast<size_t>(frame.detections.count)) return;
@@ -206,12 +235,14 @@ public:
             outer_observation = PoseEllipseObservation{frame.ellipses[outer].ellipse,
                 EllipseObservationSigmaPx(frame.ellipses[outer]), true,
                 frame.ellipses[outer].visible_arc_points,
-                frame.ellipses[outer].partial_visibility};
+                frame.ellipses[outer].partial_visibility,
+                frame.ellipses[outer].visible_arc_ratio};
         if (middle >= 0)
             middle_observation = PoseEllipseObservation{frame.ellipses[middle].ellipse,
                 EllipseObservationSigmaPx(frame.ellipses[middle]), true,
                 frame.ellipses[middle].visible_arc_points,
-                frame.ellipses[middle].partial_visibility};
+                frame.ellipses[middle].partial_visibility,
+                frame.ellipses[middle].visible_arc_ratio};
         const double hole_sigma = EllipseObservationSigmaPx(frame.ellipses[hole]);
         frame.pose.automatic = estimator_.SolveDual(
             outer_observation, middle_observation, frame.pose.hole_center,

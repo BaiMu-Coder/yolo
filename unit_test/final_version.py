@@ -2,8 +2,10 @@
 """final_version.cpp 的效果优先 Python/PT 版本。
 
 依赖：ultralytics、torch、opencv-python、numpy。
-运行：../.venv-yolo/bin/python final_version.py
-常用覆盖：--model xxx.pt --video xxx.mp4 --no-show
+服务器运行示例：
+python final_version.py --model best.pt --input-path /data/images --mode images \
+  --output-path /data/result --device 0 --no-show
+输出目录和可视化效果对齐 batch_image_video.cpp。
 """
 from __future__ import annotations
 
@@ -61,7 +63,10 @@ class Config:
     force_reference_box: bool = False
     ellipse_deviation_ratio: float = 0.30
     ellipse_ransac_iters: int = 160
+    ellipse_local_optimization_iters: int = 2
+    ellipse_refinement_iters: int = 15
     ellipse_inlier_px: float = 3.0
+    ellipse_robust_delta_px: float = 2.5
     ellipse_min_inlier_ratio: float = 0.42
     ellipse_max_axis_ratio: float = 6.0
     ellipse_max_points: int = 180
@@ -88,7 +93,8 @@ class Config:
     signed_robust_residual: bool = False  # False 精确复现 C++；True 可试验改进
 
     # 抗抖：原始值和平滑值都会保存，画面默认显示平滑值
-    enable_pose_smoothing: bool = True
+    # batch_image_video.cpp 不做位姿 EMA；默认关闭以保证服务器可视化一致。
+    enable_pose_smoothing: bool = False
     pose_ema_alpha: float = 0.35
     keep_pose_frames_when_missing: int = 5
     draw_held_pose: bool = True
@@ -100,16 +106,16 @@ class Config:
     window_width: int = 1280
     window_height: int = 720
     save_video: bool = True
-    save_visual_frames: bool = True
+    save_visual_frames: bool = False      # 对应 C++ --save-video-frames
     visual_frame_every: int = 1
-    save_masks: bool = True
+    save_masks: bool = False              # C++ batch 默认不单独保存 Mask
     mask_every: int = 1
     mask_alpha: float = 0.50
     draw_boxes: bool = True
     draw_masks: bool = True
     draw_all_ellipses: bool = True
     draw_pose_axis: bool = True
-    draw_fps: bool = True
+    draw_fps: bool = False                # batch_image_video.cpp 默认不叠加 FPS
 
 
 CFG = Config()
@@ -123,12 +129,8 @@ def configured_input_path(cfg: Config) -> Path:
 
 
 def configured_output_dir(cfg: Config) -> Path:
-    """默认把同一输入的所有结果归档到以输入名称命名的文件夹。"""
-    if cfg.source_mode.lower() == "camera":
-        stem = f"camera_{cfg.camera_id}"
-    else:
-        stem = configured_input_path(cfg).stem
-    return Path(cfg.output_path).expanduser() / stem
+    """与 batch_image_video.cpp 一致：--output-path 本身就是本次输出根目录。"""
+    return Path(cfg.output_path).expanduser()
 
 
 def configured_output_video_name(cfg: Config) -> str:
@@ -171,6 +173,10 @@ class EllipseResult:
     angle_std_deg: float = math.inf
     covariance_condition: float = math.inf
     uncertainty_valid: bool = False
+    covariance: np.ndarray = field(default_factory=lambda: np.zeros((5, 5), dtype=np.float64),
+                                   repr=False)
+    conic: np.ndarray = field(default_factory=lambda: np.zeros((3, 3), dtype=np.float64),
+                              repr=False)
 
     @property
     def from_mask(self) -> bool:
@@ -275,6 +281,108 @@ def signed_sampson_errors(ellipse: Ellipse, points: np.ndarray) -> np.ndarray:
     return (x * x / (a * a) + y * y / (b * b) - 1.0) / np.maximum(gradient, 1e-9)
 
 
+def ellipse_from_parameters(parameters: np.ndarray) -> Ellipse:
+    """C++ LM 的五参数表示：[cx, cy, log(a), log(b), angle_rad]。"""
+    return ((float(parameters[0]), float(parameters[1])),
+            (float(2.0 * math.exp(parameters[2])),
+             float(2.0 * math.exp(parameters[3]))),
+            float(math.degrees(parameters[4])))
+
+
+def ellipse_conic_matrix(ellipse: Ellipse) -> np.ndarray:
+    """生成与 C++ EllipseConicMatrix 相同的 Frobenius 归一化二次曲线矩阵。"""
+    (cx, cy), (width, height), angle = ellipse
+    a, b = max(1e-6, width * 0.5), max(1e-6, height * 0.5)
+    rad = math.radians(angle)
+    c, s = math.cos(rad), math.sin(rad)
+    rotation = np.asarray([[c, -s], [s, c]], dtype=np.float64)
+    quadratic = rotation @ np.diag((1.0 / (a * a), 1.0 / (b * b))) @ rotation.T
+    center = np.asarray([cx, cy], dtype=np.float64)
+    linear = -(quadratic @ center)
+    conic = np.asarray([[quadratic[0, 0], quadratic[0, 1], linear[0]],
+                        [quadratic[1, 0], quadratic[1, 1], linear[1]],
+                        [linear[0], linear[1], center @ quadratic @ center - 1.0]],
+                       dtype=np.float64)
+    return conic / max(1e-15, float(np.linalg.norm(conic)))
+
+
+def refine_sampson_lm(ellipse: Ellipse, points: np.ndarray, point_weights: np.ndarray,
+                      cfg: Config) -> Optional[Tuple[Ellipse, np.ndarray, float]]:
+    """复现 C++ RefineSampson：Huber IRLS + 数值雅可比 + LM + 协方差。"""
+    (cx, cy), (width, height), angle = ellipse
+    parameters = np.asarray([cx, cy, math.log(max(1.0, width * 0.5)),
+                             math.log(max(1.0, height * 0.5)),
+                             math.radians(angle)], dtype=np.float64)
+    damping = 1e-3
+    final_normal: Optional[np.ndarray] = None
+    final_sse = 0.0
+    final_count = 0
+    epsilons = np.asarray((0.02, 0.02, 1e-4, 1e-4, 1e-5), dtype=np.float64)
+
+    for _ in range(cfg.ellipse_refinement_iters):
+        current = ellipse_from_parameters(parameters)
+        residual = signed_sampson_errors(current, points)
+        finite = np.isfinite(residual)
+        if int(np.count_nonzero(finite)) < 6:
+            return None
+        used_points = points[finite]
+        used_residual = residual[finite]
+        base_weights = np.maximum(0.01, point_weights[finite])
+        absolute = np.abs(used_residual)
+        robust_weights = np.where(absolute <= cfg.ellipse_robust_delta_px, 1.0,
+                                  cfg.ellipse_robust_delta_px / np.maximum(absolute, 1e-12))
+        weights = base_weights * robust_weights
+        jacobian = np.empty((len(used_points), 5), dtype=np.float64)
+        for column, epsilon in enumerate(epsilons):
+            perturbed = parameters.copy()
+            perturbed[column] += epsilon
+            jacobian[:, column] = (
+                signed_sampson_errors(ellipse_from_parameters(perturbed), used_points) -
+                used_residual) / epsilon
+        normal = jacobian.T @ (weights[:, None] * jacobian)
+        gradient = jacobian.T @ (weights * used_residual)
+        cost = float(np.sum(base_weights * np.where(
+            absolute <= cfg.ellipse_robust_delta_px,
+            0.5 * used_residual * used_residual,
+            cfg.ellipse_robust_delta_px *
+            (absolute - 0.5 * cfg.ellipse_robust_delta_px))))
+        final_normal = normal.copy()
+        final_sse = float(np.sum(weights * used_residual * used_residual))
+        final_count = len(used_points)
+        damped = normal + damping * np.diag(np.maximum(1.0, np.diag(normal)))
+        try:
+            delta = np.linalg.lstsq(damped, -gradient, rcond=None)[0]
+        except np.linalg.LinAlgError:
+            return None
+        trial = parameters + delta
+        if math.exp(trial[2]) < 1.0 or math.exp(trial[3]) < 1.0:
+            damping *= 5.0
+            continue
+        trial_residual = signed_sampson_errors(ellipse_from_parameters(trial), points)
+        trial_absolute = np.abs(trial_residual)
+        trial_cost = float(np.sum(point_weights * np.where(
+            trial_absolute <= cfg.ellipse_robust_delta_px,
+            0.5 * trial_residual * trial_residual,
+            cfg.ellipse_robust_delta_px *
+            (trial_absolute - 0.5 * cfg.ellipse_robust_delta_px))))
+        if np.isfinite(trial_cost) and trial_cost < cost:
+            parameters = trial
+            damping = max(1e-9, damping * 0.4)
+            if float(delta @ delta) < 1e-10:
+                break
+        else:
+            damping = min(1e9, damping * 5.0)
+
+    if final_normal is None:
+        return None
+    singular = np.linalg.svd(final_normal, compute_uv=False)
+    condition = float(singular[0] / max(1e-15, singular[-1]))
+    covariance = np.linalg.pinv(final_normal) * (final_sse / max(1, final_count - 5))
+    if not np.all(np.isfinite(covariance)) or not math.isfinite(condition):
+        return None
+    return ellipse_from_parameters(parameters), covariance, condition
+
+
 def update_ellipse_statistics(candidate: EllipseResult, points: np.ndarray,
                               det: Detection, cfg: Config) -> None:
     errors = np.abs(signed_sampson_errors(candidate.ellipse, points))
@@ -291,21 +399,7 @@ def update_ellipse_statistics(candidate: EllipseResult, points: np.ndarray,
     candidate.angular_coverage_deg = 5.0 * len(np.unique(np.minimum(71, (theta * 72 / (2 * math.pi)).astype(int))))
     candidate.occupied_quadrants = len(np.unique(np.minimum(3, (theta * 4 / (2 * math.pi)).astype(int))))
 
-    parameters = np.asarray([cx, cy, math.log(max(width * 0.5, 1.0)),
-                             math.log(max(height * 0.5, 1.0)), rad], dtype=np.float64)
-    def ellipse_from(p: np.ndarray) -> Ellipse:
-        return ((float(p[0]), float(p[1])),
-                (float(2 * math.exp(p[2])), float(2 * math.exp(p[3]))),
-                float(math.degrees(p[4])))
-    residual = signed_sampson_errors(candidate.ellipse, inliers)
-    jacobian = np.empty((len(inliers), 5), dtype=np.float64)
-    for column, epsilon in enumerate((0.02, 0.02, 1e-4, 1e-4, 1e-5)):
-        perturbed = parameters.copy()
-        perturbed[column] += epsilon
-        jacobian[:, column] = (signed_sampson_errors(ellipse_from(perturbed), inliers) - residual) / epsilon
-    normal = jacobian.T @ jacobian
-    candidate.covariance_condition = float(np.linalg.cond(normal))
-    covariance = np.linalg.pinv(normal) * float(np.sum(residual * residual) / max(1, len(inliers) - 5))
+    covariance = candidate.covariance
     candidate.center_std_px = float(math.sqrt(max(0.0, covariance[0, 0], covariance[1, 1])))
     width_std = width * math.sqrt(max(0.0, covariance[2, 2]))
     height_std = height * math.sqrt(max(0.0, covariance[3, 3]))
@@ -319,16 +413,20 @@ def update_ellipse_statistics(candidate: EllipseResult, points: np.ndarray,
         candidate.major_axis_std_px <= 0.18 * short_side)
 
 
-def ransac_ellipse(points: np.ndarray, cfg: Config) -> Optional[EllipseResult]:
+def ransac_ellipse(points: np.ndarray, point_weights: np.ndarray,
+                   cfg: Config) -> Optional[EllipseResult]:
     if len(points) < 20:
         return None
+    order = np.argsort(-point_weights, kind="stable")
+    points, point_weights = points[order], point_weights[order]
     rng = np.random.default_rng(12345)
     best: Optional[EllipseResult] = None
-    best_inlier_mask: Optional[np.ndarray] = None
+    best_weighted_inliers = -1.0
     for iteration in range(cfg.ellipse_ransac_iters):
         # points 按 mask 梯度质量排序；逐步扩展采样池形成 PROSAC 式初值。
-        pool_size = min(len(points), max(5, 5 + iteration * max(1, len(points) - 5) //
-                                         max(1, cfg.ellipse_ransac_iters - 1)))
+        pool_size = min(len(points), max(
+            20, 20 + iteration * max(0, len(points) - 20) //
+            max(1, cfg.ellipse_ransac_iters - 1)))
         sample = points[rng.choice(pool_size, 5, replace=False)].reshape(-1, 1, 2).astype(np.float32)
         try:
             ellipse = cv2.fitEllipseDirect(sample)
@@ -337,26 +435,51 @@ def ransac_ellipse(points: np.ndarray, cfg: Config) -> Optional[EllipseResult]:
         a, b = ellipse[1][0] * 0.5, ellipse[1][1] * 0.5
         if min(a, b) < 2.0 or max(a, b) / max(min(a, b), 1e-3) > cfg.ellipse_max_axis_ratio:
             continue
-        errors = radial_errors(ellipse, points)
+        errors = np.abs(signed_sampson_errors(ellipse, points))
         inlier_mask = errors <= cfg.ellipse_inlier_px
         count = int(np.count_nonzero(inlier_mask))
+        weighted_inliers = float(np.sum(point_weights[inlier_mask]))
         mean = float(np.mean(errors[inlier_mask])) if count else math.inf
-        if best is None or count > best.inliers or (count == best.inliers and mean < (best.mean_error_px or math.inf)):
+        if (best is None or weighted_inliers > best_weighted_inliers or
+                (weighted_inliers == best_weighted_inliers and
+                 mean < (best.mean_error_px or math.inf))):
+            best_weighted_inliers = weighted_inliers
             best = EllipseResult(ellipse=ellipse, source="mask", inliers=count,
                                  mean_error_px=mean, sampled_points=len(points),
                                  inlier_ratio=count / len(points))
-            best_inlier_mask = inlier_mask
     required = max(20, int(math.ceil(cfg.ellipse_min_inlier_ratio * len(points))))
-    if best is None or best.inliers < required or best_inlier_mask is None:
+    if best is None or best.inliers < required:
         return None
-    refined_points = points[best_inlier_mask]
-    try:
-        refined = cv2.fitEllipseAMS(refined_points.reshape(-1, 1, 2).astype(np.float32))
-    except cv2.error:
+    # 与 C++ 一致的两轮 LO-RANSAC：当前内点全部重新做 Direct 拟合。
+    refined = best.ellipse
+    for _ in range(cfg.ellipse_local_optimization_iters):
+        mask = np.abs(signed_sampson_errors(refined, points)) <= cfg.ellipse_inlier_px
+        if int(np.count_nonzero(mask)) < 5:
+            return None
+        try:
+            refined = cv2.fitEllipseDirect(
+                points[mask].reshape(-1, 1, 2).astype(np.float32))
+        except cv2.error:
+            return None
+    errors = np.abs(signed_sampson_errors(refined, points))
+    inlier_mask = errors <= cfg.ellipse_inlier_px
+    count = int(np.count_nonzero(inlier_mask))
+    if count < required:
         return None
-    return EllipseResult(ellipse=refined, source="mask", inliers=len(refined_points),
-                         mean_error_px=float(np.mean(radial_errors(refined, refined_points))),
-                         sampled_points=len(points), inlier_ratio=len(refined_points) / len(points))
+    lm = refine_sampson_lm(refined, points[inlier_mask],
+                           point_weights[inlier_mask], cfg)
+    if lm is None:
+        return None
+    refined, covariance, condition = lm
+    final_errors = np.abs(signed_sampson_errors(refined, points))
+    final_mask = final_errors <= cfg.ellipse_inlier_px
+    final_count = int(np.count_nonzero(final_mask))
+    result = EllipseResult(
+        ellipse=refined, source="mask", inliers=final_count,
+        mean_error_px=float(np.mean(final_errors[final_mask])) if final_count else math.inf,
+        sampled_points=len(points), inlier_ratio=final_count / len(points),
+        covariance=covariance, covariance_condition=condition)
+    return result
 
 
 def _score_candidate(candidate: EllipseResult, det: Detection, cfg: Config) -> Optional[EllipseResult]:
@@ -372,9 +495,9 @@ def _score_candidate(candidate: EllipseResult, det: Detection, cfg: Config) -> O
     error = candidate.mean_error_px if candidate.mean_error_px is not None else math.inf
     error_quality = math.exp(-error / max(0.5, cfg.ellipse_inlier_px))
     center_quality = max(0.0, 1.0 - candidate.center_deviation_ratio / cfg.ellipse_deviation_ratio)
-    shape_quality = max(0.0, min(1.0, 1.0 - (major / max(minor, 1e-3) - 1.0) /
-                                 max(1.0, cfg.ellipse_max_axis_ratio - 1.0)))
-    bonus = 0.05 if candidate.source == "mask" else 0.0
+    if major > 1.45 * max(det.w, det.h):
+        return None
+    bonus = 0.04 if candidate.source == "mask" else 0.0
     coverage_quality = min(1.0, candidate.angular_coverage_deg / 300.0)
     uncertainty_quality = max(0.0, 1.0 - candidate.center_std_px / max(1.0, 0.10 * short_side))
     candidate.quality = min(1.0, 0.32 * candidate.inlier_ratio + 0.22 * error_quality +
@@ -383,17 +506,22 @@ def _score_candidate(candidate: EllipseResult, det: Detection, cfg: Config) -> O
     return candidate
 
 
-def _fit_points(points: np.ndarray, det: Detection, cfg: Config, source: str) -> Optional[EllipseResult]:
+def _fit_points(points: np.ndarray, point_weights: np.ndarray, det: Detection,
+                cfg: Config, source: str) -> Optional[EllipseResult]:
     if len(points) < 20:
         return None
     step = max(1, len(points) // cfg.ellipse_max_points)
-    fitted = ransac_ellipse(points[::step][:cfg.ellipse_max_points], cfg)
+    sampled_points = points[::step][:cfg.ellipse_max_points]
+    sampled_weights = point_weights[::step][:cfg.ellipse_max_points]
+    fitted = ransac_ellipse(sampled_points, sampled_weights, cfg)
     if fitted is None:
         return None
     (cx, cy), size, angle = fitted.ellipse
     fitted.ellipse = ((cx + det.x, cy + det.y), size, angle)
     fitted.source = source
-    global_points = points.astype(np.float64) + np.asarray([det.x, det.y], dtype=np.float64)
+    fitted.conic = ellipse_conic_matrix(fitted.ellipse)
+    global_points = sampled_points.astype(np.float64) + np.asarray(
+        [det.x, det.y], dtype=np.float64)
     update_ellipse_statistics(fitted, global_points, det, cfg)
     return _score_candidate(fitted, det, cfg)
 
@@ -403,9 +531,11 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
     box_center = (det.x + det.w * 0.5, det.y + det.h * 0.5)
     side = float(min(det.w, det.h))
     fallback = EllipseResult((box_center, (side, side), 0.0), source="box", quality=0.30,
-                             center_std_px=max(8.0, 0.12 * side),
-                             major_axis_std_px=max(10.0, 0.15 * side),
-                             minor_axis_std_px=max(10.0, 0.15 * side))
+                             center_std_px=max(2.0, 0.12 * side),
+                             major_axis_std_px=0.20 * side,
+                             minor_axis_std_px=0.20 * side,
+                             angle_std_deg=90.0)
+    fallback.conic = ellipse_conic_matrix(fallback.ellipse)
     if force_box:
         return fallback
     candidates: List[EllipseResult] = []
@@ -427,6 +557,7 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
                 selected.append(contour.reshape(-1, 2))
         if selected:
             points = np.concatenate(selected).astype(np.float32)
+            point_weights = np.ones(len(points), dtype=np.float64)
             # 在软 mask 的 p=0.5 等值线上做一步法向亚像素修正。
             # 梯度越清晰的点越靠前，供 PROSAC 优先采样。
             if det.mask_probability is not None:
@@ -442,9 +573,9 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
                 shift = np.clip((0.5 - probability[yi, xi]) / safe, -0.75, 0.75)
                 points[:, 0] += shift * grad_x / safe
                 points[:, 1] += shift * grad_y / safe
-                points = points[np.argsort(-magnitude)]
+                point_weights = np.clip(magnitude * 4.0, 0.15, 1.0).astype(np.float64)
             if len(points) >= 20:
-                fitted = _fit_points(points, det, cfg, "mask")
+                fitted = _fit_points(points, point_weights, det, cfg, "mask")
                 if fitted is not None:
                     candidates.append(fitted)
     if allow_edge and cfg.enable_edge_fallback and (not candidates or max(x.quality for x in candidates) < 0.72):
@@ -453,9 +584,19 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
         edges = cv2.Canny(cv2.equalizeHist(roi_gray), 45, 135, L2gradient=True)
         edges[:3, :], edges[-3:, :], edges[:, :3], edges[:, -3:] = 0, 0, 0, 0
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-        edge_points = [c.reshape(-1, 2) for c in contours if len(c) >= 18]
+        edge_points = []
+        distance_limit = 0.80 * min(det.w, det.h)
+        for contour in contours:
+            if len(contour) < 18:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if math.hypot(x + 0.5 * w - 0.5 * det.w,
+                          y + 0.5 * h - 0.5 * det.h) <= distance_limit:
+                edge_points.append(contour.reshape(-1, 2))
         if edge_points:
-            fitted = _fit_points(np.concatenate(edge_points), det, cfg, "edge")
+            points = np.concatenate(edge_points).astype(np.float32)
+            fitted = _fit_points(points, np.ones(len(points), dtype=np.float64),
+                                 det, cfg, "edge")
             if fitted is not None:
                 candidates.append(fitted)
     if not candidates:
@@ -703,12 +844,12 @@ class PoseSmoother:
         return None, False
 
 
-def refine_ring_pair(outer: EllipseResult, middle: EllipseResult) -> bool:
+def refine_ring_pair(outer: EllipseResult, middle: EllipseResult) -> Tuple[bool, float]:
     """双圆环几何一致性门控；不强制图像椭圆同心。"""
     outer_major, outer_minor = max(outer.ellipse[1]), min(outer.ellipse[1])
     middle_major, middle_minor = max(middle.ellipse[1]), min(middle.ellipse[1])
     if min(outer_major, outer_minor, middle_major, middle_minor) <= 0:
-        return False
+        return False, 0.0
     size_error = abs(middle_major / outer_major - 980.0 / 1200.0) / 0.22
     center_error = math.dist(outer.ellipse[0], middle.ellipse[0]) / max(1.0, outer_major * 0.14)
     axis_error = abs(outer_major / outer_minor - middle_major / middle_minor) / 0.28
@@ -716,18 +857,25 @@ def refine_ring_pair(outer: EllipseResult, middle: EllipseResult) -> bool:
     am = (middle.ellipse[2] + (90.0 if middle.ellipse[1][0] < middle.ellipse[1][1] else 0.0)) % 180.0
     angle_error = min(abs(ao - am), 180.0 - abs(ao - am)) / 24.0
     consistent = max(size_error, center_error, axis_error, angle_error) <= 1.0
+    score = max(0.0, 1.0 - (0.34 * size_error + 0.34 * center_error +
+                            0.18 * axis_error + 0.14 * angle_error))
     outer.geometry_consistent = middle.geometry_consistent = consistent
     if not consistent:
         if outer.quality >= middle.quality:
             middle.quality *= 0.35
         else:
             outer.quality *= 0.35
-        return False
-    score = max(0.0, 1.0 - (0.34 * size_error + 0.34 * center_error +
-                            0.18 * axis_error + 0.14 * angle_error))
+        return False, score
     for ellipse in (outer, middle):
         ellipse.quality = min(1.0, ellipse.quality + 0.12 * score)
-    return True
+    return True, score
+
+
+def ellipse_selection_score(ellipse: EllipseResult, detection_score: float) -> float:
+    """对应 C++ EllipseSelectionScore。"""
+    geometry_penalty = 1.0 if ellipse.geometry_consistent else 0.72
+    return (0.55 * max(0.0, min(1.0, detection_score)) +
+            0.45 * max(0.0, min(1.0, ellipse.quality)) * geometry_penalty)
 
 
 def select_ring_pair(detections: Sequence[Detection], ellipses: List[EllipseResult],
@@ -741,10 +889,11 @@ def select_ring_pair(detections: Sequence[Detection], ellipses: List[EllipseResu
     for outer_idx in outers:
         for middle_idx in middles:
             outer, middle = copy.deepcopy(ellipses[outer_idx]), copy.deepcopy(ellipses[middle_idx])
-            consistent = refine_ring_pair(outer, middle)
-            score = (0.55 * detections[outer_idx].score + 0.45 * outer.quality +
-                     0.55 * detections[middle_idx].score + 0.45 * middle.quality +
-                     (0.45 if consistent else -0.35))
+            consistent, consistency_score = refine_ring_pair(outer, middle)
+            geometry_term = 0.45 * consistency_score if consistent else -0.35
+            score = (ellipse_selection_score(outer, detections[outer_idx].score) +
+                     ellipse_selection_score(middle, detections[middle_idx].score) +
+                     geometry_term)
             if score > best_score:
                 best_score, best_pair = score, (outer_idx, middle_idx)
     refine_ring_pair(ellipses[best_pair[0]], ellipses[best_pair[1]])
@@ -778,6 +927,7 @@ class EllipseSmoother:
         current.ellipse = ((float(center[0]), float(center[1])),
                            (float(size[0]), float(size[1])),
                            float((previous.ellipse[2] + alpha * delta) % 180.0))
+        current.conic = ellipse_conic_matrix(current.ellipse)
         current.temporally_filtered = True
         self.values[class_id] = current
         return current
@@ -795,7 +945,7 @@ def pick_best(detections: Sequence[Detection], class_id: int,
     if not indices:
         return -1
     return max(indices, key=lambda i: detections[i].score if ellipses is None else
-               0.55 * detections[i].score + 0.45 * ellipses[i].quality)
+               ellipse_selection_score(ellipses[i], detections[i].score))
 
 
 def pose_dict(pose: Optional[Pose6D]) -> Optional[Dict[str, float]]:
@@ -842,8 +992,9 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
                                   0, 255).astype(np.uint8)
         if cfg.draw_boxes:
             cv2.rectangle(vis, (det.x, det.y), (det.x + det.w, det.y + det.h), (0, 0, 255), 2)
-            name = cfg.class_names[det.class_id] if 0 <= det.class_id < len(cfg.class_names) else str(det.class_id)
-            cv2.putText(vis, f"{name} {det.score:.3f}", (det.x, max(18, det.y - 6)),
+            cv2.putText(vis, f"cls={det.class_id} conf={det.score:.2f} "
+                        f"q={ellipse.quality:.2f} {ellipse.source}",
+                        (det.x, max(18, det.y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
         if cfg.draw_all_ellipses:
             color = (0, 255, 0) if ellipse.source == "mask" else ((255, 0, 255) if ellipse.source == "edge" else (0, 255, 255))
@@ -855,25 +1006,31 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
     idx0, idx1 = select_ring_pair(detections, ellipses,
                                   cfg.outer_class_id, cfg.middle_class_id)
     idx2 = pick_best(detections, cfg.hole_class_id, ellipses)
-    if idx0 >= 0:
-        ellipses[idx0] = ellipse_smoother.update(cfg.outer_class_id, ellipses[idx0])
-    if idx1 >= 0:
-        ellipses[idx1] = ellipse_smoother.update(cfg.middle_class_id, ellipses[idx1])
-    if idx2 >= 0:
-        ellipses[idx2] = ellipse_smoother.update(cfg.hole_class_id, ellipses[idx2])
+    # C++ 图片批处理每张图都会 Reset；只有视频/摄像头才跨帧使用椭圆 EMA。
+    if cfg.source_mode.lower() != "images":
+        if idx0 >= 0:
+            ellipses[idx0] = ellipse_smoother.update(cfg.outer_class_id, ellipses[idx0])
+        if idx1 >= 0:
+            ellipses[idx1] = ellipse_smoother.update(cfg.middle_class_id, ellipses[idx1])
+        if idx2 >= 0:
+            ellipses[idx2] = ellipse_smoother.update(cfg.hole_class_id, ellipses[idx2])
     target_idx = -1
     use_middle = False
     pose_auto = pose_fixed = None
+    selected_reference_center: Optional[List[float]] = None
+    selected_hole_center: Optional[List[float]] = None
     if idx2 >= 0 and (idx0 >= 0 or idx1 >= 0):
         if idx0 >= 0 and idx1 >= 0:
-            score0 = 0.65 * ellipses[idx0].quality + 0.35 * detections[idx0].score
-            score1 = 0.65 * ellipses[idx1].quality + 0.35 * detections[idx1].score
+            score0 = ellipse_selection_score(ellipses[idx0], detections[idx0].score)
+            score1 = ellipse_selection_score(ellipses[idx1], detections[idx1].score)
             target_idx = idx0 if score0 >= score1 else idx1
         else:
             target_idx = idx0 if idx0 >= 0 else idx1
         use_middle = detections[target_idx].class_id == cfg.middle_class_id
         hole_center = ellipses[idx2].ellipse[0]
         target = ellipses[target_idx].ellipse
+        selected_reference_center = [float(target[0][0]), float(target[0][1])]
+        selected_hole_center = [float(hole_center[0]), float(hole_center[1])]
         outer_observation = ellipses[idx0] if idx0 >= 0 else None
         middle_observation = ellipses[idx1] if idx1 >= 0 else None
         hole_sigma = ellipse_observation_sigma(ellipses[idx2])
@@ -921,7 +1078,8 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
                         "angle_deg": float(ellipse.ellipse[2]), "source": ellipse.source,
                         "from_mask": ellipse.from_mask, "quality": ellipse.quality,
                         "inlier_ratio": ellipse.inlier_ratio, "inliers": ellipse.inliers,
-                        "mean_error_px": ellipse.mean_error_px,
+                        "mean_error_px": (finite_or_none(ellipse.mean_error_px)
+                                          if ellipse.mean_error_px is not None else None),
                         "geometry_consistent": ellipse.geometry_consistent,
                         "temporally_filtered": ellipse.temporally_filtered,
                         "angular_coverage_deg": ellipse.angular_coverage_deg,
@@ -932,15 +1090,99 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
                         "minor_axis_std_px": finite_or_none(ellipse.minor_axis_std_px),
                         "angle_std_deg": finite_or_none(ellipse.angle_std_deg),
                         "covariance_condition": finite_or_none(ellipse.covariance_condition),
-                        "pose_sigma_px": ellipse_observation_sigma(ellipse)},
+                        "pose_sigma_px": ellipse_observation_sigma(ellipse),
+                        "conic": [[float(value) for value in row]
+                                  for row in ellipse.conic]},
         })
     return vis, {
         "frame_id": frame_id, "detections": det_details,
         "selected_reference_class": detections[target_idx].class_id if target_idx >= 0 else None,
+        "selected_reference_center": selected_reference_center,
+        "selected_hole_center": selected_hole_center,
         "pose_auto": pose_dict(pose_auto), "pose_fixed": pose_dict(pose_fixed),
         "pose_selected_raw": pose_dict(raw), "pose_smoothed": pose_dict(smooth),
         "pose_is_stale": stale,
     }
+
+
+ELLIPSE_TXT_HEADER = (
+    "# class_id center_x_px center_y_px major_axis_px minor_axis_px angle_deg "
+    "confidence fit_source quality inlier_ratio inliers mean_error_px coverage_deg "
+    "quadrants center_std_px major_std_px minor_std_px angle_std_deg cov_condition "
+    "geometry_ok temporal conic00 conic01 conic02 conic11 conic12 conic22\n"
+)
+POSE_FRAME_HEADER = (
+    "# valid reference_class ref_center_x_px ref_center_y_px hole_center_x_px "
+    "hole_center_y_px auto_yaw_deg auto_pitch_deg auto_roll_deg auto_tx_mm auto_ty_mm "
+    "auto_tz_mm fixed_yaw_deg fixed_pitch_deg fixed_roll_deg fixed_tx_mm fixed_ty_mm "
+    "fixed_tz_mm display_mode\n"
+)
+
+
+def write_batch_frame_outputs(key: str, frame: np.ndarray,
+                              detections: Sequence[Detection],
+                              detail: Dict[str, Any], cfg: Config,
+                              labels_dir: Path, ellipses_dir: Path,
+                              poses_dir: Path) -> None:
+    """生成与 batch_image_video.cpp 字段和目录一致的三类逐帧 TXT。"""
+    height, width = frame.shape[:2]
+    with (labels_dir / f"{key}.txt").open("w", encoding="utf-8") as handle:
+        for det in detections:
+            handle.write(
+                f"{det.class_id} {(det.x + det.w * 0.5) / width:.8f} "
+                f"{(det.y + det.h * 0.5) / height:.8f} {det.w / width:.8f} "
+                f"{det.h / height:.8f} {det.score:.8f}\n")
+
+    def number(value: Any) -> float:
+        return float(value) if value is not None else math.inf
+
+    with (ellipses_dir / f"{key}.txt").open("w", encoding="utf-8") as handle:
+        handle.write(ELLIPSE_TXT_HEADER)
+        for det, item in zip(detections, detail["detections"]):
+            ellipse = item["ellipse"]
+            size = ellipse["size"]
+            conic = ellipse["conic"]
+            geometry_fields = [
+                ellipse["center"][0], ellipse["center"][1], max(size), min(size),
+                ellipse["angle_deg"], det.score,
+            ]
+            tail_fields = [
+                number(ellipse["mean_error_px"]),
+                ellipse["angular_coverage_deg"], ellipse["occupied_quadrants"],
+                number(ellipse["center_std_px"]), number(ellipse["major_axis_std_px"]),
+                number(ellipse["minor_axis_std_px"]), number(ellipse["angle_std_deg"]),
+                number(ellipse["covariance_condition"]),
+                int(ellipse["geometry_consistent"]), int(ellipse["temporally_filtered"]),
+                conic[0][0], conic[0][1], conic[0][2],
+                conic[1][1], conic[1][2], conic[2][2],
+            ]
+            handle.write(
+                f"{det.class_id} " +
+                " ".join(f"{float(value):.6f}" for value in geometry_fields) +
+                f" {ellipse['source']} {float(ellipse['quality']):.6f} "
+                f"{float(ellipse['inlier_ratio']):.6f} {int(ellipse['inliers'])} " +
+                " ".join(f"{float(value):.6f}" for value in tail_fields) + "\n")
+
+    with (poses_dir / f"{key}.txt").open("w", encoding="utf-8") as handle:
+        handle.write(POSE_FRAME_HEADER)
+        automatic, fixed = detail["pose_auto"], detail["pose_fixed"]
+        center, hole = detail["selected_reference_center"], detail["selected_hole_center"]
+        valid = automatic is not None and fixed is not None and center is not None and hole is not None
+        if not valid:
+            handle.write("0 -1 " + " ".join(["nan"] * 16) + " invalid\n")
+            return
+
+        def pose_values(pose: Dict[str, float]) -> List[float]:
+            return [pose[name] for name in
+                    ("yaw_deg", "pitch_deg", "roll_deg", "tx_mm", "ty_mm", "tz_mm")]
+
+        values: List[Any] = [
+            1, detail["selected_reference_class"], center[0], center[1], hole[0], hole[1],
+            *pose_values(automatic), *pose_values(fixed),
+            "fixed" if cfg.pose_display_fixed else "auto",
+        ]
+        handle.write(" ".join(str(value) if isinstance(value, str)
+                              else f"{float(value):.9f}" for value in values) + "\n")
 
 
 class FrameSource:
@@ -974,7 +1216,8 @@ class FrameSource:
         else:
             raise ValueError("source_mode 只能是 video、camera 或 images")
 
-    def __iter__(self) -> Iterable[Tuple[int, np.ndarray]]:
+    def __iter__(self) -> Iterable[Tuple[int, str, str, np.ndarray]]:
+        """返回 frame_id、与 C++ 相同的输出 key、图片扩展名和图像。"""
         cfg = self.cfg
         if cfg.source_mode.lower() == "images":
             for frame_id, path in enumerate(self.images):
@@ -984,7 +1227,7 @@ class FrameSource:
                     continue
                 image = cv2.imread(str(path))
                 if image is not None:
-                    yield frame_id, image
+                    yield frame_id, path.stem, path.suffix, image
             return
         assert self.capture is not None
         frame_id = cfg.start_frame if cfg.source_mode.lower() == "video" else 0
@@ -997,7 +1240,11 @@ class FrameSource:
             if cfg.end_frame >= 0 and current > cfg.end_frame:
                 break
             if (current - cfg.start_frame) % max(1, cfg.frame_step) == 0:
-                yield current, frame
+                if cfg.source_mode.lower() == "camera":
+                    key = f"camera_{cfg.camera_id}_frame_{current:08d}"
+                else:
+                    key = f"{configured_input_path(cfg).stem}_frame_{current:08d}"
+                yield current, key, ".jpg", frame
 
     def close(self) -> None:
         if self.capture is not None:
@@ -1050,19 +1297,34 @@ def save_pose_plots(history: List[Tuple[int, Pose6D]], out_dir: Path) -> None:
 
 
 def parse_args(cfg: Config) -> Config:
-    parser = argparse.ArgumentParser(description="PT YOLOv8-seg + RANSAC ellipse + LM pose")
+    parser = argparse.ArgumentParser(
+        description="PT 服务器验证版：处理流程和输出效果对齐 batch_image_video.cpp")
     parser.add_argument("--model", help="覆盖配置区 model_path")
     parser.add_argument("--video", help="使用指定视频")
     parser.add_argument("--images", help="使用指定图片目录")
     parser.add_argument("--cam", type=int, help="使用指定摄像头")
+    parser.add_argument("--input-path", help="兼容 C++：图片目录或视频所在目录/完整路径")
+    parser.add_argument("--video-name", help="兼容 C++：与 --input-path 拼接的视频文件名")
+    parser.add_argument("--mode", choices=("auto", "images", "video", "camera"),
+                        help="兼容 C++：auto/images/video；另支持 camera")
     parser.add_argument("--device", help='cpu 或 CUDA 编号，如 "0"')
-    parser.add_argument("--output", help="覆盖输出目录")
+    parser.add_argument("--output", "--output-path", dest="output",
+                        help="输出根目录，直接创建 visual/labels/ellipses/poses")
     parser.add_argument("--no-show", action="store_true")
+    parser.add_argument("--show", action="store_true")
     parser.add_argument("--no-video", action="store_true")
+    parser.add_argument("--save-video-frames", action="store_true")
+    parser.add_argument("--display-fixed", action="store_true")
+    parser.add_argument("--fixed-distance", type=float)
+    parser.add_argument("--start-frame", type=int)
+    parser.add_argument("--end-frame", type=int)
+    parser.add_argument("--frame-step", type=int)
     parser.add_argument("--force-reference-box", action="store_true",
                         help="外/中参考圈强制使用检测框内切圆")
     parser.add_argument("--hole-mask", action="store_true",
                         help="尝试使用 Mask 拟合内孔（默认使用检测框）")
+    parser.add_argument("--hole-box", action="store_true",
+                        help="内孔使用检测框内切圆（默认）")
     args = parser.parse_args()
     if args.model:
         cfg.model_path = args.model
@@ -1074,28 +1336,59 @@ def parse_args(cfg: Config) -> Config:
         cfg.source_mode, cfg.input_path, cfg.video_name = "images", str(path.parent), path.name
     if args.cam is not None:
         cfg.source_mode, cfg.camera_id = "camera", args.cam
+    if args.input_path:
+        cfg.input_path = str(Path(args.input_path).expanduser())
+        cfg.video_name = args.video_name or ""
+    elif args.video_name:
+        cfg.video_name = args.video_name
+    if args.mode:
+        cfg.source_mode = args.mode
+    if cfg.source_mode == "auto":
+        cfg.source_mode = "images" if configured_input_path(cfg).is_dir() else "video"
     if args.device:
         cfg.device = args.device
     if args.output:
         cfg.output_path = args.output
     if args.no_show:
         cfg.show_window = False
+    if args.show:
+        cfg.show_window = True
     if args.no_video:
         cfg.save_video = False
     if args.force_reference_box:
         cfg.force_reference_box = True
     if args.hole_mask:
         cfg.mask_fit_hole = True
+    if args.hole_box:
+        cfg.mask_fit_hole = False
+    if args.save_video_frames:
+        cfg.save_visual_frames = True
+    if args.display_fixed:
+        cfg.pose_display_fixed = True
+    if args.fixed_distance is not None:
+        cfg.pose_fixed_distance_mm = args.fixed_distance
+    if args.start_frame is not None:
+        cfg.start_frame = max(0, args.start_frame)
+    if args.end_frame is not None:
+        cfg.end_frame = args.end_frame
+    if args.frame_step is not None:
+        cfg.frame_step = max(1, args.frame_step)
+    if cfg.device.lower() == "cpu":
+        cfg.half = False
     return cfg
 
 
 def main() -> int:
     cfg = parse_args(CFG)
     out_dir = configured_output_dir(cfg)
-    frames_dir, masks_dir = out_dir / "frames", out_dir / "masks"
+    visual_dir = out_dir / "visual"
+    labels_dir = out_dir / "labels"
+    ellipses_dir = out_dir / "ellipses"
+    poses_dir = out_dir / "poses"
+    masks_dir = out_dir / "masks"
     out_dir.mkdir(parents=True, exist_ok=True)
-    if cfg.save_visual_frames:
-        frames_dir.mkdir(parents=True, exist_ok=True)
+    for directory in (visual_dir, labels_dir, ellipses_dir, poses_dir):
+        directory.mkdir(parents=True, exist_ok=True)
     if cfg.save_masks:
         masks_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "run_config.json").open("w", encoding="utf-8") as handle:
@@ -1123,7 +1416,7 @@ def main() -> int:
         with (out_dir / "pose.txt").open("w", encoding="utf-8", buffering=1) as pose_file, \
              (out_dir / "detections.jsonl").open("w", encoding="utf-8", buffering=1) as json_file:
             pose_file.write("\t".join(POSE_COLUMNS) + "\n")
-            for frame_id, frame in source:
+            for frame_id, output_key, image_extension, frame in source:
                 detections = model.infer(frame)
                 vis, detail = process_visual(frame, detections, cfg, estimator, smoother,
                                              ellipse_smoother, frame_id, masks_dir)
@@ -1137,20 +1430,37 @@ def main() -> int:
                 detail.update(timestamp_s=timestamp, processing_fps=ema_fps)
                 pose_file.write(pose_txt_line(detail, timestamp, cfg))
                 json_file.write(json.dumps(detail, ensure_ascii=False, allow_nan=False) + "\n")
+                write_batch_frame_outputs(output_key, frame, detections, detail, cfg,
+                                          labels_dir, ellipses_dir, poses_dir)
                 if detail["pose_smoothed"] is not None and not detail["pose_is_stale"]:
                     history.append((frame_id, Pose6D(**detail["pose_smoothed"])))
 
-                if cfg.save_video and writer is None:
+                if (cfg.source_mode.lower() in ("video", "camera") and
+                        cfg.save_video and writer is None):
                     writer = cv2.VideoWriter(str(out_dir / configured_output_video_name(cfg)),
                                              cv2.VideoWriter_fourcc(*cfg.output_fourcc), fps_out,
                                              (vis.shape[1], vis.shape[0]))
                     if not writer.isOpened():
-                        raise RuntimeError("输出视频创建失败，可尝试 fourcc='MJPG' 且文件名改为 .avi")
+                        # 与 C++ 一致：服务器缺少 MP4 编码器时自动回退 MJPG/AVI。
+                        writer.release()
+                        fallback_name = f"{configured_input_path(cfg).stem}_result.avi"
+                        writer = cv2.VideoWriter(
+                            str(out_dir / fallback_name),
+                            cv2.VideoWriter_fourcc(*"MJPG"), fps_out,
+                            (vis.shape[1], vis.shape[0]))
+                    if not writer.isOpened():
+                        raise RuntimeError("无法创建 MP4 或 MJPG/AVI 输出视频")
                 if writer is not None:
                     writer.write(vis)
-                if cfg.save_visual_frames and frame_id % max(1, cfg.visual_frame_every) == 0:
-                    cv2.imwrite(str(frames_dir / f"frame_{frame_id:08d}.jpg"), vis,
-                                [cv2.IMWRITE_JPEG_QUALITY, 95])
+                save_visual = (cfg.source_mode.lower() == "images" or
+                               (cfg.save_visual_frames and
+                                frame_id % max(1, cfg.visual_frame_every) == 0))
+                if save_visual:
+                    suffix = image_extension if cfg.source_mode.lower() == "images" else ".jpg"
+                    output_image = visual_dir / f"{output_key}{suffix}"
+                    parameters = ([cv2.IMWRITE_JPEG_QUALITY, 95]
+                                  if suffix.lower() in (".jpg", ".jpeg") else [])
+                    cv2.imwrite(str(output_image), vis, parameters)
                 processed += 1
                 print(f"\rframe={frame_id} det={len(detections)} fps={ema_fps:.1f}", end="", flush=True)
                 if cfg.show_window:

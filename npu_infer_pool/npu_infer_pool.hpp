@@ -388,7 +388,14 @@ private:
             
             
             
-            // 验收保底模式可同时强制 cls0/cls1 使用检测框内切圆。
+            // 类别到拟合策略的映射（在线、批处理、单帧入口保持完全一致）：
+            //   cls0 外圈、cls1 中圈：
+            //     默认 PreferMaskNoEdge，即 Mask 拟合失败直接用框内切圆。
+            //     不使用灰度 Edge，是为了避免验收现场的反光、阴影和背景纹理产生伪边缘。
+            //   cls2 内孔：
+            //     默认 ForceBox；只有显式打开 use_mask_fit_class2 才使用 PreferMask。
+            //   force_box_for_reference_ring：
+            //     验收保底总开关，优先级最高，可同时强制 cls0/cls1 使用内切圆。
             const bool force_box =
                 (class_id == 0 && (force_box_for_reference_ring || !use_mask_fit_class0)) ||
                 (class_id == 1 && (force_box_for_reference_ring || !use_mask_fit_class1)) ||

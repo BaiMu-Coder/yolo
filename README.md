@@ -29,9 +29,32 @@ output_path = "/data/result"
 video_name = "test01.mp4"
 ```
 
-程序读取 `/data/input/test01.mp4`，自动输出到 `/data/result/test01/`，结果视频名为
-`test01_result.mp4`。相机内参、物理尺寸、置信度、平滑与其他保存开关也集中在该配置区。
+程序读取 `/data/input/test01.mp4`，直接输出到 `/data/result/`，结果视频名为
+`test01_result.mp4`。输出根目录下会创建与 C++ 批处理一致的 `visual/`、`labels/`、
+`ellipses/`、`poses/`，另外保留 Python 的逐帧 JSONL、汇总位姿和曲线。
+相机内参、物理尺寸、置信度、平滑与其他保存开关也集中在该配置区。
 默认会创建可缩放的实时前台窗口；按 `q` 或 `ESC` 退出，按 `s` 保存当前画面。服务器无桌面环境时使用 `--no-show`。
+
+服务器上也可以完全沿用 `batch_image_video.cpp` 的参数风格：
+
+```bash
+python unit_test/final_version.py \
+  --model best.pt \
+  --input-path /data/images \
+  --mode images \
+  --output-path /data/result \
+  --device 0 \
+  --no-show
+
+python unit_test/final_version.py \
+  --model best.pt \
+  --input-path /data/videos \
+  --video-name test.mp4 \
+  --mode video \
+  --output-path /data/result \
+  --save-video-frames \
+  --no-show
+```
 
 ## C++ 串行图片/视频处理
 
@@ -103,6 +126,29 @@ cmake --build build --target single_frame_pipeline -j
 ## 圆环拟合现场切换
 
 `npu_infer_pool` 默认对参考外/中圈（cls0/cls1）优先使用 Mask 拟合，内孔（cls2）使用检测框中心和内切圆。验收现场图像质量不足时，可在提交推理任务前开启参考圈保底模式：
+
+### 椭圆模块快速阅读顺序
+
+新人建议按下面的调用链阅读，不需要先通读整个后处理：
+
+```text
+推理入口选择 EllipseFitMode
+    -> EllipseFitter::Fit                 总调度及 Box 回退
+    -> CollectMaskPoints                  Mask 轮廓和 p=0.5 亚像素修正
+    -> BuildCandidate
+       -> FitRansac                       PROSAC 式采样和 LO-RANSAC
+       -> RefineSampson                   Huber-Sampson LM 和协方差
+       -> UpdateGeometryStatistics        覆盖度、标准差及退化门控
+    -> RingPairRefiner                    外圈/中圈物理一致性选择
+    -> EllipseTemporalFilter              视频质量自适应 EMA
+    -> EllipseObservationSigmaPx          转为联合位姿解算的观测权重
+```
+
+主要数据都集中在 `EllipseFitResult`：`ellipse` 是原图坐标下的最终椭圆，
+`source` 表示 Mask/Edge/Box 来源，`quality` 用于候选选择和时序滤波，
+`angular_coverage_deg`、`occupied_quadrants` 用于识别短弧退化，
+`covariance` 和各项 `*_std_*` 表示拟合不确定度。`valid=true` 不代表一定来自
+Mask；Box 兜底同样是可用结果，判断来源应读取 `source`。
 
 默认外圈/中圈只采用两级策略：高质量 Mask 椭圆，或检测框内切圆。参考圈不执行灰度 Edge 拟合。
 Mask 路径先从分割概率的 0.5 等值线获得亚像素轮廓，再用质量排序采样、直接最小二乘初值、

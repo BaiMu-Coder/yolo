@@ -7,6 +7,11 @@
 
 namespace
 {
+// -----------------------------------------------------------------------------
+// RotatedRect 基础工具
+// OpenCV 的 size.width/height 不保证分别是长轴/短轴，angle 也会随二者交换而变化，
+// 所以后续几何比较统一通过这些函数取得“真正的长轴、短轴和长轴方向”。
+// -----------------------------------------------------------------------------
 float clamp01(float value)
 {
     return std::clamp(value, 0.0f, 1.0f);
@@ -45,6 +50,8 @@ float angle_difference(float first, float second)
 
 float blend_angle(float previous, float current, float alpha)
 {
+    // 椭圆方向以180度为周期，而普通角度平均以360度为周期。
+    // 先把角度乘2映射到完整圆上做向量平均，再除2，可避免179度和1度被平均成90度。
     const float p = previous * 2.0f * static_cast<float>(CV_PI) / 180.0f;
     const float c = current * 2.0f * static_cast<float>(CV_PI) / 180.0f;
     const float x = (1.0f - alpha) * std::cos(p) + alpha * std::cos(c);
@@ -67,6 +74,8 @@ const char *EllipseSourceName(EllipseSource source)
 
 float EllipseSelectionScore(const EllipseFitResult &ellipse, float detection_confidence)
 {
+    // 检测置信度回答“目标是不是该类别”，ellipse.quality 回答“边界几何是否可信”。
+    // 两者都保留，避免仅凭高置信检测框选中一个严重退化的 Mask 椭圆。
     const float geometry_penalty = ellipse.geometry_consistent ? 1.0f : 0.72f;
     return 0.55f * clamp01(detection_confidence) +
            0.45f * clamp01(ellipse.quality) * geometry_penalty;
@@ -74,6 +83,8 @@ float EllipseSelectionScore(const EllipseFitResult &ellipse, float detection_con
 
 double EllipseObservationSigmaPx(const EllipseFitResult &ellipse)
 {
+    // Box 没有真实轮廓残差和可靠协方差，因此给它与目标尺寸相关的较大 sigma。
+    // 位姿 LM 中残差会除以 sigma：sigma 越大，该观测对最终位姿影响越小。
     if (ellipse.source == EllipseSource::Box || !ellipse.uncertainty_valid)
         return std::max(8.0, 0.12 * major_axis(ellipse.ellipse));
     const double residual = std::isfinite(ellipse.mean_error_px) ? ellipse.mean_error_px : 3.0;
@@ -86,6 +97,11 @@ double EllipseObservationSigmaPx(const EllipseFitResult &ellipse)
 
 cv::Matx33d EllipseConicMatrix(const cv::RotatedRect &ellipse)
 {
+    // 椭圆局部坐标方程：
+    //     u^2/a^2 + v^2/b^2 - 1 = 0
+    // 通过旋转 R 和平移 center 展开为齐次形式：
+    //     [x y 1] * Q * [x y 1]^T = 0
+    // Q 最后做 Frobenius 范数归一化，消除二次曲线矩阵任意比例带来的数值差异。
     const double a = std::max(1e-6, ellipse.size.width * 0.5);
     const double b = std::max(1e-6, ellipse.size.height * 0.5);
     const double angle = ellipse.angle * CV_PI / 180.0;
@@ -105,6 +121,7 @@ cv::Matx33d EllipseConicMatrix(const cv::RotatedRect &ellipse)
 
 EllipseFitter::EllipseFitter(EllipseFitConfig config) : config_(std::move(config))
 {
+    // 在构造阶段把外部配置裁剪到合法范围，使核心循环不必反复防御无效参数。
     config_.ransac_iterations = std::max(1, config_.ransac_iterations);
     config_.local_optimization_iterations = std::max(0, config_.local_optimization_iterations);
     config_.refinement_iterations = std::max(1, config_.refinement_iterations);
@@ -121,6 +138,9 @@ EllipseFitter::EllipseFitter(EllipseFitConfig config) : config_(std::move(config
 
 EllipseFitResult EllipseFitter::BoxInscribedCircle(const cv::Rect &detection_box)
 {
+    // Box 兜底采用检测框短边作为直径，保证圆一定落在框内。
+    // 它是一个“始终可用但精度较低”的观测：valid=true 便于后续绘制和解算，
+    // uncertainty_valid=false 让位姿层自动使用更大的 sigma 降低其权重。
     EllipseFitResult result;
     const float side = static_cast<float>(std::max(0, std::min(detection_box.width,
                                                                detection_box.height)));
@@ -149,6 +169,10 @@ EllipseFitResult EllipseFitter::BoxInscribedCircle(const cv::Rect &detection_box
 float EllipseFitter::SampsonResidualPx(const cv::RotatedRect &ellipse,
                                        const cv::Point2f &point)
 {
+    // 将点变换到椭圆自身坐标系后，隐式方程为：
+    //     F = x^2/a^2 + y^2/b^2 - 1
+    // Sampson 距离使用 F / ||∇F||，是一阶点到曲线距离近似。
+    // 相比直接比较 F，它已除去局部梯度尺度，结果可近似理解为带符号像素误差。
     const double a = ellipse.size.width * 0.5;
     const double b = ellipse.size.height * 0.5;
     if (a < 1e-3 || b < 1e-3) return std::numeric_limits<float>::infinity();
@@ -167,10 +191,15 @@ float EllipseFitter::SampsonResidualPx(const cv::RotatedRect &ellipse,
 EllipseFitter::RansacResult EllipseFitter::FitRansac(
     const std::vector<WeightedPoint> &input_points) const
 {
+    // =========================================================================
+    // 阶段1：PROSAC 式质量引导采样 + 5点直接椭圆初值
+    // =========================================================================
     RansacResult best;
     const int count = static_cast<int>(input_points.size());
     if (count < 20) return best;
     std::vector<WeightedPoint> points = input_points;
+    // 软 Mask 梯度越清晰，点权重越高。先排序后逐步扩大采样池：
+    // 早期主要从高质量边界采样，后期再覆盖全部点，兼顾速度和全局搜索能力。
     std::stable_sort(points.begin(), points.end(), [](const WeightedPoint &a, const WeightedPoint &b) {
         return a.weight > b.weight;
     });
@@ -179,6 +208,7 @@ EllipseFitter::RansacResult EllipseFitter::FitRansac(
 
     for (int iteration = 0; iteration < config_.ransac_iterations; ++iteration)
     {
+        // pool_size 从20逐渐增长到全部点；这是 PROSAC 思想的轻量实现。
         const int pool_size = std::min(count, std::max(20,
             20 + iteration * std::max(0, count - 20) / std::max(1, config_.ransac_iterations - 1)));
         std::uniform_int_distribution<int> pick(0, pool_size - 1);
@@ -196,6 +226,8 @@ EllipseFitter::RansacResult EllipseFitter::FitRansac(
             ++sample_index;
         }
         cv::RotatedRect candidate;
+        // 一般椭圆有5个自由度，因此5个非退化点即可产生一个最小假设。
+        // fitEllipseDirect 使用带椭圆约束的直接最小二乘，比普通 fitEllipse 初值更稳定。
         try { candidate = cv::fitEllipseDirect(sample); }
         catch (const cv::Exception &) { continue; }
         if (minor_axis(candidate) < 2.0f || axis_ratio(candidate) > config_.maximum_axis_ratio)
@@ -214,6 +246,8 @@ EllipseFitter::RansacResult EllipseFitter::FitRansac(
                 error_sum += error;
             }
         }
+        // 先最大化加权内点数；相同情况下选择平均误差更小的候选。
+        // 这样反光或模糊边缘产生的低权重点不容易主导模型选择。
         const float mean_error = inliers > 0 ? error_sum / inliers
                                              : std::numeric_limits<float>::infinity();
         if (weighted_inliers > best_weighted_inliers ||
@@ -227,7 +261,11 @@ EllipseFitter::RansacResult EllipseFitter::FitRansac(
     const int required = std::max(20, static_cast<int>(std::ceil(config_.minimum_inlier_ratio * count)));
     if (!best.valid || best.inliers < required) return {};
 
-    // LO-RANSAC：用当前内点集稳定直接拟合，再重新计算内点。
+    // =========================================================================
+    // 阶段2：LO-RANSAC
+    // 用当前最佳模型的全部内点重新拟合，再重新划分内点。它能明显减小仅用5点
+    // 产生的随机偏差，同时保留 RANSAC 对离群点的鲁棒性。
+    // =========================================================================
     for (int local = 0; local < config_.local_optimization_iterations; ++local)
     {
         std::vector<cv::Point2f> inliers;
@@ -254,6 +292,11 @@ std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
     const cv::Mat &binary_roi, const cv::Mat &probability_roi,
     const cv::Point2f &box_center_roi) const
 {
+    // =========================================================================
+    // Mask 轮廓点生成
+    // binary_roi 用于确定拓扑轮廓；probability_roi 用于恢复亚像素边界。
+    // 两张图都处在检测框 ROI 坐标系，返回点也暂时保持 ROI 坐标。
+    // =========================================================================
     cv::Mat work = binary_roi.clone();
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(work, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
@@ -263,6 +306,8 @@ std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
                                  std::min(binary_roi.cols, binary_roi.rows);
     for (const auto &contour : contours)
     {
+        // 先删除面积太小的碎片，再删除质心离检测框中心过远的实例碎片。
+        // 这一步主要抑制分割噪点、邻近目标和框边缘残留。
         if (contour.size() < 5 || std::abs(cv::contourArea(contour)) < minimum_area) continue;
         const cv::Moments moments = cv::moments(contour);
         if (std::abs(moments.m00) < 1e-6) continue;
@@ -275,6 +320,10 @@ std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
             if (!probability_roi.empty() && pixel.x > 0 && pixel.y > 0 &&
                 pixel.x + 1 < probability_roi.cols && pixel.y + 1 < probability_roi.rows)
             {
+                // 二值轮廓只能落在整数像素栅格上。利用局部一阶近似：
+                //     p(x + Δn) ≈ p(x) + |∇p|Δ
+                // 解 p=0.5 得 Δ=(0.5-p)/|∇p|，再沿梯度方向移动轮廓点。
+                // 位移限制在 ±0.75 像素，防止低梯度区域产生不稳定的大步跳动。
                 const float value = probability_roi.at<uint8_t>(pixel) / 255.0f;
                 const float gx = (probability_roi.at<uint8_t>(pixel.y, pixel.x + 1) -
                                   probability_roi.at<uint8_t>(pixel.y, pixel.x - 1)) / 510.0f;
@@ -286,6 +335,7 @@ std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
                     const float shift = std::clamp((0.5f - value) / gradient, -0.75f, 0.75f);
                     point.point.x += shift * gx / gradient;
                     point.point.y += shift * gy / gradient;
+                    // 梯度越大，Mask 边界越锐利；该权重同时用于 PROSAC 排序和 LM。
                     point.weight = std::clamp(gradient * 4.0f, 0.15f, 1.0f);
                 }
             }
@@ -298,6 +348,8 @@ std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
 std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectEdgePoints(
     const cv::Mat &edge_roi, const cv::Point2f &box_center_roi) const
 {
+    // Edge 是通用实验路径，只在 PreferMask 且 Mask 质量不足时调用。
+    // 外圈/中圈生产流程使用 PreferMaskNoEdge，不会进入这里。
     cv::Mat work = edge_roi.clone();
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(work, contours, cv::RETR_LIST, cv::CHAIN_APPROX_NONE);
@@ -320,6 +372,14 @@ bool EllipseFitter::RefineSampson(const std::vector<WeightedPoint> &points,
                                   cv::Matx<double, 5, 5> &covariance,
                                   double &condition) const
 {
+    // =========================================================================
+    // 阶段3：鲁棒 Sampson-LM 精修
+    //
+    // 优化变量：[cx, cy, log(a), log(b), angle_rad]
+    // 使用 log(a)、log(b) 而不是直接优化半轴，可天然保证轴长始终为正。
+    // 每个点的残差为带符号 Sampson 像素距离，外层使用 Huber IRLS 降低残余
+    // 离群点影响，内层使用 Levenberg-Marquardt 在高斯牛顿与梯度下降间切换。
+    // =========================================================================
     if (points.size() < 6) return false;
     cv::Vec<double, 5> parameters(ellipse.center.x, ellipse.center.y,
                                   std::log(std::max(1.0f, ellipse.size.width * 0.5f)),
@@ -348,8 +408,11 @@ bool EllipseFitter::RefineSampson(const std::vector<WeightedPoint> &points,
             const double absolute = std::abs(residual);
             const double robust_weight = absolute <= config_.robust_delta_px
                                              ? 1.0 : config_.robust_delta_px / absolute;
+            // 最终权重 = Mask 边界可靠度 × Huber 鲁棒权重。
             const double weight = std::max(0.01, static_cast<double>(point.weight)) * robust_weight;
             cv::Vec<double, 5> jacobian;
+            // 椭圆残差的解析导数较繁琐，这里使用一侧数值差分。
+            // 不同参数使用不同 epsilon，避免像素、对数轴长和弧度量纲差异造成精度损失。
             for (int parameter = 0; parameter < 5; ++parameter)
             {
                 cv::Vec<double, 5> perturbed = parameters;
@@ -376,6 +439,7 @@ bool EllipseFitter::RefineSampson(const std::vector<WeightedPoint> &points,
         final_sse = sse;
         final_count = used;
         cv::Mat damped = normal.clone();
+        // LM 对角阻尼。lambda 较大时步长更保守，较小时接近高斯牛顿。
         for (int diagonal = 0; diagonal < 5; ++diagonal)
             damped.at<double>(diagonal, diagonal) += lambda *
                 std::max(1.0, normal.at<double>(diagonal, diagonal));
@@ -398,20 +462,29 @@ bool EllipseFitter::RefineSampson(const std::vector<WeightedPoint> &points,
         }
         if (trial_cost < cost)
         {
+            // 新模型降低了鲁棒目标：接受更新并减小阻尼。
             parameters = trial;
             lambda = std::max(1e-9, lambda * 0.4);
             if (step < 1e-10) break;
         }
-        else lambda = std::min(1e9, lambda * 5.0);
+        else
+        {
+            // 新模型更差：拒绝本次更新并增大阻尼，下轮尝试更小的步长。
+            lambda = std::min(1e9, lambda * 5.0);
+        }
     }
     ellipse = make_ellipse(parameters);
     if (final_normal.empty()) return false;
     cv::SVD svd(final_normal, cv::SVD::NO_UV);
+    // 条件数 = 最大奇异值/最小奇异值。值越大，说明现有轮廓不能稳定约束某些
+    // 参数，例如只看到很短的一段弧时，椭圆中心和轴长会存在多组近似解。
     const double largest = svd.w.at<double>(0);
     const double smallest = svd.w.at<double>(svd.w.rows - 1);
     condition = largest / std::max(1e-15, smallest);
     cv::Mat inverse;
     if (!cv::invert(final_normal, inverse, cv::DECOMP_SVD)) return false;
+    // 局部线性化下 Cov ≈ (JᵀWJ)^-1 * 残差方差。
+    // 该协方差不是绝对真值，但足以用于退化门控和后续位姿观测相对加权。
     inverse *= final_sse / std::max(1, final_count - 5);
     for (int row = 0; row < 5; ++row)
         for (int col = 0; col < 5; ++col)
@@ -428,6 +501,11 @@ void EllipseFitter::UpdateGeometryStatistics(const std::vector<WeightedPoint> &p
                                              const cv::Rect &detection_box,
                                              EllipseFitResult &result) const
 {
+    // =========================================================================
+    // 阶段4：覆盖度与不确定度统计
+    // 把内点映射到标准单位圆参数角，使用72个5度小格及4个象限统计覆盖范围。
+    // 仅有一小段连续弧时，即使残差很小也不能可靠确定完整椭圆，因此必须单独门控。
+    // =========================================================================
     std::array<bool, 72> bins{};
     std::array<bool, 4> quadrants{};
     const double angle = result.ellipse.angle * CV_PI / 180.0;
@@ -448,6 +526,8 @@ void EllipseFitter::UpdateGeometryStatistics(const std::vector<WeightedPoint> &p
     result.angular_coverage_deg = 5.0f * std::count(bins.begin(), bins.end(), true);
     result.occupied_quadrants = std::count(quadrants.begin(), quadrants.end(), true);
     result.conic = EllipseToConic(result.ellipse);
+    // 将优化参数协方差转换为更直观的像素/角度标准差。
+    // 对 log(a) 有 d(2a)/d(log(a))=2a，所以完整轴长标准差约为轴长×log轴标准差。
     const double center_variance = std::max(result.covariance(0, 0), result.covariance(1, 1));
     result.center_std_px = std::sqrt(std::max(0.0, center_variance));
     const double width_std = result.ellipse.size.width * std::sqrt(std::max(0.0, result.covariance(2, 2)));
@@ -467,9 +547,17 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
                                                 const cv::Rect &detection_box,
                                                 EllipseSource source) const
 {
+    // =========================================================================
+    // 阶段5：从轮廓点构造并验收一个完整候选
+    // 数据流：
+    // 点集降采样 -> PROSAC/LO-RANSAC -> 取内点 -> Sampson LM ->
+    // ROI坐标转原图坐标 -> 覆盖度/协方差统计 -> 硬门控 -> 综合质量评分。
+    // 任一关键阶段失败都返回 valid=false，由最外层 Fit() 决定继续尝试 Edge 或回退 Box。
+    // =========================================================================
     if (points.size() < 20) return {};
     std::vector<WeightedPoint> sampled;
     sampled.reserve(std::min(static_cast<int>(points.size()), config_.maximum_points));
+    // 轮廓点通常沿边界有序，等步长抽样可保留空间覆盖，同时限制 RANSAC/LM 开销。
     const int step = std::max(1, static_cast<int>(points.size()) / config_.maximum_points);
     for (int index = 0; index < static_cast<int>(points.size()) &&
                         static_cast<int>(sampled.size()) < config_.maximum_points; index += step)
@@ -478,6 +566,7 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
     if (!fit.valid) return {};
 
     std::vector<WeightedPoint> inliers;
+    // RANSAC 负责从全部点中找到正确吸引域；只把其内点交给更精确但更局部的 LM。
     for (const WeightedPoint &point : sampled)
         if (std::abs(SampsonResidualPx(fit.ellipse, point.point)) <= config_.inlier_threshold_px)
             inliers.push_back(point);
@@ -487,6 +576,7 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
     if (!RefineSampson(inliers, refined, covariance, condition)) return {};
 
     EllipseFitResult result;
+    // CollectMaskPoints/CollectEdgePoints 返回 ROI 局部坐标；对外结果必须统一回到原图坐标。
     result.ellipse = refined;
     result.ellipse.center += cv::Point2f(roi.x, roi.y);
     result.valid = true;
@@ -513,6 +603,11 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
                                  detection_box.y + detection_box.height * 0.5f);
     const float short_side = std::max(1.0f, static_cast<float>(std::min(detection_box.width, detection_box.height)));
     result.center_deviation_ratio = cv::norm(result.ellipse.center - box_center) / short_side;
+    // 硬门控用于拒绝“数值上能拟合、物理上不可信”的结果：
+    // - 中心不能离检测框太远；
+    // - 椭圆不能太小或大幅超出检测框；
+    // - 内点必须覆盖足够角度和象限；
+    // - 参数协方差必须可观测且没有明显退化。
     if (result.center_deviation_ratio > config_.center_deviation_ratio ||
         minor_axis(result.ellipse) < 0.20f * short_side ||
         major_axis(result.ellipse) > 1.45f * std::max(detection_box.width, detection_box.height) ||
@@ -520,6 +615,8 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
         result.occupied_quadrants < config_.minimum_occupied_quadrants || !result.uncertainty_valid)
         return {};
 
+    // 通过硬门控后再计算软质量分。quality 不直接决定几何参数，而用于：
+    // 候选/双环选择、视频 EMA 当前帧权重，以及位姿联合优化的观测 sigma。
     const float error_quality = std::exp(-result.mean_error_px / std::max(0.5f, config_.inlier_threshold_px));
     const float center_quality = clamp01(1.0f - result.center_deviation_ratio / config_.center_deviation_ratio);
     const float coverage_quality = clamp01(result.angular_coverage_deg / 300.0f);
@@ -538,10 +635,27 @@ EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
                                     EllipseFitMode mode,
                                     const uint8_t *mask_probability) const
 {
+    // =========================================================================
+    // 椭圆拟合总入口
+    //
+    //   先生成 Box 内切圆兜底
+    //          |
+    //          +-- ForceBox ------------------------------> 返回 Box
+    //          |
+    //          +-- 有 Mask -> 亚像素轮廓 -> 稳健拟合/门控 --+
+    //          |                                           |
+    //          +-- PreferMask 且 Mask 较差 -> 可选 Edge ----+--> 最优候选
+    //                                                      |
+    //                              候选无效或质量不够 ------+--> 返回 Box
+    //
+    // PreferMaskNoEdge 不会执行 Canny，这正是外圈/中圈的默认生产策略。
+    // =========================================================================
     const cv::Size image_size = image.empty() ? cv::Size() : image.size();
+    // 提前准备 fallback，保证后面任何错误分支都有一致、可绘制的返回值。
     EllipseFitResult fallback = BoxInscribedCircle(detection_box);
     if (mode == EllipseFitMode::ForceBox || image_size.width <= 0 || image_size.height <= 0)
         return fallback;
+    // 检测框可能因为反投影或取整略微越界，先与原图求交，防止构造 Mat ROI 异常。
     const cv::Rect roi = detection_box & cv::Rect(0, 0, image.cols, image.rows);
     if (roi.width <= 0 || roi.height <= 0) return fallback;
     const cv::Point2f box_center_roi(detection_box.x + detection_box.width * 0.5f - roi.x,
@@ -550,6 +664,8 @@ EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
     EllipseFitResult best;
     if (mask_data != nullptr)
     {
+        // mask_data/mask_probability 都是“原图宽×原图高”的连续单通道数据；
+        // Mat 这里只包装外部内存，不复制，再截取与检测框对应的 ROI。
         cv::Mat full_mask(image.size(), CV_8UC1, const_cast<uint8_t *>(mask_data));
         cv::Mat probability_roi;
         if (mask_probability != nullptr)
@@ -589,6 +705,7 @@ EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
             best = edge;
     }
 
+    // 最终仅接受“通过所有硬门控且综合质量达标”的候选，否则统一使用内切圆。
     return best.valid && best.quality >= config_.minimum_candidate_quality ? best : fallback;
 }
 
@@ -610,6 +727,13 @@ RingPairRefiner::RingPairRefiner(RingConsistencyConfig config) : config_(std::mo
 RingConsistencyResult RingPairRefiner::Refine(EllipseFitResult &outer,
                                                EllipseFitResult &middle) const
 {
+    // =========================================================================
+    // 同帧双圆环物理一致性门控
+    //
+    // 外圈和中圈是空间中共轴的两个物理圆，但透视投影后两个图像椭圆的中心
+    // 一般不严格重合。因此这里检查“允许范围内的中心偏移”，不修改拟合中心；
+    // 真正的共轴/共享法向约束由 PoseEstimatorLM 的联合重投影模型负责。
+    // =========================================================================
     RingConsistencyResult result;
     if (!outer.valid || !middle.valid) return result;
     result.evaluated = true;
@@ -617,6 +741,7 @@ RingConsistencyResult RingPairRefiner::Refine(EllipseFitResult &outer,
     const float middle_major = major_axis(middle.ellipse);
     if (outer_major < 1.0f || middle_major < 1.0f) return result;
     const float size_ratio = middle_major / outer_major;
+    // 四项误差都除以各自容差，归一化后 <=1 表示该项通过。
     const float size_error = std::abs(size_ratio - config_.expected_middle_to_outer_ratio) /
                              std::max(0.01f, config_.diameter_ratio_tolerance);
     const float center_error = cv::norm(outer.ellipse.center - middle.ellipse.center) /
@@ -634,6 +759,8 @@ RingConsistencyResult RingPairRefiner::Refine(EllipseFitResult &outer,
     middle.geometry_consistent = result.consistent;
     if (!result.consistent)
     {
+        // 不直接删除不一致候选：保留高质量的一圈作为单圈解算机会，同时显著降低
+        // 另一圈 quality。EllipseObservationSigmaPx 会把低质量进一步变成更大的 sigma。
         if (outer.quality >= middle.quality) middle.quality *= 0.35f;
         else outer.quality *= 0.35f;
         return result;
@@ -652,6 +779,8 @@ RingPairSelection RingPairRefiner::SelectAndRefine(
     int outer_class_id,
     int middle_class_id) const
 {
+    // 可能存在同类别多个检测框。先记录每个类别各自最佳项，再遍历所有外圈×中圈
+    // 组合，用“两个单体分数 + 双环一致性分数”选择物理上最合理的一对。
     RingPairSelection selection;
     const size_t count = std::min({class_ids.size(), detection_confidences.size(), ellipses.size()});
     float best_outer_score = -1.0f;
@@ -682,6 +811,7 @@ RingPairSelection RingPairRefiner::SelectAndRefine(
             if (class_ids[middle] != middle_class_id) continue;
             EllipseFitResult outer_copy = ellipses[outer];
             EllipseFitResult middle_copy = ellipses[middle];
+            // 在副本上评估，防止遍历某个失败组合时提前污染真实候选 quality。
             const RingConsistencyResult consistency = Refine(outer_copy, middle_copy);
             const float geometry_term = consistency.consistent
                                             ? 0.45f * consistency.score : -0.35f;
@@ -698,6 +828,7 @@ RingPairSelection RingPairRefiner::SelectAndRefine(
     }
     if (best_outer >= 0 && best_middle >= 0)
     {
+        // 只对最终胜出的真实候选写入 geometry_consistent 和质量修正。
         selection.outer_index = best_outer;
         selection.middle_index = best_middle;
         selection.consistency = Refine(ellipses[best_outer], ellipses[best_middle]);
@@ -711,6 +842,7 @@ EllipseTemporalFilter::EllipseTemporalFilter(EllipseTemporalConfig config)
 EllipseFitResult EllipseTemporalFilter::Update(int class_id,
                                                const EllipseFitResult &measurement)
 {
+    // 每个类别维护独立状态，避免外圈、中圈、内孔之间互相串扰。
     if (class_id < 0 || class_id >= static_cast<int>(states_.size()) || !measurement.valid)
         return measurement;
     State &state = states_[class_id];
@@ -729,6 +861,8 @@ EllipseFitResult EllipseTemporalFilter::Update(int class_id,
     if ((jump > config_.hard_jump_ratio || size_change > config_.hard_size_change_ratio) &&
         measurement.quality < config_.rejection_quality)
     {
+        // 当前帧同时满足“变化很大”和“质量较低”时，认为更可能是误检。
+        // 保持上一帧但略微降低质量；若后续连续出现稳定高质量新位置，仍可重新跟随。
         EllipseFitResult held = state.value;
         held.quality *= 0.92f;
         held.temporally_filtered = true;
@@ -738,6 +872,7 @@ EllipseFitResult EllipseTemporalFilter::Update(int class_id,
 
     const float alpha = config_.minimum_alpha +
                         (config_.maximum_alpha - config_.minimum_alpha) * clamp01(measurement.quality);
+    // 质量越高 alpha 越大，越相信当前测量；质量越低越依赖历史值。
     EllipseFitResult filtered = measurement;
     filtered.ellipse.center = state.value.ellipse.center * (1.0f - alpha) +
                               measurement.ellipse.center * alpha;
@@ -745,6 +880,7 @@ EllipseFitResult EllipseTemporalFilter::Update(int class_id,
                                   measurement.ellipse.size.width * alpha;
     filtered.ellipse.size.height = state.value.ellipse.size.height * (1.0f - alpha) +
                                    measurement.ellipse.size.height * alpha;
+    // 角度不能直接线性插值，例如179度和1度实际只相差2度，需按180度周期融合。
     filtered.ellipse.angle = blend_angle(state.value.ellipse.angle,
                                          measurement.ellipse.angle, alpha);
     filtered.conic = EllipseConicMatrix(filtered.ellipse);

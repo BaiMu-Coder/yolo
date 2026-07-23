@@ -197,6 +197,10 @@ public:
                 result.results_mask[0].each_of_mask_probability[i]) {
                 mask_probability = result.results_mask[0].each_of_mask_probability[i].get();
             }
+            // 拟合模式与在线推理一致：
+            // 外/中参考圈只走“Mask -> Box”，不尝试容易受反光影响的灰度 Edge；
+            // 内孔默认 Box，--hole-mask 才允许“Mask -> Edge -> Box”；
+            // --force-reference-box 的优先级最高，强制外/中圈使用框内切圆。
             const bool is_reference = detection.cls_id == 0 || detection.cls_id == 1;
             const bool force_box = (is_reference && args_.force_reference_box) ||
                                    (detection.cls_id == 2 && !args_.fit_hole_from_mask);

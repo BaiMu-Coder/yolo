@@ -73,6 +73,14 @@ class Config:
     ellipse_min_quality: float = 0.52
     ellipse_min_coverage_deg: float = 160.0
     ellipse_max_covariance_condition: float = 1e12
+    # 出视场专用配置：先删除贴图像边界的“封口假轮廓”，再允许开放弧拟合。
+    image_border_margin_px: int = 3
+    partial_min_coverage_deg: float = 90.0
+    partial_min_quadrants: int = 2
+    partial_min_quality: float = 0.28
+    partial_max_center_std_ratio: float = 0.25
+    partial_max_axis_std_ratio: float = 0.45
+    partial_max_covariance_condition: float = 1e14
     enable_edge_fallback: bool = True
     enable_ellipse_smoothing: bool = True
 
@@ -156,6 +164,7 @@ class Detection:
 @dataclass
 class EllipseResult:
     ellipse: Ellipse
+    valid: bool = True
     source: str = "box"
     inliers: int = 0
     mean_error_px: Optional[float] = None
@@ -165,6 +174,12 @@ class EllipseResult:
     quality: float = 0.0
     geometry_consistent: bool = True
     temporally_filtered: bool = False
+    border_truncated: bool = False
+    partial_visibility: bool = False
+    removed_border_points: int = 0
+    visible_arc_ratio: float = 0.0
+    visible_arc_points: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.float32), repr=False)
     angular_coverage_deg: float = 0.0
     occupied_quadrants: int = 0
     center_std_px: float = math.inf
@@ -384,7 +399,8 @@ def refine_sampson_lm(ellipse: Ellipse, points: np.ndarray, point_weights: np.nd
 
 
 def update_ellipse_statistics(candidate: EllipseResult, points: np.ndarray,
-                              det: Detection, cfg: Config) -> None:
+                              det: Detection, cfg: Config,
+                              partial_visibility: bool = False) -> None:
     errors = np.abs(signed_sampson_errors(candidate.ellipse, points))
     inliers = points[errors <= cfg.ellipse_inlier_px]
     if len(inliers) < 6:
@@ -398,6 +414,7 @@ def update_ellipse_statistics(candidate: EllipseResult, points: np.ndarray,
                    2.0 * math.pi)
     candidate.angular_coverage_deg = 5.0 * len(np.unique(np.minimum(71, (theta * 72 / (2 * math.pi)).astype(int))))
     candidate.occupied_quadrants = len(np.unique(np.minimum(3, (theta * 4 / (2 * math.pi)).astype(int))))
+    candidate.visible_arc_ratio = min(1.0, candidate.angular_coverage_deg / 360.0)
 
     covariance = candidate.covariance
     candidate.center_std_px = float(math.sqrt(max(0.0, covariance[0, 0], covariance[1, 1])))
@@ -407,10 +424,14 @@ def update_ellipse_statistics(candidate: EllipseResult, points: np.ndarray,
     candidate.minor_axis_std_px = float(min(width_std, height_std))
     candidate.angle_std_deg = float(math.degrees(math.sqrt(max(0.0, covariance[4, 4]))))
     short_side = max(1.0, float(min(det.w, det.h)))
+    max_condition = (cfg.partial_max_covariance_condition if partial_visibility
+                     else cfg.ellipse_max_covariance_condition)
+    max_center_std = (cfg.partial_max_center_std_ratio if partial_visibility else 0.10)
+    max_axis_std = (cfg.partial_max_axis_std_ratio if partial_visibility else 0.18)
     candidate.uncertainty_valid = (np.isfinite(candidate.covariance_condition) and
-        candidate.covariance_condition <= cfg.ellipse_max_covariance_condition and
-        candidate.center_std_px <= 0.10 * short_side and
-        candidate.major_axis_std_px <= 0.18 * short_side)
+        candidate.covariance_condition <= max_condition and
+        candidate.center_std_px <= max_center_std * short_side and
+        candidate.major_axis_std_px <= max_axis_std * short_side)
 
 
 def ransac_ellipse(points: np.ndarray, point_weights: np.ndarray,
@@ -488,26 +509,40 @@ def _score_candidate(candidate: EllipseResult, det: Detection, cfg: Config) -> O
     short_side = max(1.0, float(min(det.w, det.h)))
     candidate.center_deviation_ratio = math.hypot(cx - box_center[0], cy - box_center[1]) / short_side
     major, minor = max(candidate.ellipse[1]), min(candidate.ellipse[1])
-    if (candidate.center_deviation_ratio > cfg.ellipse_deviation_ratio or minor < 0.2 * short_side or
-            candidate.angular_coverage_deg < cfg.ellipse_min_coverage_deg or
-            candidate.occupied_quadrants < 3 or not candidate.uncertainty_valid):
+    partial = candidate.partial_visibility
+    center_limit = 0.80 if partial else cfg.ellipse_deviation_ratio
+    minor_limit = 0.10 if partial else 0.20
+    coverage_limit = cfg.partial_min_coverage_deg if partial else cfg.ellipse_min_coverage_deg
+    quadrant_limit = cfg.partial_min_quadrants if partial else 3
+    if (candidate.center_deviation_ratio > center_limit or minor < minor_limit * short_side or
+            candidate.angular_coverage_deg < coverage_limit or
+            candidate.occupied_quadrants < quadrant_limit or not candidate.uncertainty_valid):
         return None
     error = candidate.mean_error_px if candidate.mean_error_px is not None else math.inf
     error_quality = math.exp(-error / max(0.5, cfg.ellipse_inlier_px))
-    center_quality = max(0.0, 1.0 - candidate.center_deviation_ratio / cfg.ellipse_deviation_ratio)
-    if major > 1.45 * max(det.w, det.h):
+    # 允许部分弧中心有更大偏差用于“硬通过”，但软评分仍按完整圈标准降权。
+    center_quality = max(0.0, 1.0 - candidate.center_deviation_ratio /
+                         cfg.ellipse_deviation_ratio)
+    if major > (4.0 if partial else 1.45) * max(det.w, det.h):
         return None
     bonus = 0.04 if candidate.source == "mask" else 0.0
     coverage_quality = min(1.0, candidate.angular_coverage_deg / 300.0)
-    uncertainty_quality = max(0.0, 1.0 - candidate.center_std_px / max(1.0, 0.10 * short_side))
+    uncertainty_quality = max(0.0, 1.0 - candidate.center_std_px /
+                              max(1.0, 0.10 * short_side))
     candidate.quality = min(1.0, 0.32 * candidate.inlier_ratio + 0.22 * error_quality +
                             0.16 * center_quality + 0.16 * coverage_quality +
                             0.14 * uncertainty_quality + bonus)
+    if partial:
+        # 短弧可以进入位姿优化，但不应获得与完整闭合轮廓相同的权重。
+        candidate.quality *= min(1.0, candidate.visible_arc_ratio /
+                                 max(cfg.ellipse_min_coverage_deg / 360.0, 1e-6))
+        candidate.quality = min(candidate.quality, 0.70)
     return candidate
 
 
 def _fit_points(points: np.ndarray, point_weights: np.ndarray, det: Detection,
-                cfg: Config, source: str) -> Optional[EllipseResult]:
+                cfg: Config, source: str, partial_visibility: bool = False,
+                removed_border_points: int = 0) -> Optional[EllipseResult]:
     if len(points) < 20:
         return None
     step = max(1, len(points) // cfg.ellipse_max_points)
@@ -519,18 +554,32 @@ def _fit_points(points: np.ndarray, point_weights: np.ndarray, det: Detection,
     (cx, cy), size, angle = fitted.ellipse
     fitted.ellipse = ((cx + det.x, cy + det.y), size, angle)
     fitted.source = source
+    fitted.border_truncated = partial_visibility
+    fitted.partial_visibility = partial_visibility
+    fitted.removed_border_points = removed_border_points
     fitted.conic = ellipse_conic_matrix(fitted.ellipse)
     global_points = sampled_points.astype(np.float64) + np.asarray(
         [det.x, det.y], dtype=np.float64)
-    update_ellipse_statistics(fitted, global_points, det, cfg)
+    update_ellipse_statistics(fitted, global_points, det, cfg, partial_visibility)
+    # 只把最终 Sampson 内点交给位姿层，避免离群纹理直接参与重投影优化。
+    final_inliers = np.abs(signed_sampson_errors(
+        fitted.ellipse, global_points)) <= cfg.ellipse_inlier_px
+    fitted.visible_arc_points = global_points[final_inliers].astype(np.float32)
     return _score_candidate(fitted, det, cfg)
 
 
 def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
                  force_box: bool = False, allow_edge: bool = True) -> EllipseResult:
+    height, width = frame.shape[:2]
+    margin = max(0, cfg.image_border_margin_px)
+    border_truncated = (det.x <= margin or det.y <= margin or
+                        det.x + det.w >= width - margin or
+                        det.y + det.h >= height - margin)
     box_center = (det.x + det.w * 0.5, det.y + det.h * 0.5)
     side = float(min(det.w, det.h))
     fallback = EllipseResult((box_center, (side, side), 0.0), source="box", quality=0.30,
+                             border_truncated=border_truncated,
+                             partial_visibility=border_truncated,
                              center_std_px=max(2.0, 0.12 * side),
                              major_axis_std_px=0.20 * side,
                              minor_axis_std_px=0.20 * side,
@@ -558,6 +607,17 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
         if selected:
             points = np.concatenate(selected).astype(np.float32)
             point_weights = np.ones(len(points), dtype=np.float64)
+            # findContours 会沿图像裁剪边界人为“封口”。这些直线不是目标真实边缘，
+            # 若保留会把短弧拟合强烈拉向画面边缘，因此按原图坐标先删除。
+            global_x = points[:, 0] + det.x
+            global_y = points[:, 1] + det.y
+            keep = ((global_x > margin) & (global_y > margin) &
+                    (global_x < width - 1 - margin) &
+                    (global_y < height - 1 - margin))
+            removed_border_points = int(len(points) - np.count_nonzero(keep))
+            points = points[keep]
+            point_weights = point_weights[keep]
+            partial_visibility = border_truncated or removed_border_points > 0
             # 在软 mask 的 p=0.5 等值线上做一步法向亚像素修正。
             # 梯度越清晰的点越靠前，供 PROSAC 优先采样。
             if det.mask_probability is not None:
@@ -575,10 +635,13 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
                 points[:, 1] += shift * grad_y / safe
                 point_weights = np.clip(magnitude * 4.0, 0.15, 1.0).astype(np.float64)
             if len(points) >= 20:
-                fitted = _fit_points(points, point_weights, det, cfg, "mask")
+                fitted = _fit_points(points, point_weights, det, cfg, "mask",
+                                     partial_visibility, removed_border_points)
                 if fitted is not None:
                     candidates.append(fitted)
-    if allow_edge and cfg.enable_edge_fallback and (not candidates or max(x.quality for x in candidates) < 0.72):
+    # 截断场景禁用 Edge：图像边界和反光边缘往往比真实开放弧更强，风险高于收益。
+    if (allow_edge and not border_truncated and cfg.enable_edge_fallback and
+            (not candidates or max(x.quality for x in candidates) < 0.72)):
         roi_gray = cv2.cvtColor(frame[det.y:det.y + det.h, det.x:det.x + det.w], cv2.COLOR_BGR2GRAY)
         roi_gray = cv2.GaussianBlur(roi_gray, (5, 5), 1.2)
         edges = cv2.Canny(cv2.equalizeHist(roi_gray), 45, 135, L2gradient=True)
@@ -600,9 +663,20 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
             if fitted is not None:
                 candidates.append(fitted)
     if not candidates:
+        # 自动模式下，可见弧不足时明确返回 invalid，防止把裁剪框内切圆误当成
+        # 完整圆环参与位姿。手动 force_box 已在上方返回，仍保留验收兜底能力。
+        if border_truncated:
+            fallback.valid = False
+            fallback.quality = 0.0
         return fallback
     best = max(candidates, key=lambda item: item.quality + (0.03 if item.source == "mask" else 0.0))
-    return best if best.quality >= cfg.ellipse_min_quality else fallback
+    threshold = cfg.partial_min_quality if best.partial_visibility else cfg.ellipse_min_quality
+    if best.quality >= threshold:
+        return best
+    if border_truncated:
+        fallback.valid = False
+        fallback.quality = 0.0
+    return fallback
 
 
 class PoseEstimatorLM:
@@ -667,12 +741,13 @@ class PoseEstimatorLM:
         return np.concatenate((outer, self._robust(np.asarray([center_distance]), 10.0)))
 
     def _optimize(self, initial: np.ndarray, ellipse: Ellipse, hole: Tuple[float, float],
-                  points: np.ndarray, fixed_tz: Optional[float]) -> np.ndarray:
+                  points: np.ndarray, fixed_tz: Optional[float],
+                  max_iters: Optional[int] = None) -> np.ndarray:
         x = initial.astype(np.float64).copy()
         damping = 1e-3
         residual = self._residual(x, ellipse, hole, points, fixed_tz)
         cost = 0.5 * float(residual @ residual)
-        for _ in range(self.cfg.pose_max_iters):
+        for _ in range(self.cfg.pose_max_iters if max_iters is None else max_iters):
             jac = np.empty((len(residual), len(x)), dtype=np.float64)
             for j in range(len(x)):
                 eps = 1e-4 * (abs(x[j]) + 1.0)
@@ -700,7 +775,8 @@ class PoseEstimatorLM:
         return x
 
     def solve(self, ellipse: Ellipse, hole: Tuple[float, float], use_middle: bool,
-              fixed_distance: Optional[float] = None) -> Pose6D:
+              fixed_distance: Optional[float] = None,
+              max_iters: Optional[int] = None) -> Pose6D:
         points = self.points_middle if use_middle else self.points_outer
         radius = self.radius_middle if use_middle else self.radius_outer
         (cx, cy), (width, height), _ = ellipse
@@ -716,9 +792,11 @@ class PoseEstimatorLM:
         tx = (cx - self.cfg.cx) * tz / self.cfg.fx
         ty = (cy - self.cfg.cy) * tz / self.cfg.fy
         if fixed_distance is None:
-            out = self._optimize(np.asarray([yaw, pitch, tx, ty, tz]), ellipse, hole, points, None)
+            out = self._optimize(np.asarray([yaw, pitch, tx, ty, tz]), ellipse,
+                                 hole, points, None, max_iters)
             return Pose6D(out[0], out[1], 0.0, out[2], out[3], out[4])
-        out = self._optimize(np.asarray([yaw, pitch, tx, ty]), ellipse, hole, points, fixed_distance)
+        out = self._optimize(np.asarray([yaw, pitch, tx, ty]), ellipse,
+                             hole, points, fixed_distance, max_iters)
         return Pose6D(out[0], out[1], 0.0, out[2], out[3], fixed_distance)
 
     def _dual_residual(self, x: np.ndarray, outer: Optional[EllipseResult],
@@ -730,18 +808,40 @@ class PoseEstimatorLM:
             yaw, pitch, tx, ty = x
             tz = fixed_tz
         observations = ((outer, self.points_outer), (middle, self.points_middle))
-        expected = sum(len(points) for observation, points in observations if observation is not None) + 2
+        def observation_count(observation: Optional[EllipseResult],
+                              complete_count: int) -> int:
+            if observation is None or not observation.valid:
+                return 0
+            if observation.partial_visibility and len(observation.visible_arc_points) >= 5:
+                return len(observation.visible_arc_points)
+            return complete_count
+        expected = sum(observation_count(observation, len(points))
+                       for observation, points in observations) + 2
         if tz < 100.0:
             return np.full(expected, 10000.0, dtype=np.float64)
         rvec = self._rvec(float(yaw), float(pitch))
         tvec = np.asarray([tx, ty, tz], dtype=np.float64)
         residuals: List[np.ndarray] = []
         for observation, points in observations:
-            if observation is None:
+            if observation is None or not observation.valid:
                 continue
             projected, _ = cv2.projectPoints(points, rvec, tvec, self.k, self.d)
-            standardized = signed_sampson_errors(
-                observation.ellipse, projected.reshape(-1, 2)) / ellipse_observation_sigma(observation)
+            if observation.partial_visibility and len(observation.visible_arc_points) >= 5:
+                # 与 C++ 相同：当前位姿投影完整 3D 圆得到预测椭圆，再让真实可见
+                # 弧点贴近它。无需建立圆周点对应，也不会盲信短弧外推的完整椭圆。
+                try:
+                    predicted = cv2.fitEllipseDirect(projected.astype(np.float32))
+                    standardized = signed_sampson_errors(
+                        predicted, observation.visible_arc_points
+                    ) / ellipse_observation_sigma(observation)
+                except cv2.error:
+                    residuals.append(np.full(len(observation.visible_arc_points),
+                                             10000.0, dtype=np.float64))
+                    continue
+            else:
+                standardized = signed_sampson_errors(
+                    observation.ellipse,
+                    projected.reshape(-1, 2)) / ellipse_observation_sigma(observation)
             # 联合优化必须保留残差符号，否则雅可比方向会被破坏。
             xh = standardized / 2.5
             robust = np.sqrt(2.0 * 2.5 * 2.5 * (np.sqrt(1.0 + xh * xh) - 1.0))
@@ -756,12 +856,13 @@ class PoseEstimatorLM:
 
     def _optimize_dual(self, initial: np.ndarray, outer: Optional[EllipseResult],
                        middle: Optional[EllipseResult], hole: Tuple[float, float],
-                       hole_sigma: float, fixed_tz: Optional[float]) -> np.ndarray:
+                       hole_sigma: float, fixed_tz: Optional[float],
+                       max_iters: Optional[int] = None) -> np.ndarray:
         x = initial.astype(np.float64).copy()
         damping = 1e-3
         residual = self._dual_residual(x, outer, middle, hole, hole_sigma, fixed_tz)
         cost = 0.5 * float(residual @ residual)
-        for _ in range(self.cfg.pose_max_iters):
+        for _ in range(self.cfg.pose_max_iters if max_iters is None else max_iters):
             jacobian = np.empty((len(residual), len(x)), dtype=np.float64)
             for column in range(len(x)):
                 epsilon = 1e-4 * (abs(x[column]) + 1.0)
@@ -800,9 +901,27 @@ class PoseEstimatorLM:
             return Pose6D()
         initializer, use_middle = min(available,
                                       key=lambda item: ellipse_observation_sigma(item[0]))
-        initial = self.solve(initializer.ellipse, hole, use_middle, fixed_distance)
+        initial = self.solve(initializer.ellipse, hole, use_middle, fixed_distance,
+                             0 if initializer.partial_visibility else 8)
         values = initial.array()
         x = values[[0, 1, 3, 4]] if fixed_distance is not None else values[[0, 1, 3, 4, 5]]
+        if any(item is not None and item.partial_visibility for item in (outer, middle)):
+            # 部分弧的吸引域较窄，使用与 C++ 相同的五个轻量姿态假设粗搜索。
+            best_seed, best_cost = x, math.inf
+            for yaw_offset, pitch_offset in ((0.0, 0.0), (-12.0, 0.0),
+                                             (12.0, 0.0), (0.0, -12.0),
+                                             (0.0, 12.0)):
+                seed = x.copy()
+                seed[0] += yaw_offset
+                seed[1] += pitch_offset
+                seed = self._optimize_dual(seed, outer, middle, hole, hole_sigma,
+                                           fixed_distance, 8)
+                residual = self._dual_residual(seed, outer, middle, hole,
+                                               hole_sigma, fixed_distance)
+                cost = float(residual @ residual)
+                if math.isfinite(cost) and cost < best_cost:
+                    best_seed, best_cost = seed, cost
+            x = best_seed
         result = self._optimize_dual(x, outer, middle, hole, hole_sigma, fixed_distance)
         tz = fixed_distance if fixed_distance is not None else float(result[4])
         if not np.all(np.isfinite(result)) or tz < 100.0:
@@ -873,6 +992,8 @@ def refine_ring_pair(outer: EllipseResult, middle: EllipseResult) -> Tuple[bool,
 
 def ellipse_selection_score(ellipse: EllipseResult, detection_score: float) -> float:
     """对应 C++ EllipseSelectionScore。"""
+    if not ellipse.valid:
+        return -1e6
     geometry_penalty = 1.0 if ellipse.geometry_consistent else 0.72
     return (0.55 * max(0.0, min(1.0, detection_score)) +
             0.45 * max(0.0, min(1.0, ellipse.quality)) * geometry_penalty)
@@ -880,8 +1001,10 @@ def ellipse_selection_score(ellipse: EllipseResult, detection_score: float) -> f
 
 def select_ring_pair(detections: Sequence[Detection], ellipses: List[EllipseResult],
                      outer_class_id: int, middle_class_id: int) -> Tuple[int, int]:
-    outers = [i for i, det in enumerate(detections) if det.class_id == outer_class_id]
-    middles = [i for i, det in enumerate(detections) if det.class_id == middle_class_id]
+    outers = [i for i, det in enumerate(detections)
+              if det.class_id == outer_class_id and ellipses[i].valid]
+    middles = [i for i, det in enumerate(detections)
+               if det.class_id == middle_class_id and ellipses[i].valid]
     if not outers or not middles:
         return (pick_best(detections, outer_class_id, ellipses),
                 pick_best(detections, middle_class_id, ellipses))
@@ -917,6 +1040,9 @@ class EllipseSmoother:
             held = EllipseResult(**{**previous.__dict__})
             held.quality *= 0.92
             held.temporally_filtered = True
+            # 上一帧可见弧不能与当前帧孔中心混用；保持帧退回低权重完整椭圆先验。
+            held.visible_arc_points = np.empty((0, 2), dtype=np.float32)
+            held.partial_visibility = False
             self.values[class_id] = held
             return held
         alpha = 0.18 + (0.72 - 0.18) * max(0.0, min(1.0, current.quality))
@@ -941,7 +1067,9 @@ def draw_text(image: np.ndarray, text: str, y: int, color: Tuple[int, int, int],
 
 def pick_best(detections: Sequence[Detection], class_id: int,
               ellipses: Optional[Sequence[EllipseResult]] = None) -> int:
-    indices = [i for i, det in enumerate(detections) if det.class_id == class_id]
+    indices = [i for i, det in enumerate(detections)
+               if det.class_id == class_id and
+               (ellipses is None or (i < len(ellipses) and ellipses[i].valid))]
     if not indices:
         return -1
     return max(indices, key=lambda i: detections[i].score if ellipses is None else
@@ -969,7 +1097,10 @@ def ellipse_observation_sigma(ellipse: EllipseResult) -> float:
     residual = ellipse.mean_error_px if ellipse.mean_error_px is not None else 3.0
     sigma = max(0.5, math.hypot(residual, 0.5 * ellipse.center_std_px))
     sigma /= max(0.25, ellipse.quality)
-    return sigma * (1.0 if ellipse.geometry_consistent else 3.0)
+    sigma *= (1.0 if ellipse.geometry_consistent else 3.0)
+    if ellipse.partial_visibility:
+        sigma *= 1.5 / max(0.25, ellipse.visible_arc_ratio)
+    return sigma
 
 
 def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
@@ -993,13 +1124,21 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
         if cfg.draw_boxes:
             cv2.rectangle(vis, (det.x, det.y), (det.x + det.w, det.y + det.h), (0, 0, 255), 2)
             cv2.putText(vis, f"cls={det.class_id} conf={det.score:.2f} "
-                        f"q={ellipse.quality:.2f} {ellipse.source}",
+                        f"q={ellipse.quality:.2f} {ellipse.source}"
+                        f"{' PARTIAL' if ellipse.partial_visibility else ''}",
                         (det.x, max(18, det.y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
         if cfg.draw_all_ellipses:
-            color = (0, 255, 0) if ellipse.source == "mask" else ((255, 0, 255) if ellipse.source == "edge" else (0, 255, 255))
+            color = ((0, 0, 255) if not ellipse.valid else
+                     ((0, 165, 255) if ellipse.partial_visibility else
+                      ((0, 255, 0) if ellipse.source == "mask" else
+                       ((255, 0, 255) if ellipse.source == "edge" else (0, 255, 255)))))
             cv2.ellipse(vis, ellipse.ellipse, color, 2)
             cv2.circle(vis, tuple(np.rint(ellipse.ellipse[0]).astype(int)), 2, (0, 0, 255), -1)
+            if ellipse.partial_visibility:
+                for point in ellipse.visible_arc_points[::4]:
+                    cv2.circle(vis, tuple(np.rint(point).astype(int)), 1,
+                               (0, 165, 255), -1)
         if cfg.save_masks and det.mask is not None and frame_id % max(1, cfg.mask_every) == 0:
             cv2.imwrite(str(masks_dir / f"frame_{frame_id:08d}_det_{i:03d}_cls_{det.class_id}.png"), det.mask)
 
@@ -1076,12 +1215,18 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
             "ellipse": {"center": [float(x) for x in ellipse.ellipse[0]],
                         "size": [float(x) for x in ellipse.ellipse[1]],
                         "angle_deg": float(ellipse.ellipse[2]), "source": ellipse.source,
-                        "from_mask": ellipse.from_mask, "quality": ellipse.quality,
+                        "valid": ellipse.valid, "from_mask": ellipse.from_mask,
+                        "quality": ellipse.quality,
                         "inlier_ratio": ellipse.inlier_ratio, "inliers": ellipse.inliers,
                         "mean_error_px": (finite_or_none(ellipse.mean_error_px)
                                           if ellipse.mean_error_px is not None else None),
                         "geometry_consistent": ellipse.geometry_consistent,
                         "temporally_filtered": ellipse.temporally_filtered,
+                        "border_truncated": ellipse.border_truncated,
+                        "partial_visibility": ellipse.partial_visibility,
+                        "visible_arc_ratio": ellipse.visible_arc_ratio,
+                        "removed_border_points": ellipse.removed_border_points,
+                        "support_points": int(len(ellipse.visible_arc_points)),
                         "angular_coverage_deg": ellipse.angular_coverage_deg,
                         "occupied_quadrants": ellipse.occupied_quadrants,
                         "uncertainty_valid": ellipse.uncertainty_valid,
@@ -1107,8 +1252,9 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
 
 ELLIPSE_TXT_HEADER = (
     "# class_id center_x_px center_y_px major_axis_px minor_axis_px angle_deg "
-    "confidence fit_source quality inlier_ratio inliers mean_error_px coverage_deg "
-    "quadrants center_std_px major_std_px minor_std_px angle_std_deg cov_condition "
+    "confidence fit_source valid quality inlier_ratio inliers mean_error_px coverage_deg "
+    "quadrants border_truncated partial visible_arc_ratio removed_border_points support_points "
+    "center_std_px major_std_px minor_std_px angle_std_deg cov_condition "
     "geometry_ok temporal conic00 conic01 conic02 conic11 conic12 conic22\n"
 )
 POSE_FRAME_HEADER = (
@@ -1149,6 +1295,9 @@ def write_batch_frame_outputs(key: str, frame: np.ndarray,
             tail_fields = [
                 number(ellipse["mean_error_px"]),
                 ellipse["angular_coverage_deg"], ellipse["occupied_quadrants"],
+                int(ellipse["border_truncated"]), int(ellipse["partial_visibility"]),
+                ellipse["visible_arc_ratio"], ellipse["removed_border_points"],
+                ellipse["support_points"],
                 number(ellipse["center_std_px"]), number(ellipse["major_axis_std_px"]),
                 number(ellipse["minor_axis_std_px"]), number(ellipse["angle_std_deg"]),
                 number(ellipse["covariance_condition"]),
@@ -1159,7 +1308,8 @@ def write_batch_frame_outputs(key: str, frame: np.ndarray,
             handle.write(
                 f"{det.class_id} " +
                 " ".join(f"{float(value):.6f}" for value in geometry_fields) +
-                f" {ellipse['source']} {float(ellipse['quality']):.6f} "
+                f" {ellipse['source']} {int(ellipse['valid'])} "
+                f"{float(ellipse['quality']):.6f} "
                 f"{float(ellipse['inlier_ratio']):.6f} {int(ellipse['inliers'])} " +
                 " ".join(f"{float(value):.6f}" for value in tail_fields) + "\n")
 

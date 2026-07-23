@@ -134,7 +134,7 @@ cmake --build build --target single_frame_pipeline -j
 ```text
 推理入口选择 EllipseFitMode
     -> EllipseFitter::Fit                 总调度及 Box 回退
-    -> CollectMaskPoints                  Mask 轮廓和 p=0.5 亚像素修正
+    -> CollectMaskPoints                  Mask 轮廓、边界假轮廓剔除和 p=0.5 亚像素修正
     -> BuildCandidate
        -> FitRansac                       PROSAC 式采样和 LO-RANSAC
        -> RefineSampson                   Huber-Sampson LM 和协方差
@@ -142,6 +142,9 @@ cmake --build build --target single_frame_pipeline -j
     -> RingPairRefiner                    外圈/中圈物理一致性选择
     -> EllipseTemporalFilter              视频质量自适应 EMA
     -> EllipseObservationSigmaPx          转为联合位姿解算的观测权重
+    -> PoseEstimatorLM::SolveDual
+       -> 完整圈：投影圆周点到观测椭圆
+       -> 部分圈：实际可见弧点到当前位姿预测椭圆
 ```
 
 主要数据都集中在 `EllipseFitResult`：`ellipse` 是原图坐标下的最终椭圆，
@@ -153,12 +156,35 @@ Mask；Box 兜底同样是可用结果，判断来源应读取 `source`。
 默认外圈/中圈只采用两级策略：高质量 Mask 椭圆，或检测框内切圆。参考圈不执行灰度 Edge 拟合。
 Mask 路径先从分割概率的 0.5 等值线获得亚像素轮廓，再用质量排序采样、直接最小二乘初值、
 LO-RANSAC 局部重拟合和 Huber-Sampson LM 精修。候选必须通过内点率、轮廓角度/象限覆盖、检测框偏差、
-轴比及协方差条件数门控；任一关键项不合格就回退到内切圆。
+轴比及协方差条件数门控。完整目标不合格时回退内切圆；出视场目标若可见弧不足则标记无效，避免裁剪后的检测框
+产生错误几何。需要无条件保底时再显式开启强制内切圆。
 
 两圈同时存在时，先做尺寸比、中心偏移、轴比和方向的几何门控，但不强制两个投影椭圆在图像上同心。
 位姿层把外圈和中圈作为同一组共轴 3D 圆，在同一 LM 中联合重投影，并用各自拟合协方差换算的像素标准差加权。
 Mask 拟合可信时权重高，Box 兜底时自动降权。视频/摄像头模式最后使用随质量自适应的椭圆 EMA，
-并拒绝低质量突变。可视化中绿色为 Mask、黄色为检测框内切圆。
+并拒绝低质量突变。可视化中绿色为完整 Mask、橙色及 `PARTIAL` 表示部分可见但仍通过
+几何门控、黄色为检测框内切圆、红色表示检测存在但可见弧不足，不能进入位姿解算。
+
+### 出视场圆环处理
+
+当检测框或 Mask 接触原图边界时，拟合器自动进入部分可见模式，不需要新增命令行参数：
+
+1. 删除距原图边界 3 px 内的轮廓点，防止 Mask 被裁剪后生成的直线“封口”参与拟合。
+2. 仍使用 PROSAC/LO-RANSAC 和 Huber-Sampson LM，但采用部分弧专用门限：默认至少
+   `90°`、覆盖至少两个象限，并检查放宽后的协方差条件数和参数标准差。
+3. 保留最终有效弧内点。双圆共轴位姿 LM 不再盲信短弧外推出的完整椭圆，而是把当前
+   3D 圆环投影成预测椭圆，直接最小化可见弧点到预测椭圆的 Sampson 距离。
+4. 部分弧启用五个 yaw/pitch 初值的轻量多假设搜索，降低单个短弧初值落入局部最优的概率；
+   完整目标不执行该搜索，不增加正常路径耗时。
+5. 部分弧按可见比例扩大 `sigma`、质量分最高限制为 `0.70`，完整圆环会自然获得更高权重。
+6. 可见弧小于门限时返回 `valid=false`，候选选择和位姿层会跳过它，避免输出看似正常但
+   实际发散的姿态。若验收现场必须无条件出结果，仍可显式使用
+   `--force-reference-box`，其优先级高于自动失效策略。
+
+逐帧椭圆 TXT 和 Python JSON 新增 `valid`、`border_truncated`、`partial`、
+`visible_arc_ratio`、`removed_border_points` 和 `support_points`，便于现场说明算法为何
+接受或拒绝某一帧。常用部分弧门限在
+`EllipseFitConfig`（C++）和 `Config`（`unit_test/final_version.py`）中均有中文注释。
 
 ```cpp
 npu_infer_pool pool(model_path);

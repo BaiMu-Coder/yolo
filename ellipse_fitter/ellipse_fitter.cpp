@@ -74,6 +74,7 @@ const char *EllipseSourceName(EllipseSource source)
 
 float EllipseSelectionScore(const EllipseFitResult &ellipse, float detection_confidence)
 {
+    if (!ellipse.valid) return -1e6f;
     // 检测置信度回答“目标是不是该类别”，ellipse.quality 回答“边界几何是否可信”。
     // 两者都保留，避免仅凭高置信检测框选中一个严重退化的 Mask 椭圆。
     const float geometry_penalty = ellipse.geometry_consistent ? 1.0f : 0.72f;
@@ -92,6 +93,11 @@ double EllipseObservationSigmaPx(const EllipseFitResult &ellipse)
     // 协方差衡量单个椭圆的局部稳定性；quality/双圈门控补充模型选错风险。
     sigma /= std::max(0.25, static_cast<double>(ellipse.quality));
     if (!ellipse.geometry_consistent) sigma *= 3.0;
+    if (ellipse.partial_visibility)
+    {
+        // 可见弧越短，完整椭圆参数越不稳定；即使局部残差很小也必须降低位姿权重。
+        sigma *= 1.5 / std::max(0.25, static_cast<double>(ellipse.visible_arc_ratio));
+    }
     return sigma;
 }
 
@@ -134,6 +140,13 @@ EllipseFitter::EllipseFitter(EllipseFitConfig config) : config_(std::move(config
     config_.edge_search_quality_threshold = clamp01(config_.edge_search_quality_threshold);
     config_.minimum_angular_coverage_deg = std::clamp(config_.minimum_angular_coverage_deg, 0.0f, 360.0f);
     config_.minimum_occupied_quadrants = std::clamp(config_.minimum_occupied_quadrants, 1, 4);
+    config_.image_border_margin_px = std::max(0, config_.image_border_margin_px);
+    config_.partial_minimum_angular_coverage_deg =
+        std::clamp(config_.partial_minimum_angular_coverage_deg, 0.0f, 360.0f);
+    config_.partial_minimum_occupied_quadrants =
+        std::clamp(config_.partial_minimum_occupied_quadrants, 1, 4);
+    config_.partial_minimum_candidate_quality =
+        clamp01(config_.partial_minimum_candidate_quality);
 }
 
 EllipseFitResult EllipseFitter::BoxInscribedCircle(const cv::Rect &detection_box)
@@ -290,7 +303,8 @@ EllipseFitter::RansacResult EllipseFitter::FitRansac(
 
 std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
     const cv::Mat &binary_roi, const cv::Mat &probability_roi,
-    const cv::Point2f &box_center_roi) const
+    const cv::Point2f &box_center_roi, const cv::Rect &roi_in_image,
+    cv::Size image_size, int *removed_border_points) const
 {
     // =========================================================================
     // Mask 轮廓点生成
@@ -316,6 +330,18 @@ std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
         if (cv::norm(center - box_center_roi) > distance_limit) continue;
         for (const cv::Point &pixel : contour)
         {
+            const cv::Point global(pixel.x + roi_in_image.x, pixel.y + roi_in_image.y);
+            const int margin = config_.image_border_margin_px;
+            const bool on_image_border =
+                global.x <= margin || global.y <= margin ||
+                global.x >= image_size.width - 1 - margin ||
+                global.y >= image_size.height - 1 - margin;
+            if (on_image_border)
+            {
+                // 出视场 Mask 会被图像边缘强行闭合成直线；这些点不属于真实圆环。
+                if (removed_border_points != nullptr) ++(*removed_border_points);
+                continue;
+            }
             WeightedPoint point{cv::Point2f(pixel), 1.0f};
             if (!probability_roi.empty() && pixel.x > 0 && pixel.y > 0 &&
                 pixel.x + 1 < probability_roi.cols && pixel.y + 1 < probability_roi.rows)
@@ -499,7 +525,8 @@ cv::Matx33d EllipseFitter::EllipseToConic(const cv::RotatedRect &ellipse)
 
 void EllipseFitter::UpdateGeometryStatistics(const std::vector<WeightedPoint> &points,
                                              const cv::Rect &detection_box,
-                                             EllipseFitResult &result) const
+                                             EllipseFitResult &result,
+                                             bool partial_visibility) const
 {
     // =========================================================================
     // 阶段4：覆盖度与不确定度统计
@@ -525,6 +552,7 @@ void EllipseFitter::UpdateGeometryStatistics(const std::vector<WeightedPoint> &p
     }
     result.angular_coverage_deg = 5.0f * std::count(bins.begin(), bins.end(), true);
     result.occupied_quadrants = std::count(quadrants.begin(), quadrants.end(), true);
+    result.visible_arc_ratio = clamp01(result.angular_coverage_deg / 360.0f);
     result.conic = EllipseToConic(result.ellipse);
     // 将优化参数协方差转换为更直观的像素/角度标准差。
     // 对 log(a) 有 d(2a)/d(log(a))=2a，所以完整轴长标准差约为轴长×log轴标准差。
@@ -536,16 +564,27 @@ void EllipseFitter::UpdateGeometryStatistics(const std::vector<WeightedPoint> &p
     result.minor_axis_std_px = std::min(width_std, height_std);
     result.angle_std_deg = std::sqrt(std::max(0.0, result.covariance(4, 4))) * 180.0 / CV_PI;
     const float short_side = std::max(1.0f, static_cast<float>(std::min(detection_box.width, detection_box.height)));
+    const float center_limit = partial_visibility
+                                   ? config_.partial_maximum_center_std_ratio
+                                   : config_.maximum_center_std_ratio;
+    const float axis_limit = partial_visibility
+                                 ? config_.partial_maximum_axis_std_ratio
+                                 : config_.maximum_axis_std_ratio;
+    const double condition_limit = partial_visibility
+                                       ? config_.partial_maximum_covariance_condition
+                                       : config_.maximum_covariance_condition;
     result.uncertainty_valid = std::isfinite(result.center_std_px) &&
-        result.center_std_px <= config_.maximum_center_std_ratio * short_side &&
-        result.major_axis_std_px <= config_.maximum_axis_std_ratio * short_side &&
-        result.covariance_condition <= config_.maximum_covariance_condition;
+        result.center_std_px <= center_limit * short_side &&
+        result.major_axis_std_px <= axis_limit * short_side &&
+        result.covariance_condition <= condition_limit;
 }
 
 EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> &points,
                                                 const cv::Rect &roi,
                                                 const cv::Rect &detection_box,
-                                                EllipseSource source) const
+                                                EllipseSource source,
+                                                bool partial_visibility,
+                                                int removed_border_points) const
 {
     // =========================================================================
     // 阶段5：从轮廓点构造并验收一个完整候选
@@ -582,6 +621,9 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
     result.valid = true;
     result.source = source;
     result.from_mask = source == EllipseSource::Mask;
+    result.border_truncated = partial_visibility;
+    result.partial_visibility = partial_visibility;
+    result.removed_border_points = removed_border_points;
     result.covariance = covariance;
     result.covariance_condition = condition;
     result.sampled_points = sampled.size();
@@ -591,13 +633,18 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
     {
         point.point += cv::Point2f(roi.x, roi.y);
         const float error = std::abs(SampsonResidualPx(result.ellipse, point.point));
-        if (error <= config_.inlier_threshold_px) { ++result.inliers; error_sum += error; }
+        if (error <= config_.inlier_threshold_px)
+        {
+            ++result.inliers;
+            error_sum += error;
+            result.visible_arc_points.push_back(point.point);
+        }
     }
     result.inlier_ratio = result.sampled_points > 0
                               ? static_cast<float>(result.inliers) / result.sampled_points : 0.0f;
     result.mean_error_px = result.inliers > 0 ? error_sum / result.inliers
                                                : std::numeric_limits<float>::infinity();
-    UpdateGeometryStatistics(global_points, detection_box, result);
+    UpdateGeometryStatistics(global_points, detection_box, result, partial_visibility);
 
     const cv::Point2f box_center(detection_box.x + detection_box.width * 0.5f,
                                  detection_box.y + detection_box.height * 0.5f);
@@ -608,11 +655,21 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
     // - 椭圆不能太小或大幅超出检测框；
     // - 内点必须覆盖足够角度和象限；
     // - 参数协方差必须可观测且没有明显退化。
-    if (result.center_deviation_ratio > config_.center_deviation_ratio ||
-        minor_axis(result.ellipse) < 0.20f * short_side ||
-        major_axis(result.ellipse) > 1.45f * std::max(detection_box.width, detection_box.height) ||
-        result.angular_coverage_deg < config_.minimum_angular_coverage_deg ||
-        result.occupied_quadrants < config_.minimum_occupied_quadrants || !result.uncertainty_valid)
+    const float center_limit = partial_visibility ? 0.80f : config_.center_deviation_ratio;
+    const float minimum_minor_ratio = partial_visibility ? 0.10f : 0.20f;
+    const float maximum_major_ratio = partial_visibility ? 4.0f : 1.45f;
+    const float coverage_limit = partial_visibility
+                                     ? config_.partial_minimum_angular_coverage_deg
+                                     : config_.minimum_angular_coverage_deg;
+    const int quadrant_limit = partial_visibility
+                                   ? config_.partial_minimum_occupied_quadrants
+                                   : config_.minimum_occupied_quadrants;
+    if (result.center_deviation_ratio > center_limit ||
+        minor_axis(result.ellipse) < minimum_minor_ratio * short_side ||
+        major_axis(result.ellipse) > maximum_major_ratio *
+                                         std::max(detection_box.width, detection_box.height) ||
+        result.angular_coverage_deg < coverage_limit ||
+        result.occupied_quadrants < quadrant_limit || !result.uncertainty_valid)
         return {};
 
     // 通过硬门控后再计算软质量分。quality 不直接决定几何参数，而用于：
@@ -626,6 +683,13 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
     result.quality = clamp01(0.32f * result.inlier_ratio + 0.22f * error_quality +
                              0.16f * center_quality + 0.16f * coverage_quality +
                              0.14f * uncertainty_quality + source_bonus);
+    if (partial_visibility)
+    {
+        // 部分弧允许进入位姿层，但不能获得与完整椭圆相同的置信度。
+        result.quality *= clamp01(result.angular_coverage_deg /
+                                  std::max(1.0f, config_.minimum_angular_coverage_deg));
+        result.quality = std::min(result.quality, 0.70f);
+    }
     return result;
 }
 
@@ -653,15 +717,25 @@ EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
     const cv::Size image_size = image.empty() ? cv::Size() : image.size();
     // 提前准备 fallback，保证后面任何错误分支都有一致、可绘制的返回值。
     EllipseFitResult fallback = BoxInscribedCircle(detection_box);
-    if (mode == EllipseFitMode::ForceBox || image_size.width <= 0 || image_size.height <= 0)
+    if (image_size.width <= 0 || image_size.height <= 0)
         return fallback;
     // 检测框可能因为反投影或取整略微越界，先与原图求交，防止构造 Mat ROI 异常。
     const cv::Rect roi = detection_box & cv::Rect(0, 0, image.cols, image.rows);
     if (roi.width <= 0 || roi.height <= 0) return fallback;
+    const int margin = config_.image_border_margin_px;
+    const bool border_truncated =
+        detection_box.x <= margin || detection_box.y <= margin ||
+        detection_box.x + detection_box.width >= image.cols - margin ||
+        detection_box.y + detection_box.height >= image.rows - margin;
+    fallback.border_truncated = border_truncated;
+    fallback.partial_visibility = border_truncated;
+    if (mode == EllipseFitMode::ForceBox)
+        return fallback;
     const cv::Point2f box_center_roi(detection_box.x + detection_box.width * 0.5f - roi.x,
                                      detection_box.y + detection_box.height * 0.5f - roi.y);
 
     EllipseFitResult best;
+    int removed_border_points = 0;
     if (mask_data != nullptr)
     {
         // mask_data/mask_probability 都是“原图宽×原图高”的连续单通道数据；
@@ -674,12 +748,17 @@ EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
                                      const_cast<uint8_t *>(mask_probability));
             probability_roi = full_probability(roi);
         }
-        best = BuildCandidate(CollectMaskPoints(full_mask(roi), probability_roi, box_center_roi),
-                              roi, detection_box, EllipseSource::Mask);
+        const std::vector<WeightedPoint> mask_points =
+            CollectMaskPoints(full_mask(roi), probability_roi, box_center_roi,
+                              roi, image.size(), &removed_border_points);
+        const bool partial = border_truncated || removed_border_points > 0;
+        best = BuildCandidate(mask_points, roi, detection_box, EllipseSource::Mask,
+                              partial, removed_border_points);
     }
 
     // Mask 已经足够稳定时跳过 Canny，避免在实时路径上重复消耗 CPU。
-    if (mode == EllipseFitMode::PreferMask && config_.enable_edge_fallback &&
+    // 出视场时禁止 Edge：图像边界和背景纹理会制造比 Mask 更强的伪直线。
+    if (!border_truncated && mode == EllipseFitMode::PreferMask && config_.enable_edge_fallback &&
         (!best.valid || best.quality < config_.edge_search_quality_threshold))
     {
         cv::Mat gray;
@@ -700,13 +779,27 @@ EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
             edges.colRange(edges.cols - border, edges.cols).setTo(0);
         }
         EllipseFitResult edge = BuildCandidate(CollectEdgePoints(edges, box_center_roi),
-                                               roi, detection_box, EllipseSource::Edge);
+                                               roi, detection_box, EllipseSource::Edge,
+                                               false, 0);
         if (edge.valid && (!best.valid || edge.quality > best.quality + 0.03f))
             best = edge;
     }
 
-    // 最终仅接受“通过所有硬门控且综合质量达标”的候选，否则统一使用内切圆。
-    return best.valid && best.quality >= config_.minimum_candidate_quality ? best : fallback;
+    const float quality_threshold = best.partial_visibility
+                                        ? config_.partial_minimum_candidate_quality
+                                        : config_.minimum_candidate_quality;
+    if (best.valid && best.quality >= quality_threshold) return best;
+
+    if (border_truncated)
+    {
+        // 被图像裁剪的检测框内切圆没有物理意义：中心会向画面内部偏、直径会缩小。
+        // 自动路径宁可返回 invalid，也不输出一个看似稳定但错误的圆。视频上层可选择
+        // 保持上一帧；单图则明确记录无效。
+        fallback.valid = false;
+        fallback.quality = 0.0f;
+        fallback.removed_border_points = removed_border_points;
+    }
+    return fallback;
 }
 
 EllipseFitResult EllipseFitter::Fit(cv::Size image_size,
@@ -787,6 +880,9 @@ RingPairSelection RingPairRefiner::SelectAndRefine(
     float best_middle_score = -1.0f;
     for (size_t i = 0; i < count; ++i)
     {
+        // 出视场过多、可见弧不足时 Fit 会返回 valid=false。它可以用于可视化
+        // “检测到了但几何不可解”，不能参加双环选择和位姿解算。
+        if (!ellipses[i].valid) continue;
         const float score = EllipseSelectionScore(ellipses[i], detection_confidences[i]);
         if (class_ids[i] == outer_class_id && score > best_outer_score)
         {
@@ -805,10 +901,10 @@ RingPairSelection RingPairRefiner::SelectAndRefine(
     int best_middle = -1;
     for (size_t outer = 0; outer < count; ++outer)
     {
-        if (class_ids[outer] != outer_class_id) continue;
+        if (class_ids[outer] != outer_class_id || !ellipses[outer].valid) continue;
         for (size_t middle = 0; middle < count; ++middle)
         {
-            if (class_ids[middle] != middle_class_id) continue;
+            if (class_ids[middle] != middle_class_id || !ellipses[middle].valid) continue;
             EllipseFitResult outer_copy = ellipses[outer];
             EllipseFitResult middle_copy = ellipses[middle];
             // 在副本上评估，防止遍历某个失败组合时提前污染真实候选 quality。
@@ -866,6 +962,10 @@ EllipseFitResult EllipseTemporalFilter::Update(int class_id,
         EllipseFitResult held = state.value;
         held.quality *= 0.92f;
         held.temporally_filtered = true;
+        // held 的弧点属于上一帧，不能拿去和当前帧孔中心一起做像素重投影。
+        // 保持帧改用上一帧完整椭圆作为低权重时序先验。
+        held.visible_arc_points.clear();
+        held.partial_visibility = false;
         state.value = held;
         return held;
     }

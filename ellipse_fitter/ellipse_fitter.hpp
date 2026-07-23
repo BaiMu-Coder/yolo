@@ -42,6 +42,15 @@ struct EllipseFitConfig
     float minimum_angular_coverage_deg = 160.0f; ///< 内点至少覆盖的椭圆参数角，防止短弧冒充整圆。
     int minimum_occupied_quadrants = 3;          ///< 内点至少分布在几个椭圆象限中。
 
+    // ---------- 出视场/边界截断专用门限 ----------
+    int image_border_margin_px = 3; ///< 距原图边界不超过该距离的轮廓点视为裁剪产生的假边界。
+    float partial_minimum_angular_coverage_deg = 90.0f; ///< 截断模式允许的最小可见弧覆盖角。
+    int partial_minimum_occupied_quadrants = 2; ///< 截断模式最少覆盖象限数。
+    float partial_minimum_candidate_quality = 0.28f; ///< 部分弧候选最低质量；位姿层还会继续降权。
+    float partial_maximum_center_std_ratio = 0.25f; ///< 截断模式中心标准差/框短边上限。
+    float partial_maximum_axis_std_ratio = 0.45f; ///< 截断模式轴长标准差/框短边上限。
+    double partial_maximum_covariance_condition = 1e14; ///< 截断短弧允许更大的条件数。
+
     // ---------- PROSAC / LO-RANSAC ----------
     int ransac_iterations = 160;           ///< 5点直接椭圆假设的最大采样次数。
     int local_optimization_iterations = 2; ///< 用当前内点重新直接拟合的 LO 次数。
@@ -86,6 +95,11 @@ struct EllipseFitResult
     float quality = 0.0f;               ///< [0,1] 综合质量分，供候选选择、时序滤波和位姿加权。
     bool geometry_consistent = true;    ///< 与同帧另一参考圆环是否通过物理几何一致性门控。
     bool temporally_filtered = false;   ///< 是否经过视频 EMA 或因低质量突变而保持上一帧。
+    bool border_truncated = false; ///< 检测框或 Mask 是否接触原图边界。
+    bool partial_visibility = false; ///< 是否使用“开放可见弧”专用门限得到。
+    int removed_border_points = 0; ///< 从 Mask 轮廓中删除的图像边界假轮廓点数。
+    float visible_arc_ratio = 0.0f; ///< angular_coverage_deg / 360。
+    std::vector<cv::Point2f> visible_arc_points; ///< 原图坐标下的有效弧内点，供位姿层直接重投影。
 
     cv::Matx33d conic = cv::Matx33d::zeros(); ///< 归一化二次曲线矩阵 Q，使 [x y 1]Q[x y 1]^T=0。
     cv::Matx<double, 5, 5> covariance = cv::Matx<double, 5, 5>::zeros(); ///< 上述5参数的近似协方差。
@@ -159,20 +173,26 @@ private:
     RansacResult FitRansac(const std::vector<WeightedPoint> &points) const;
     std::vector<WeightedPoint> CollectMaskPoints(const cv::Mat &binary_roi,
                                                  const cv::Mat &probability_roi,
-                                                 const cv::Point2f &box_center_roi) const;
+                                                 const cv::Point2f &box_center_roi,
+                                                 const cv::Rect &roi_in_image,
+                                                 cv::Size image_size,
+                                                 int *removed_border_points) const;
     std::vector<WeightedPoint> CollectEdgePoints(const cv::Mat &edge_roi,
                                                  const cv::Point2f &box_center_roi) const;
     EllipseFitResult BuildCandidate(const std::vector<WeightedPoint> &points,
                                     const cv::Rect &roi,
                                     const cv::Rect &detection_box,
-                                    EllipseSource source) const;
+                                    EllipseSource source,
+                                    bool partial_visibility = false,
+                                    int removed_border_points = 0) const;
     bool RefineSampson(const std::vector<WeightedPoint> &points,
                        cv::RotatedRect &ellipse,
                        cv::Matx<double, 5, 5> &covariance,
                        double &condition) const;
     void UpdateGeometryStatistics(const std::vector<WeightedPoint> &points,
                                   const cv::Rect &detection_box,
-                                  EllipseFitResult &result) const;
+                                  EllipseFitResult &result,
+                                  bool partial_visibility) const;
     static cv::Matx33d EllipseToConic(const cv::RotatedRect &ellipse);
 
     EllipseFitConfig config_;

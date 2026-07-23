@@ -204,10 +204,14 @@ public:
         std::optional<PoseEllipseObservation> middle_observation;
         if (outer >= 0)
             outer_observation = PoseEllipseObservation{frame.ellipses[outer].ellipse,
-                EllipseObservationSigmaPx(frame.ellipses[outer]), true};
+                EllipseObservationSigmaPx(frame.ellipses[outer]), true,
+                frame.ellipses[outer].visible_arc_points,
+                frame.ellipses[outer].partial_visibility};
         if (middle >= 0)
             middle_observation = PoseEllipseObservation{frame.ellipses[middle].ellipse,
-                EllipseObservationSigmaPx(frame.ellipses[middle]), true};
+                EllipseObservationSigmaPx(frame.ellipses[middle]), true,
+                frame.ellipses[middle].visible_arc_points,
+                frame.ellipses[middle].partial_visibility};
         const double hole_sigma = EllipseObservationSigmaPx(frame.ellipses[hole]);
         frame.pose.automatic = estimator_.SolveDual(
             outer_observation, middle_observation, frame.pose.hole_center,
@@ -229,6 +233,7 @@ private:
         float best_score = -1.0f;
         for (int i = 0; i < detections.count; ++i) {
             const auto& detection = detections.results_box[i];
+            if (i >= static_cast<int>(ellipses.size()) || !ellipses[i].valid) continue;
             const float score = i < static_cast<int>(ellipses.size())
                                     ? EllipseSelectionScore(ellipses[i], detection.prop)
                                     : detection.prop;
@@ -269,16 +274,26 @@ public:
             cv::rectangle(frame.visualization,
                           {detection.x, detection.y, detection.w, detection.h}, {0, 0, 255}, 2);
             const auto& ellipse = frame.ellipses[i];
-            const cv::Scalar fit_color = ellipse.source == EllipseSource::Mask
+            const cv::Scalar fit_color = !ellipse.valid
+                                             ? cv::Scalar(0, 0, 255)
+                                         : ellipse.partial_visibility
+                                             ? cv::Scalar(0, 165, 255)
+                                         : ellipse.source == EllipseSource::Mask
                                              ? cv::Scalar(0, 255, 0)
                                              : (ellipse.source == EllipseSource::Edge
                                                     ? cv::Scalar(255, 0, 255)
                                                     : cv::Scalar(0, 255, 255));
             cv::ellipse(frame.visualization, ellipse.ellipse, fit_color, 2);
+            if (ellipse.partial_visibility) {
+                for (size_t p = 0; p < ellipse.visible_arc_points.size(); p += 4)
+                    cv::circle(frame.visualization, ellipse.visible_arc_points[p],
+                               1, {0, 165, 255}, -1);
+            }
             cv::putText(frame.visualization,
                         "cls=" + std::to_string(detection.cls_id) +
-                            " " + cv::format("%s q=%.2f", EllipseSourceName(ellipse.source),
-                                             ellipse.quality),
+                            " " + cv::format("%s q=%.2f%s", EllipseSourceName(ellipse.source),
+                                             ellipse.quality,
+                                             ellipse.partial_visibility ? " PARTIAL" : ""),
                         {detection.x, std::max(18, detection.y - 5)},
                         cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 2);
         }
@@ -346,7 +361,7 @@ private:
 
     static void write_ellipses(const fs::path& path, const FrameContext& frame) {
         std::ofstream output(path);
-        output << "# class_id center_x center_y major_axis minor_axis angle confidence source quality inlier_ratio inliers mean_error_px coverage_deg quadrants center_std major_std minor_std angle_std cov_condition geometry_ok temporal conic00 conic01 conic02 conic11 conic12 conic22\n"
+        output << "# class_id center_x center_y major_axis minor_axis angle confidence source valid quality inlier_ratio inliers mean_error_px coverage_deg quadrants border_truncated partial visible_arc_ratio removed_border_points support_points center_std major_std minor_std angle_std cov_condition geometry_ok temporal conic00 conic01 conic02 conic11 conic12 conic22\n"
                << std::fixed << std::setprecision(6);
         for (int i = 0; i < frame.detections.count; ++i) {
             const auto& d = frame.detections.results_box[i];
@@ -355,9 +370,12 @@ private:
                    << std::max(e.ellipse.size.width, e.ellipse.size.height) << ' '
                    << std::min(e.ellipse.size.width, e.ellipse.size.height) << ' '
                    << e.ellipse.angle << ' ' << d.prop << ' '
-                   << EllipseSourceName(e.source) << ' ' << e.quality << ' '
+                   << EllipseSourceName(e.source) << ' ' << e.valid << ' ' << e.quality << ' '
                    << e.inlier_ratio << ' ' << e.inliers << ' ' << e.mean_error_px << ' '
                    << e.angular_coverage_deg << ' ' << e.occupied_quadrants << ' '
+                   << e.border_truncated << ' ' << e.partial_visibility << ' '
+                   << e.visible_arc_ratio << ' ' << e.removed_border_points << ' '
+                   << e.visible_arc_points.size() << ' '
                    << e.center_std_px << ' ' << e.major_axis_std_px << ' '
                    << e.minor_axis_std_px << ' ' << e.angle_std_deg << ' '
                    << e.covariance_condition << ' ' << e.geometry_consistent << ' '

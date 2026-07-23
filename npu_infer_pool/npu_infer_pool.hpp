@@ -277,6 +277,8 @@ private:
             const auto &d = result.results_box[i];
             if (d.cls_id != cls_id)
                 continue;
+            if (i >= static_cast<int>(ellipses.size()) || !ellipses[i].valid)
+                continue;
             double s = i < static_cast<int>(ellipses.size())
                            ? EllipseSelectionScore(ellipses[i], static_cast<float>(det_score(d)))
                            : det_score(d);
@@ -412,13 +414,26 @@ private:
             EllipseFitResult ellipse_result = ellipse_fitter.Fit(
                 fitting_image, detection_rect, raw_mask_ptr, fit_mode,
                 mask_probability_ptr);
-            const cv::Scalar e_color = ellipse_result.source == EllipseSource::Mask
+            // 橙色明确标记“部分可见但仍可解”；红色表示可见弧不足、仅保留诊断结果。
+            const cv::Scalar e_color = !ellipse_result.valid
+                                           ? cv::Scalar(0, 0, 255)
+                                       : ellipse_result.partial_visibility
+                                           ? cv::Scalar(0, 165, 255)
+                                       : ellipse_result.source == EllipseSource::Mask
                                            ? cv::Scalar(0, 255, 0)
                                            : (ellipse_result.source == EllipseSource::Edge
                                                   ? cv::Scalar(255, 0, 255)
                                                   : cv::Scalar(0, 255, 255));
             cv::ellipse(frame, ellipse_result.ellipse, e_color, 2);
             cv::circle(frame, ellipse_result.ellipse.center, 2, cv::Scalar(0, 0, 255), -1);
+            if (ellipse_result.partial_visibility)
+            {
+                for (size_t point_index = 0;
+                     point_index < ellipse_result.visible_arc_points.size();
+                     point_index += 4)
+                    cv::circle(frame, ellipse_result.visible_arc_points[point_index],
+                               1, cv::Scalar(0, 165, 255), -1);
+            }
 
             ellipse_results.push_back(std::move(ellipse_result));
 
@@ -554,10 +569,14 @@ private:
         std::optional<PoseEllipseObservation> middle_observation;
         if (has0)
             outer_observation = PoseEllipseObservation{cand0.ellipse,
-                                                       EllipseObservationSigmaPx(cand0), true};
+                                                       EllipseObservationSigmaPx(cand0), true,
+                                                       cand0.visible_arc_points,
+                                                       cand0.partial_visibility};
         if (has1)
             middle_observation = PoseEllipseObservation{cand1.ellipse,
-                                                        EllipseObservationSigmaPx(cand1), true};
+                                                        EllipseObservationSigmaPx(cand1), true,
+                                                        cand1.visible_arc_points,
+                                                        cand1.partial_visibility};
         const double hole_sigma = EllipseObservationSigmaPx(hole_ellipse);
 
         // 双圆共享同一3D位姿，以各自协方差加权重投影残差。

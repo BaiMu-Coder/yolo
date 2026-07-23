@@ -1,8 +1,10 @@
 #pragma once
 #include <opencv2/opencv.hpp>
 #include <opencv2/calib3d.hpp>
+#include <array>
 #include <vector>
 #include <cmath>
+#include <limits>
 #include <optional>
 
 // 锥套物理尺寸大小，单位mm
@@ -29,6 +31,11 @@ struct PoseEllipseObservation
     cv::RotatedRect ellipse;
     double sigma_px = 10.0;
     bool valid = false;
+
+    // 出视场时不要把“由短弧外推得到的完整椭圆”当成绝对真值。拟合器将真正
+    // 可见的弧段内点传到这里，位姿优化可直接约束这些像素点到预测圆锥曲线的距离。
+    std::vector<cv::Point2f> visible_arc_points;
+    bool partial_visibility = false;
 };
 
 inline static double pose_estimator_clamp(double val, double min, double max)
@@ -151,11 +158,51 @@ public:
             initializer_is_middle = true;
         }
         if (initializer == nullptr) return {};
+        // 完整椭圆可先做少量单圈 LM 获得更好的吸引域；部分弧外推椭圆的中心和
+        // 长轴可能有偏差，只用它生成透视近似初值，随后直接交给可见弧联合残差。
+        const int initializer_iterations = initializer->partial_visibility ? 0 : 8;
         Pose6D initial = Solve(initializer->ellipse, hole_center_px,
-                               initializer_is_middle, known_dist_mm, 8);
+                               initializer_is_middle, known_dist_mm,
+                               initializer_iterations);
         std::vector<double> x;
         if (known_dist_mm) x = {initial.yaw_deg, initial.pitch_deg, initial.tx_mm, initial.ty_mm};
         else x = {initial.yaw_deg, initial.pitch_deg, initial.tx_mm, initial.ty_mm, initial.tz_mm};
+
+        // 短弧目标函数的吸引域比完整椭圆小。仅在部分可见时做轻量多初值搜索，
+        // 从初始姿态及 yaw/pitch ±12° 五个假设中选择重投影代价最低者；正常完整
+        // 圆环不增加任何计算量。粗搜索后仍由下方完整 LM 做最终精修。
+        const bool has_partial =
+            (outer && outer->valid && outer->partial_visibility) ||
+            (middle && middle->valid && middle->partial_visibility);
+        if (has_partial)
+        {
+            const std::array<std::array<double, 2>, 5> offsets{{
+                {{0.0, 0.0}}, {{-12.0, 0.0}}, {{12.0, 0.0}},
+                {{0.0, -12.0}}, {{0.0, 12.0}}
+            }};
+            std::vector<double> best_seed = x;
+            double best_cost = std::numeric_limits<double>::infinity();
+            for (const auto &offset : offsets)
+            {
+                std::vector<double> seed = x;
+                seed[0] += offset[0];
+                seed[1] += offset[1];
+                lmOptimizeDual(seed, outer, middle, hole_center_px,
+                               std::max(0.5, hole_sigma_px), known_dist_mm, 8);
+                std::vector<double> seed_residual;
+                computeResidualDual(seed, outer, middle, hole_center_px,
+                                    std::max(0.5, hole_sigma_px), known_dist_mm,
+                                    seed_residual);
+                double cost = 0.0;
+                for (const double value : seed_residual) cost += value * value;
+                if (std::isfinite(cost) && cost < best_cost)
+                {
+                    best_cost = cost;
+                    best_seed = std::move(seed);
+                }
+            }
+            x = std::move(best_seed);
+        }
         lmOptimizeDual(x, outer, middle, hole_center_px,
                        std::max(0.5, hole_sigma_px), known_dist_mm, max_iters);
         const double tz = known_dist_mm ? *known_dist_mm : x[4];
@@ -284,8 +331,17 @@ private:
         if (tz < 100.0)
         {
             size_t expected = 2;
-            if (outer && outer->valid) expected += pts3d_cls0_.size();
-            if (middle && middle->valid) expected += pts3d_cls1_.size();
+            auto residual_count = [](const std::optional<PoseEllipseObservation> &observation,
+                                     size_t complete_ring_count)
+            {
+                if (!observation || !observation->valid) return size_t{0};
+                if (observation->partial_visibility &&
+                    observation->visible_arc_points.size() >= 5)
+                    return observation->visible_arc_points.size();
+                return complete_ring_count;
+            };
+            expected += residual_count(outer, pts3d_cls0_.size());
+            expected += residual_count(middle, pts3d_cls1_.size());
             residual.assign(expected, 1e4);
             return;
         }
@@ -298,6 +354,35 @@ private:
             std::vector<cv::Point2f> projected;
             cv::projectPoints(circle, rvec, tvec, K_, D_, projected);
             const double sigma = std::max(0.5, observation->sigma_px);
+
+            // 部分可见分支（pose-first visible-arc refinement）：
+            // 先把当前位姿下的完整 3D 圆环投影成预测椭圆，再计算“实际可见弧点”
+            // 到预测椭圆的 Sampson 距离。它不需要圆周点一一对应，并避免短弧拟合
+            // 出来的中心/长轴误差被 LM 放大。残差个数固定，数值雅可比才保持稳定。
+            if (observation->partial_visibility &&
+                observation->visible_arc_points.size() >= 5)
+            {
+                try
+                {
+                    const cv::RotatedRect predicted = cv::fitEllipseDirect(projected);
+                    for (const cv::Point2f &point : observation->visible_arc_points)
+                    {
+                        const double standardized =
+                            ellipse_sampson_residual(predicted, point) / sigma;
+                        residual.push_back(signed_pseudo_huber(standardized, 2.5));
+                    }
+                }
+                catch (const cv::Exception &)
+                {
+                    // 极端退化姿态下 fitEllipseDirect 可能失败。保持残差维度不变并
+                    // 返回大代价，让 LM 自动拒绝该次试探步。
+                    residual.insert(residual.end(),
+                                    observation->visible_arc_points.size(), 1e4);
+                }
+                return;
+            }
+
+            // 完整目标沿用原来的“投影圆周点 -> 观测椭圆”残差，正常场景不改行为。
             for (const cv::Point2f &point : projected)
             {
                 const double standardized = ellipse_sampson_residual(observation->ellipse, point) / sigma;

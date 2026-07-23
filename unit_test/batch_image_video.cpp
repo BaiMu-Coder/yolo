@@ -121,6 +121,7 @@ static int best_index(const object_detect_result_list& result,
     float score = -1.0f;
     for (int i = 0; i < result.count; ++i) {
         if (result.results_box[i].cls_id != class_id || i >= static_cast<int>(ellipses.size())) continue;
+        if (!ellipses[i].valid) continue;
         const float candidate = EllipseSelectionScore(ellipses[i], result.results_box[i].prop);
         if (candidate > score) { best = i; score = candidate; }
     }
@@ -182,7 +183,7 @@ public:
         std::ofstream pose_file(dirs.poses / (key + ".txt"));
         if (!yolo_file || !ellipse_file || !pose_file) return fail(key, "cannot create txt output");
         yolo_file << std::fixed << std::setprecision(8);
-        ellipse_file << "# class_id center_x_px center_y_px major_axis_px minor_axis_px angle_deg confidence fit_source quality inlier_ratio inliers mean_error_px coverage_deg quadrants center_std_px major_std_px minor_std_px angle_std_deg cov_condition geometry_ok temporal conic00 conic01 conic02 conic11 conic12 conic22\n"
+        ellipse_file << "# class_id center_x_px center_y_px major_axis_px minor_axis_px angle_deg confidence fit_source valid quality inlier_ratio inliers mean_error_px coverage_deg quadrants border_truncated partial visible_arc_ratio removed_border_points support_points center_std_px major_std_px minor_std_px angle_std_deg cov_condition geometry_ok temporal conic00 conic01 conic02 conic11 conic12 conic22\n"
                      << std::fixed << std::setprecision(6);
 
         for (int i = 0; i < result.count; ++i) {
@@ -231,16 +232,26 @@ public:
                 cv::addWeighted(overlay, 0.5, visualization, 0.5, 0.0, visualization);
             }
             cv::rectangle(visualization, {detection.x, detection.y, detection.w, detection.h}, {0, 0, 255}, 2);
-            const cv::Scalar fit_color = ellipse.source == EllipseSource::Mask
+            const cv::Scalar fit_color = !ellipse.valid
+                                             ? cv::Scalar(0, 0, 255)
+                                         : ellipse.partial_visibility
+                                             ? cv::Scalar(0, 165, 255)
+                                         : ellipse.source == EllipseSource::Mask
                                              ? cv::Scalar(0, 255, 0)
                                              : (ellipse.source == EllipseSource::Edge
                                                     ? cv::Scalar(255, 0, 255)
                                                     : cv::Scalar(0, 255, 255));
             cv::ellipse(visualization, ellipse.ellipse, fit_color, 2);
             cv::circle(visualization, ellipse.ellipse.center, 2, {0, 0, 255}, -1);
+            if (ellipse.partial_visibility) {
+                for (size_t p = 0; p < ellipse.visible_arc_points.size(); p += 4)
+                    cv::circle(visualization, ellipse.visible_arc_points[p], 1,
+                               {0, 165, 255}, -1);
+            }
             const std::string label = "cls=" + std::to_string(class_id) + " conf=" +
-                                      cv::format("%.2f q=%.2f %s", detection.prop,
-                                                 ellipse.quality, EllipseSourceName(ellipse.source));
+                                      cv::format("%.2f q=%.2f %s%s", detection.prop,
+                                                 ellipse.quality, EllipseSourceName(ellipse.source),
+                                                 ellipse.partial_visibility ? " PARTIAL" : "");
             cv::putText(visualization, label, {detection.x, std::max(18, detection.y - 5)},
                         cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 2);
         }
@@ -268,10 +279,14 @@ public:
                          << std::max(ellipse.ellipse.size.width, ellipse.ellipse.size.height) << ' '
                          << std::min(ellipse.ellipse.size.width, ellipse.ellipse.size.height) << ' '
                          << ellipse.ellipse.angle << ' ' << detection.prop << ' '
-                         << EllipseSourceName(ellipse.source) << ' ' << ellipse.quality << ' '
+                         << EllipseSourceName(ellipse.source) << ' ' << ellipse.valid << ' '
+                         << ellipse.quality << ' '
                          << ellipse.inlier_ratio << ' ' << ellipse.inliers << ' '
                          << ellipse.mean_error_px << ' ' << ellipse.angular_coverage_deg << ' '
-                         << ellipse.occupied_quadrants << ' ' << ellipse.center_std_px << ' '
+                         << ellipse.occupied_quadrants << ' ' << ellipse.border_truncated << ' '
+                         << ellipse.partial_visibility << ' ' << ellipse.visible_arc_ratio << ' '
+                         << ellipse.removed_border_points << ' '
+                         << ellipse.visible_arc_points.size() << ' ' << ellipse.center_std_px << ' '
                          << ellipse.major_axis_std_px << ' ' << ellipse.minor_axis_std_px << ' '
                          << ellipse.angle_std_deg << ' ' << ellipse.covariance_condition << ' '
                          << ellipse.geometry_consistent << ' ' << ellipse.temporally_filtered << ' '
@@ -328,10 +343,12 @@ private:
         std::optional<PoseEllipseObservation> middle_observation;
         if (outer >= 0)
             outer_observation = PoseEllipseObservation{ellipses[outer].ellipse,
-                EllipseObservationSigmaPx(ellipses[outer]), true};
+                EllipseObservationSigmaPx(ellipses[outer]), true,
+                ellipses[outer].visible_arc_points, ellipses[outer].partial_visibility};
         if (middle >= 0)
             middle_observation = PoseEllipseObservation{ellipses[middle].ellipse,
-                EllipseObservationSigmaPx(ellipses[middle]), true};
+                EllipseObservationSigmaPx(ellipses[middle]), true,
+                ellipses[middle].visible_arc_points, ellipses[middle].partial_visibility};
         const double hole_sigma = EllipseObservationSigmaPx(ellipses[hole]);
         const Pose6D pose_auto = pose_estimator_.SolveDual(
             outer_observation, middle_observation, hole_center, hole_sigma, std::nullopt);

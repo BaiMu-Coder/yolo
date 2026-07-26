@@ -6,13 +6,100 @@
 `unit_test/final_version.py` 直接加载转换前的实例分割 `.pt` 模型，保留软 mask、
 亚像素椭圆拟合、不确定度评估和双圆环联合 LM 位姿解算，并保存标注视频、逐帧图片、
 mask、位姿 TXT、检测 JSONL 和位姿曲线。
+服务器版本默认采用 FP32；按配置尺寸执行固定画布 letterbox、Mask 亚像素梯度、RANSAC、
+椭圆 LM 和位姿 LM 参数均与板端保持一致。
 
-项目已创建 `.venv-yolo` 环境。把 PT 模型放到项目目录（默认文件名 `best.pt`），然后运行：
+甲方演示机的验证基线是 `ultralytics==8.0.175`，代码同时保留 Ultralytics 8.x
+兼容性；效果优先入口通过运行时能力检测直接保留阈值化前的软 Mask。把 PT 模型
+放到项目目录（默认文件名 `best.pt`），然后运行：
 
 ```bash
 .venv-yolo/bin/python unit_test/final_version.py \
-  --model best.pt --video input.mp4 --output output_python --no-show
+  --model best.pt --video input.mp4 --output output_python \
+  --imgsz 1024 --no-show
 ```
+
+PT 模型推理尺寸可在配置区修改 `image_size`，也可在命令行使用
+`--imgsz 640`、`--imgsz 1024` 或 `--imgsz 768 1024`（顺序为 H W）。
+`batch_mask_ring_visualization.py` 复用同一套参数。PT 模型通常支持运行时尺寸切换；
+RKNN 则采用后文说明的多个静态模型文件。
+
+### 检测框误差与外圈椭圆 IoU 评估
+
+`unit_test/yolo_mask_bbox_error.py` 已改为配置区优先。修改文件顶部
+`EvaluationConfig` 中的模型、图片、标签和输出路径后直接运行：
+
+```bash
+python unit_test/yolo_mask_bbox_error.py
+```
+
+脚本保留原有七项检测框像素误差，同时只对 `cls0` 最外圈复用
+`final_version.py` 的稳健 Mask 椭圆拟合，计算标签多边形与填充拟合椭圆的像素 IoU。
+结果按拟合椭圆完整长轴直径 `max(width, height)` 分为：
+
+- 小目标：`major < 77 px`；
+- 中目标：`77 px <= major <= 311 px`；
+- 大目标：`major > 311 px`。
+
+输出已精简为两个目录：
+
+```text
+误差评估结果/
+├── detection/
+│   ├── detection_statistics.xlsx
+│   ├── grouped_errors.png
+│   ├── visualizations/
+│   ├── over_threshold/
+│   └── top10_max_error/
+└── ellipse_iou/
+    ├── ellipse_iou_statistics.xlsx
+    ├── overall_and_grouped.png
+    ├── visualizations/
+    └── lowest_50/
+```
+
+检测总体统计覆盖所有检测成功样本；小、中、大分组只统计具有有效拟合外圈长轴的
+样本。`top10_max_error/` 按每张图片七项误差中的最大值统一排序，不再按七个指标
+重复保存。检测工作簿包含“总体误差”“分组误差”“逐图误差”和
+“总体最大误差Top10”工作表；逐图表中每张图片固定一行，失败样本也保留状态。
+
+IoU 工作簿包含总体及三档的样本占比、平均值、最小值、最大值和 P95，以及评估状态、
+逐图 IoU 和最低50排行。`overall_and_grouped.png` 用均值柱、P95 标记和最小—最大
+范围直观展示统计结果。`ellipse_iou/visualizations/` 保存全部独立 IoU 可视化：
+绿色边界为 cls0 标签外圈，红色边界为拟合椭圆；绿色填充表示仅标签、红色表示仅
+椭圆、黄色表示交集。IoU 最低的 50 张另存到 `lowest_50/`。
+
+Excel 输出依赖 `openpyxl`。如果服务器没有安装该库，或 Excel 写入失败，脚本不会
+停止，而会自动回退为同等内容的 UTF-8-BOM TXT；两张统计 PNG 仍会正常生成。
+命令行参数仍可临时覆盖配置，例如 `--imgsz 1024 --device 0`。
+
+板端可使用同步的 RKNN/C++ 评估入口，统计口径、长轴分组、Top10、最低50和目录
+结构与 Python 版一致：
+
+```bash
+cmake -S . -B build
+cmake --build build --target yolo_mask_bbox_error -j
+cmake --install build
+
+./install/yolo_mask_bbox_error \
+  --model ./best_1024.rknn \
+  --images /data/evaluation/images \
+  --labels /data/evaluation/labels \
+  --output /data/evaluation/result \
+  --threshold 3
+```
+
+C++ 版不增加板端表格依赖，直接写 Excel 2003 XML 多工作表：
+`detection/detection_statistics.xml` 和
+`ellipse_iou/ellipse_iou_statistics.xml`，Excel/WPS 可直接打开。检测工作簿包含
+总体、分组、逐图和 Top10；IoU 工作簿包含总体/分组、状态占比、逐图和最低50。
+若工作簿创建失败，程序自动回退为制表符分隔 TXT。IoU 同时生成
+`ellipse_iou/overall_and_grouped.png`，显示均值、P95、最小—最大范围和分组占比。
+模型输入尺寸仍由 RKNN 张量自动读取，640、1024 或相同输出拓扑的其他尺寸无需修改
+该评估程序。
+
+仓库内默认模型、视频和输出路径已经按项目根目录自动解析；在带桌面的演示机上也可
+直接运行 `.venv-yolo/bin/python unit_test/final_version.py`。
 
 摄像头或图片目录输入：
 
@@ -71,6 +158,41 @@ cmake --build build --target batch_image_video -j
 cmake --install build
 ```
 
+### RKNN 640/1024 模型通用切换
+
+板端采用两个独立的静态 RKNN 模型，例如 `best_640.rknn` 和
+`best_1024.rknn`。程序启动时从 `--model` 指定的文件读取输入张量、三个检测网格和
+Proto 张量尺寸，预处理与后处理不再维护另一份手写的输入尺寸配置，也不需要额外传
+`--input-size`：
+
+```bash
+# 640 模型
+./install/batch_image_video --model ./best_640.rknn \
+  --input-path /data/images --output-path /data/result_640
+
+# 1024 模型：仅替换模型路径
+./install/batch_image_video --model ./best_1024.rknn \
+  --input-path /data/images --output-path /data/result_1024
+```
+
+启动日志会打印实际解析结果。典型 640 模型应显示输入 `640x640`、检测网格
+`80x80 / 40x40 / 20x20`、Proto `160x160`；典型 1024 模型通常对应
+`128x128 / 64x64 / 32x32` 和 Proto `256x256`。程序以模型内真实张量为准，不依赖
+这些典型数值，也支持相同输出拓扑下的其他静态宽高。
+
+模型兼容条件是 3 个检测分支，每个分支均为
+`[box, class, class_sum, mask_coeff]`，最后一个输出为 Proto；量化模型的原始输出须为
+affine INT8。模型不符合条件时会在初始化阶段明确报错，避免按错误尺寸继续推理。
+
+相机采集分辨率与网络输入分辨率是两件事：只把模型由 640 换成 1024 时，相机标定
+内参不变；若同时改变了相机实际输出分辨率，则应使用对应分辨率重新标定，或按图像
+缩放关系同步调整 `fx/fy/cx/cy`。1024 相比 640 的特征图和 Proto 像素数约为
+2.56 倍，通常能改善小目标和边界细节，但 NPU、Mask 解码和内存带宽开销也会增加，
+是否提升最终精度应使用甲方数据集对比验证。
+
+实时相机入口如需调整采集尺寸，使用
+`--camera-width W --camera-height H`；这两个参数不会覆盖 RKNN 模型输入尺寸。
+
 处理图片文件夹：
 
 ```bash
@@ -110,9 +232,10 @@ cmake --install build
 后处理、椭圆拟合、时序处理和结果保存代码，仅精简最终画面：
 
 - 保留实例 Mask 叠加；
+- 所有实例显示红色检测框；
 - cls0 外圈拟合椭圆使用青色；
 - cls1 中圈拟合椭圆使用紫色；
-- 不显示检测框、内孔椭圆、中心点、可见弧散点、文字和姿态轴。
+- 不显示内孔椭圆、中心点、可见弧散点、文字和姿态轴。
 
 图片目录：
 
@@ -138,24 +261,57 @@ cmake --install build
 输出目录仍为 `visual/`、`labels/`、`ellipses/`、`poses/`，视频结果仍保存为
 `<视频名>_result.mp4`；TXT 字段与完整版完全一致，方便两种画面直接对照。
 
-### C++ 单帧模块化示例
+服务器 PT 模型可使用对应 Python 入口，参数和输出目录保持一致：
 
-`unit_test/single_frame_pipeline.cpp` 把单帧流程拆成六个互相独立的小模块：
+```bash
+python unit_test/batch_mask_ring_visualization.py \
+  --model best.pt \
+  --input-path /data/images \
+  --mode images \
+  --output-path /data/ring_demo \
+  --device 0 \
+  --no-show
+```
+
+### C++ 串行批量性能分析
+
+`unit_test/single_frame_pipeline.cpp` 把处理流程拆成六个互相独立的小模块：
 `ImageLoader`、`RknnInference`、`EllipseFitter`、`PoseSolver`、`Visualizer` 和
-`ResultWriter`。模块之间只通过 `FrameContext` 传递结果，不修改项目原有接口。
+`ResultWriter`。现在支持处理单张图片或目录内全部图片，并且只针对算法真实环节计时：
+图片读取、预处理、RKNN 推理、后处理、椭圆拟合和位姿解算。
 
 ```bash
 cmake --build build --target single_frame_pipeline -j
 ./install/single_frame_pipeline \
   --model ./best.rknn \
-  --image /data/input/test.jpg \
-  --output /data/result \
-  --show
+  --input-path /data/input/images \
+  --output /data/performance_result
 ```
 
-单帧入口同样支持 `--hole-mask` 和 `--force-reference-box`。
+`--image /data/input/test.jpg` 仍可测试单张图片；子目录数据使用 `--recursive`。
+该入口同样支持 `--hole-mask` 和 `--force-reference-box`。
 
-它会为这一帧保存可视化图片、YOLO 检测 TXT、椭圆 TXT，以及自动距离和固定距离两套位姿 TXT。
+程序默认每处理完一张图片就在屏幕显示一次完整可视化，但可视化绘制和
+`imshow/waitKey` 不计入任何阶段耗时。无桌面板端可传 `--no-show`。该性能入口不保存
+检测图片、标签、椭圆或位姿，只保存耗时统计：
+
+```text
+performance_result/timing/
+├── per_image_timing.csv
+├── timing_summary.csv
+└── charts/
+    ├── 01_read.png
+    ├── 02_preprocess.png
+    ├── 03_rknn_inference.png
+    ├── 04_postprocess.png
+    ├── 05_ellipse_fit.png
+    └── 06_pose_solve.png
+```
+
+汇总表逐阶段给出样本数、平均值、P95、最小值、最大值和平均耗时对应的理论 FPS；
+每张图同时标出逐图曲线、平均值线和 P95 线。该程序严格串行，测量的是单帧阶段延迟，
+适合定位在线多线程入口中的 CPU/NPU 瓶颈。可视化、窗口刷新和统计文件自身的写盘
+耗时均明确排除在统计之外。
 
 ## 圆环拟合现场切换
 
@@ -168,11 +324,13 @@ cmake --build build --target single_frame_pipeline -j
 ```text
 推理入口选择 EllipseFitMode
     -> EllipseFitter::Fit                 总调度及 Box 回退
-    -> CollectMaskPoints                  Mask 轮廓、边界假轮廓剔除和 p=0.5 亚像素修正
-    -> BuildCandidate
+    -> CollectMaskPoints                  图像/检测框假边剔除和 p=0.5 亚像素修正
+    -> CollectOuterRadialEnvelope         C形/环形 Mask 的径向最外层可见弧
+    -> BuildCandidate / BuildGlobalCandidate
        -> FitRansac                       PROSAC 式采样和 LO-RANSAC
        -> RefineSampson                   Huber-Sampson LM 和协方差
        -> UpdateGeometryStatistics        覆盖度、标准差及退化门控
+    -> MaskCandidateScore                 外层凸包 IoU + 全局 q90 残差选优
     -> RingPairRefiner                    外圈/中圈物理一致性选择
     -> EllipseTemporalFilter              视频质量自适应 EMA
     -> EllipseObservationSigmaPx          转为联合位姿解算的观测权重
@@ -188,10 +346,14 @@ cmake --build build --target single_frame_pipeline -j
 Mask；Box 兜底同样是可用结果，判断来源应读取 `source`。
 
 默认外圈/中圈只采用两级策略：高质量 Mask 椭圆，或检测框内切圆。参考圈不执行灰度 Edge 拟合。
-Mask 路径先从分割概率的 0.5 等值线获得亚像素轮廓，再用质量排序采样、直接最小二乘初值、
-LO-RANSAC 局部重拟合和 Huber-Sampson LM 精修。候选必须通过内点率、轮廓角度/象限覆盖、检测框偏差、
-轴比及协方差条件数门控。完整目标不合格时回退内切圆；出视场目标若可见弧不足则标记无效，避免裁剪后的检测框
-产生错误几何。需要无条件保底时再显式开启强制内切圆。
+Mask 路径先从分割概率的 0.5 等值线获得亚像素轮廓，并删除图像边界及检测框裁剪产生的假直线。
+对普通完整 Mask，同时生成稳健 RANSAC 候选和 Direct/AMS/标准拟合的全轮廓候选；对机械臂遮挡
+形成的 C 形/环形 Mask，按角度只保留径向最外侧点并自动识别连续缺口，以开放外圆弧生成第三类候选。
+最终按照外层轮廓凸包 IoU（70%）和全局 q90 Sampson 残差（30%）选优，小目标的内点门限随检测框
+短边自适应收紧。Python/PT 与共享 C++ `EllipseFitter` 使用相同参数、候选和回退规则。
+候选还必须通过内点率、轮廓角度/象限覆盖、检测框偏差、轴比及协方差条件数门控。完整目标不合格时
+回退内切圆；出视场目标若可见弧不足则标记无效，避免裁剪后的检测框产生错误几何。需要无条件保底时
+再显式开启强制内切圆。
 
 两圈同时存在时，先做尺寸比、中心偏移、轴比和方向的几何门控，但不强制两个投影椭圆在图像上同心。
 位姿层把外圈和中圈作为同一组共轴 3D 圆，在同一 LM 中联合重投影，并用各自拟合协方差换算的像素标准差加权。

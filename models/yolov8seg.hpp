@@ -36,10 +36,30 @@ class yolov8seg
 
 
  int post_process(object_detect_result_list& result , letterbox& letter_box);
- 
 
+ /**
+  * @brief 从 RKNN 张量属性解析出的模型规格。
+  *
+  * 业务层只读取这里的尺寸，不再写死 640、80/40/20 或 Proto 160。
+  * 因此启动时更换 640/1024 静态 RKNN 文件即可自动切换预处理和后处理。
+  */
+ struct ModelSpec
+ {
+   int input_width = 0;
+   int input_height = 0;
+   int input_channels = 0;
+   int proto_width = 0;
+   int proto_height = 0;
+   int proto_channels = 0;
+   int proto_output_index = -1;
+   std::vector<cv::Size> detection_grids;
+ };
 
-
+ const ModelSpec& model_spec() const noexcept { return _model_spec; }
+ cv::Size model_input_size() const noexcept
+ {
+   return {_model_spec.input_width, _model_spec.input_height};
+ }
 
  private:
  public:
@@ -71,6 +91,9 @@ class yolov8seg
   int _proto_channel;
   int _proto_width;
   int _proto_height;
+  int _proto_output_index = -1;
+  std::vector<int> _branch_output_indices;
+  ModelSpec _model_spec;
 
   //Proto反量化查表数据
    rknpu2::float16 _proto_table[256];

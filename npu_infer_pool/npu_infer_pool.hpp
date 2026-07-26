@@ -682,7 +682,18 @@ private:
             auto proc = std::move(job.proc);
 
             // NPU 前处理 & 推理（这里做一次就够了）
-            proc->image_preprocessing(640, 640);
+            // 每个静态 RKNN 上下文都公开自己的原生输入尺寸。切换640/1024模型
+            // 只需更换模型文件，线程池不再维护另一份容易配错的尺寸配置。
+            const cv::Size model_input =
+                _models[model_id]->model_input_size();
+            if (proc->image_preprocessing(model_input.width,
+                                          model_input.height) != 0)
+            {
+                _out_queue.push(
+                    InferOut{job.frame_id, nullptr,
+                             object_detect_result_list{}});
+                continue;
+            }
             int image_len = 0;
             uint8_t *buffer = proc->get_image_buffer(&image_len);
 
@@ -696,8 +707,16 @@ private:
             // 后处理
             object_detect_result_list result;
             letterbox letter_box = proc->get_letterbox();
-            if (_models[model_id]->post_process(result, letter_box) != RKNN_SUCC)
-                break;
+            const int post_status =
+                _models[model_id]->post_process(result, letter_box);
+            _models[model_id]->release_output_data();
+            if (post_status != RKNN_SUCC)
+            {
+                _out_queue.push(
+                    InferOut{job.frame_id, nullptr,
+                             object_detect_result_list{}});
+                continue;
+            }
 
             std::shared_ptr<image_process> shared_proc = std::move(proc);
 

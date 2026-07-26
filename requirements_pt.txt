@@ -1,6 +1,7 @@
-# 推荐 Python 3.8；当前项目 .venv-yolo 已按下列兼容组合配置。
-ultralytics==8.3.0
+# 甲方演示机基线为 Python 3.8 + ultralytics 8.0.175；代码同时兼容后续 8.x。
+ultralytics>=8.0.175,<9
 torch==2.1.0
 torchvision==0.16.0
 opencv-python>=4.6,<5
 numpy>=1.23,<2
+openpyxl>=3.0,<4

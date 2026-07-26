@@ -43,10 +43,15 @@ static void compute_dfl(std::vector<float> &before_dfl, const int dfl_len, float
 }
 
 
-void process_i8_index12_init(std::unique_ptr<rknn_tensor_attr[]> &output_tensor, rknpu2::float16 table[])
+void process_i8_proto_table_init(
+    std::unique_ptr<rknn_tensor_attr[]> &output_tensor,
+    int proto_output_index,
+    rknpu2::float16 table[])
 {
-    int32_t zp_proto = output_tensor[12].zp;
-    float scale_proto = output_tensor[12].scale; //这两值是做反量化的
+    // Proto 不再假定固定为第12个输出。当前模型拓扑约定最后一个输出为 Proto，
+    // 具体索引由 yolov8seg::init() 校验后传入。
+    int32_t zp_proto = output_tensor[proto_output_index].zp;
+    float scale_proto = output_tensor[proto_output_index].scale;
     
     //因为input_proto就-128到127种可能，直接把结果全算出来，然后查表找答案就行
      for (int i = -128; i < 128; ++i) 
@@ -60,18 +65,19 @@ void process_i8_index12_init(std::unique_ptr<rknn_tensor_attr[]> &output_tensor,
 
 
 int process_i8(std::unique_ptr<rknn_output[]>& output,std::unique_ptr<rknn_tensor_attr[]>& output_tensor,int index,         //输出信息  和  索引
-     int grid_w, int grid_h, int model_w, int model_h, int stride,                    //格子大小（输出的大小）  ;  模型输入的大小  stride（步长/下采样倍数） ——也就是该输出特征图上 1 个网格格子对应输入图像上多少个像素。
+     int grid_w, int grid_h, float stride_x, float stride_y,
      std::vector<float>& candidate_box ,std::vector<float>& box_score,std::vector<int>& class_id,  //候选框  置信度  类别
     std::unique_ptr<rknpu2::float16[]>& proto,std::vector<rknpu2::float16>& box_mask_coefficient,
     int proto_channel,int proto_width,int proto_height ,    //掩码系数部分
      float box_threshold ,   //NMS阈值  
-     rknpu2::float16 proto_table[])    //proto反量化查表                                
+     rknpu2::float16 proto_table[], int proto_output_index)
 {
 
   TIMER xx;
 
-  // Skip if input_id is not 0, 4, 8, or 12
-  if (index % 4 != 0)
+  // 检测分支仍采用 [box, score, score_sum, mask_coeff] 四张量一组；
+  // Proto 是初始化时识别出的最后一个输出，不再写死索引12。
+  if (index != proto_output_index && index % 4 != 0)
   {
     return 0;
   }
@@ -80,7 +86,7 @@ int process_i8(std::unique_ptr<rknn_output[]>& output,std::unique_ptr<rknn_tenso
   int grid_len = grid_w * grid_h;
 
 
-  if (index == 12)
+  if (index == proto_output_index)
   {
       xx.tik();
     /**
@@ -107,7 +113,7 @@ int process_i8(std::unique_ptr<rknn_output[]>& output,std::unique_ptr<rknn_tenso
     }
 
     xx.tok();
-xx.print_time("index == 12");
+xx.print_time("decode proto tensor");
      return 0;
   }
 
@@ -216,10 +222,10 @@ xx.print_time("index == 12");
         compute_dfl(before_dfl, dfl_len, box); // ltrb 它们都是“以当前网格(i,j对应的那个网格)的中心为原点，向四个方向延伸多少格”。
                                                // left  top  right  below
         float x1, y1, x2, y2, w, h;
-        x1 = (i + 0.5 - box[0]) * stride; // stride 用来网格数转像素坐标的
-        y1 = (j + 0.5 - box[1]) * stride; //+0.5是要走到网格的中心
-        x2 = (i + 0.5 + box[2]) * stride;
-        y2 = (j + 0.5 + box[3]) * stride;
+        x1 = (i + 0.5 - box[0]) * stride_x;
+        y1 = (j + 0.5 - box[1]) * stride_y;
+        x2 = (i + 0.5 + box[2]) * stride_x;
+        y2 = (j + 0.5 + box[3]) * stride_y;
      
         w = x2 - x1;
         h = y2 - y1;
@@ -244,14 +250,13 @@ xx.print_time("index == 12");
 }
 
 int process_fp32(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_tensor_attr[]> &output_tensor, int index,
-                 int grid_w, int grid_h, int model_w, int model_h, int stride,
+                 int grid_w, int grid_h, float stride_x, float stride_y,
                  std::vector<float> &candidate_box, std::vector<float> &box_score, std::vector<int> &class_id,
                  std::unique_ptr<rknpu2::float16[]> &proto, std::vector<rknpu2::float16> &box_mask_coefficient,
                  int proto_channel, int proto_width, int proto_height,
-                 float box_threshold)
+                 float box_threshold, int proto_output_index)
 {
-  //Skip if input_id is not 0, 4, 8, or 12
-  if (index % 4 != 0)
+  if (index != proto_output_index && index % 4 != 0)
   {
     return 0;
   }
@@ -259,7 +264,7 @@ int process_fp32(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_te
   int volid_count = 0;
   int grid_len = grid_w * grid_h;
 
-  if (index == 12)
+  if (index == proto_output_index)
   {
     float *input_proto = (float *)output[index].buf;
     for (int i = 0; i < proto_channel * proto_width * proto_height; i++)
@@ -358,10 +363,10 @@ int process_fp32(std::unique_ptr<rknn_output[]> &output, std::unique_ptr<rknn_te
         compute_dfl(before_dfl, dfl_len, box); // ltrb 它们都是“以当前网格(i,j对应的那个网格)的中心为原点，向四个方向延伸多少格”。
                                                // left  top  right  below
         float x1, y1, x2, y2, w, h;
-        x1 = (i + 0.5 - box[0]) * stride; // stride 用来网格数转像素坐标的
-        y1 = (j + 0.5 - box[1]) * stride; //+0.5是要走到网格的中心
-        x2 = (i + 0.5 + box[2]) * stride;
-        y2 = (j + 0.5 + box[3]) * stride;
+        x1 = (i + 0.5 - box[0]) * stride_x;
+        y1 = (j + 0.5 - box[1]) * stride_y;
+        x2 = (i + 0.5 + box[2]) * stride_x;
+        y2 = (j + 0.5 + box[3]) * stride_y;
         w = x2 - x1;
         h = y2 - y1;
         candidate_box.push_back(x1);
@@ -607,6 +612,34 @@ void matrix_mult_by_cpu_fp32(std::vector<rknpu2::float16>& A,std::unique_ptr<rkn
     }
 }
 
+static cv::Rect proto_content_roi(const letterbox &letter_box,
+                                  int proto_width,
+                                  int proto_height)
+{
+  // LetterBox padding 位于模型输入坐标系，Proto 位于独立特征图坐标系。
+  // 使用实际宽高比例映射，兼容 640->160、1024->256 以及其他合法静态尺寸。
+  if (letter_box.dst_w <= 0 || letter_box.dst_h <= 0 ||
+      proto_width <= 0 || proto_height <= 0)
+    return {};
+  const double scale_x = static_cast<double>(proto_width) / letter_box.dst_w;
+  const double scale_y = static_cast<double>(proto_height) / letter_box.dst_h;
+  const int left = std::clamp(
+      static_cast<int>(std::lround(letter_box.upleft_pad_x * scale_x)),
+      0, proto_width);
+  const int top = std::clamp(
+      static_cast<int>(std::lround(letter_box.upleft_pad_y * scale_y)),
+      0, proto_height);
+  const int right = std::clamp(
+      static_cast<int>(std::lround(
+          (letter_box.dst_w - letter_box.lowright_pad_x) * scale_x)),
+      left, proto_width);
+  const int bottom = std::clamp(
+      static_cast<int>(std::lround(
+          (letter_box.dst_h - letter_box.lowright_pad_y) * scale_y)),
+      top, proto_height);
+  return {left, top, right - left, bottom - top};
+}
+
 
 
  void conbine_mak(std::unique_ptr<float[]>& mask_matrix_mult_result,std::unique_ptr<int8_t[]>& all_mask_in_one,std::vector<float>& filter_candidate_box_mask_conbine,std::vector<int>& mask_classid,int last_count,int proto_width,int proto_height)
@@ -732,16 +765,11 @@ void resize_by_opencv_fp(std::unique_ptr<float[]>& mask_matrix_mult_result,int l
 
  //先把掩码中填充的部分裁掉，在进行放缩
 
-  //1.裁剪
-    int tem_leftx=letter_box.upleft_pad_x/4;
-    int tem_rightx=letter_box.lowright_pad_x/4;
-    int tem_lefty=letter_box.upleft_pad_y/4;
-    int tem_righty=letter_box.lowright_pad_y/4;
-
-    int padx= (letter_box.lowright_pad_x+letter_box.upleft_pad_x)/4;
-    int pady= (letter_box.lowright_pad_y+letter_box.upleft_pad_y)/4;
-    int conbine_width = proto_width - padx;  //掩码160*160裁去填充部分 的宽度
-    int conbine_height= proto_height- pady;
+    const cv::Rect content_roi =
+        proto_content_roi(letter_box, proto_width, proto_height);
+    if (content_roi.width <= 0 || content_roi.height <= 0) return;
+    const int conbine_width = content_roi.width;
+    const int conbine_height = content_roi.height;
     int real_width = letter_box.src_w; //原始输入图像尺寸
     int real_height = letter_box.src_h;
 
@@ -753,7 +781,8 @@ void resize_by_opencv_fp(std::unique_ptr<float[]>& mask_matrix_mult_result,int l
   {
   for(int j=0; j<proto_width;++j)
  { 
-    if(j >= tem_leftx && j < proto_width-tem_rightx && i >= tem_lefty && i < proto_height - tem_righty)
+    if(j >= content_roi.x && j < content_roi.x + content_roi.width &&
+       i >= content_roi.y && i < content_roi.y + content_roi.height)
     every_mask_crop_pad[cropped_index++] = mask_matrix_mult_result[xx*proto_width*proto_height+i*proto_width+j];        //每张mask减去填充部分得到新的mask ， 来进行缩放
  }
  }
@@ -778,22 +807,15 @@ void resize_by_opencv_fp(std::unique_ptr<float[]>& mask_matrix_mult_result,int l
 
 
 
- void resize_by_opencv_fp1(std::unique_ptr<float[]>& mask_matrix_mult_result,int last_count,int proto_width,int proto_height,
+void resize_by_opencv_fp1(std::unique_ptr<float[]>& mask_matrix_mult_result,int last_count,int proto_width,int proto_height,
                     std::unique_ptr<float[]>& all_mask,letterbox& letter_box)
                     {
 
  //先把掩码中填充的部分裁掉，在进行放缩
 
-  //1.裁剪
-    int tem_leftx=letter_box.upleft_pad_x/4;
-    int tem_rightx=letter_box.lowright_pad_x/4;
-    int tem_lefty=letter_box.upleft_pad_y/4;
-    int tem_righty=letter_box.lowright_pad_y/4;
-
-    int padx= (letter_box.lowright_pad_x+letter_box.upleft_pad_x)/4;
-    int pady= (letter_box.lowright_pad_y+letter_box.upleft_pad_y)/4;
-    int conbine_width = proto_width - padx;  //掩码160*160裁去填充部分 的宽度
-    int conbine_height= proto_height- pady;
+    const cv::Rect roi_rect =
+        proto_content_roi(letter_box, proto_width, proto_height);
+    if (roi_rect.width <= 0 || roi_rect.height <= 0) return;
     int real_width = letter_box.src_w; //原始输入图像尺寸
     int real_height = letter_box.src_h;
 
@@ -801,8 +823,6 @@ void resize_by_opencv_fp(std::unique_ptr<float[]>& mask_matrix_mult_result,int l
 
 
     // OpenCV 的 ROI 用 Rect 表示：x=left, y=top, 宽=crop_w, 高=crop_h
-    const cv::Rect roi_rect(tem_leftx, tem_lefty, conbine_width, conbine_height);
-
     // 输出要放缩到原图大小
     const cv::Size dst_size(letter_box.src_w, letter_box.src_h);
 

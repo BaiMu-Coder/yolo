@@ -15,6 +15,12 @@ int image_process::image_preprocessing(int target_size_x,int target_size_y)
         LOG_ERROR("_src_image_frame is nullptr");
         return -1;
     }
+    if(target_size_x <= 0 || target_size_y <= 0 || _src_image_frame->empty())
+    {
+        LOG_ERROR("invalid preprocessing size, target=%dx%d", target_size_x,
+                  target_size_y);
+        return -1;
+    }
 _letterbox.dst_w= target_size_x;
 _letterbox.dst_h= target_size_y;
 _letterbox.src_w=_src_image_frame->cols;
@@ -40,7 +46,10 @@ auto tem_image=std::make_unique<cv::Mat>();
 cv::resize(*_src_image_frame,*tem_image,cv::Size(resized_x,resized_y));
 
 //创建目标大图,用144灰色填充,保持类型不变
-auto resize_image=std::make_unique<cv::Mat>(target_size_x,target_size_y,_src_image_frame->type(),cv::Scalar(114,114,114));
+// cv::Mat 构造参数顺序是 rows(height), cols(width)，不能把宽高写反。
+auto resize_image=std::make_unique<cv::Mat>(
+        target_size_y,target_size_x,_src_image_frame->type(),
+        cv::Scalar(114,114,114));
 
 //计算 把缩放的图像 放进大图里的 左上角位置
 cv::Point position(_letterbox.upleft_pad_x, _letterbox.upleft_pad_y);  //设置缩放后的图像在大画布里放置的左上角位置
@@ -79,7 +88,8 @@ unsigned char* image_process::get_image_buffer(int* size)
  
     if(size)
     {
-        *size=_dst_image_frame->channels()*_dst_image_frame->total(); // 3*640*640
+        // 实际字节数由目标画布决定，可对应3×640×640、3×1024×1024等。
+        *size=_dst_image_frame->channels()*_dst_image_frame->total();
     }
     return _dst_image_frame->data;
 }
@@ -90,7 +100,4 @@ letterbox& image_process::get_letterbox()
 {
     return _letterbox;
 }
-
-
-
 

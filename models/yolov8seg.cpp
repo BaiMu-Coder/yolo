@@ -2,6 +2,7 @@
 #include "common.hpp"
 #include <memory>
 #include <cstdio>
+#include <cmath>
 #include <iostream>
 #include <cstring>
 
@@ -13,7 +14,6 @@ static std::unique_ptr<char[]> read_data_from_file(const std::string &path, int 
     {
         LOG_ERROR("fopen model file error, %s", path.c_str());
         len = -1;
-        fclose(fp);
         return nullptr;
     }
 
@@ -74,6 +74,34 @@ static void printf_rknn_tensor_attr(const rknn_tensor_attr *attr)
 
     std::cout << std::endl;
     std::cout << std::endl;
+}
+
+static bool tensor_spatial_size(const rknn_tensor_attr &attr,
+                                int &width,
+                                int &height)
+{
+    if (attr.n_dims < 4) return false;
+    if (attr.fmt == RKNN_TENSOR_NCHW)
+    {
+        height = attr.dims[2];
+        width = attr.dims[3];
+        return true;
+    }
+    if (attr.fmt == RKNN_TENSOR_NHWC)
+    {
+        height = attr.dims[1];
+        width = attr.dims[2];
+        return true;
+    }
+    return false;
+}
+
+static int tensor_channel_count(const rknn_tensor_attr &attr)
+{
+    if (attr.n_dims < 4) return 0;
+    if (attr.fmt == RKNN_TENSOR_NCHW) return attr.dims[1];
+    if (attr.fmt == RKNN_TENSOR_NHWC) return attr.dims[3];
+    return 0;
 }
 
 yolov8seg::yolov8seg(std::string model_path) : _model_path(model_path),_ctx(0) ,_output(nullptr),_input(nullptr){}
@@ -159,6 +187,12 @@ int yolov8seg::init(rknn_context *ctx )
     _input_number= io_number.n_input;
     _output_number=io_number.n_output;
     printf("model input num: %d, output num: %d\n", io_number.n_input, io_number.n_output);
+    if (io_number.n_input != 1)
+    {
+        LOG_ERROR("only one image input tensor is supported, actual=%d",
+                  io_number.n_input);
+        return -1;
+    }
 
     // 查询输入信息
     std::cout << "input tensors: " << std::endl;
@@ -180,9 +214,19 @@ int yolov8seg::init(rknn_context *ctx )
     std::cout << "output tensors: " << std::endl;
     auto output_tensor = std::make_unique<rknn_tensor_attr[]>(io_number.n_output);
     memset(output_tensor.get(), 0, sizeof(rknn_tensor_attr) * io_number.n_output);
-    if (io_number.n_output != 13)
+    // 当前 RKNN 导出拓扑为：
+    //   3 × [box, class, class_sum, mask_coeff] + 1 × Proto。
+    // 输入分辨率可以是640、1024或其他合法尺寸，但输出排列必须保持该结构。
+    if (io_number.n_output < 5 || (io_number.n_output - 1) % 4 != 0)
     {
-        LOG_ERROR("The output is not 13 (io_number.n_output)"); // 经过 瑞芯微模型转换  分割模型的数据是13个
+        LOG_ERROR("unsupported YOLO-seg output topology, output count=%d",
+                  io_number.n_output);
+        return -1;
+    }
+    const int branch_count = (io_number.n_output - 1) / 4;
+    if (branch_count != 3)
+    {
+        LOG_ERROR("expected 3 detection branches, actual=%d", branch_count);
         return -1;
     }
     for (int i = 0; i < io_number.n_output; ++i)
@@ -209,7 +253,13 @@ int yolov8seg::init(rknn_context *ctx )
     }
 
 
-    if (input_tensor[0].fmt == RKNN_TENSOR_NCHW)
+  if (input_tensor[0].n_dims < 4)
+  {
+    LOG_ERROR("model input tensor must have 4 dimensions, actual=%d",
+              input_tensor[0].n_dims);
+    return -1;
+  }
+  if (input_tensor[0].fmt == RKNN_TENSOR_NCHW)
   {
     std::cout<<"model is NCHW input fmt"<<std::endl;
     _model_channel = input_tensor[0].dims[1];
@@ -225,36 +275,139 @@ int yolov8seg::init(rknn_context *ctx )
   }
   else
   {
-    std::cout<<"input_tensor[0].fmt doesn't exist"<<std::endl;
+    LOG_ERROR("unsupported model input tensor format");
+    return -1;
+  }
+  if (_model_width <= 0 || _model_height <= 0 || _model_channel != 3)
+  {
+    LOG_ERROR("invalid model input shape: %dx%dx%d, expected 3 channels",
+              _model_width, _model_height, _model_channel);
+    return -1;
   }
 
-
-
-    if (output_tensor[io_number.n_output-1].fmt == RKNN_TENSOR_NCHW)
+  _proto_output_index = io_number.n_output - 1;
+  if (output_tensor[_proto_output_index].n_dims < 4)
+  {
+    LOG_ERROR("Proto tensor must have 4 dimensions, actual=%d",
+              output_tensor[_proto_output_index].n_dims);
+    return -1;
+  }
+  if (output_tensor[_proto_output_index].fmt == RKNN_TENSOR_NCHW)
   {
     std::cout<<"model proto is NCHW fmt"<<std::endl;
-    _proto_channel = output_tensor[io_number.n_output-1].dims[1];
-    _proto_height = output_tensor[io_number.n_output-1].dims[2];
-    _proto_width = output_tensor[io_number.n_output-1].dims[3];
+    _proto_channel = output_tensor[_proto_output_index].dims[1];
+    _proto_height = output_tensor[_proto_output_index].dims[2];
+    _proto_width = output_tensor[_proto_output_index].dims[3];
   }
-  else if(input_tensor[io_number.n_output-1].fmt == RKNN_TENSOR_NHWC)
+  else if(output_tensor[_proto_output_index].fmt == RKNN_TENSOR_NHWC)
   {
    std::cout<<"model proto is NHWC fmt"<<std::endl;
-    _proto_height = output_tensor[io_number.n_output-1].dims[1];
-    _proto_width = output_tensor[io_number.n_output-1].dims[2];
-    _proto_channel = output_tensor[io_number.n_output-1].dims[3];
+    _proto_height = output_tensor[_proto_output_index].dims[1];
+    _proto_width = output_tensor[_proto_output_index].dims[2];
+    _proto_channel = output_tensor[_proto_output_index].dims[3];
   }
   else
   {
-    std::cout<<"output_tensor[12].fmt doesn't exist"<<std::endl;
+    LOG_ERROR("unsupported Proto tensor format at output %d",
+              _proto_output_index);
+    return -1;
   }
+
+  _branch_output_indices.clear();
+  _model_spec.detection_grids.clear();
+  for (int branch = 0; branch < branch_count; ++branch)
+  {
+    const int output_index = branch * 4;
+    int grid_width = 0;
+    int grid_height = 0;
+    if (!tensor_spatial_size(output_tensor[output_index],
+                             grid_width, grid_height) ||
+        grid_width <= 0 || grid_height <= 0)
+    {
+      LOG_ERROR("invalid detection grid at output %d", output_index);
+      return -1;
+    }
+    for (int member = 1; member < 4; ++member)
+    {
+      int member_width = 0;
+      int member_height = 0;
+      if (!tensor_spatial_size(output_tensor[output_index + member],
+                               member_width, member_height) ||
+          member_width != grid_width || member_height != grid_height)
+      {
+        LOG_ERROR("branch %d tensor %d grid mismatch", branch,
+                  output_index + member);
+        return -1;
+      }
+    }
+    const int box_channels =
+        tensor_channel_count(output_tensor[output_index]);
+    const int mask_coefficient_channels =
+        tensor_channel_count(output_tensor[output_index + 3]);
+    if (box_channels <= 0 || box_channels % 4 != 0 ||
+        mask_coefficient_channels != _proto_channel)
+    {
+      LOG_ERROR("branch %d channel mismatch: box=%d mask_coeff=%d proto=%d",
+                branch, box_channels, mask_coefficient_channels,
+                _proto_channel);
+      return -1;
+    }
+    if (_model_width % grid_width != 0 ||
+        _model_height % grid_height != 0)
+    {
+      LOG_ERROR("model input %dx%d is not divisible by grid %dx%d",
+                _model_width, _model_height, grid_width, grid_height);
+      return -1;
+    }
+    _branch_output_indices.push_back(output_index);
+    _model_spec.detection_grids.emplace_back(grid_width, grid_height);
+  }
+
+  // 当前 INT8 快速后处理直接读取 RKNN 的原始量化输出。若某个输出不是
+  // affine-asymmetric INT8，继续 reinterpret_cast 会得到没有意义的数据，
+  // 因此在启动阶段立即拒绝不兼容模型，而不是运行时静默输出错误结果。
+  if (_is_quant)
+  {
+    for (int index = 0; index < io_number.n_output; ++index)
+    {
+      if (output_tensor[index].type != RKNN_TENSOR_INT8 ||
+          output_tensor[index].qnt_type !=
+              RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC)
+      {
+        LOG_ERROR("quantized output %d must be affine INT8", index);
+        return -1;
+      }
+    }
+  }
+
+  _model_spec.input_width = _model_width;
+  _model_spec.input_height = _model_height;
+  _model_spec.input_channels = _model_channel;
+  _model_spec.proto_width = _proto_width;
+  _model_spec.proto_height = _proto_height;
+  _model_spec.proto_channels = _proto_channel;
+  _model_spec.proto_output_index = _proto_output_index;
 
 
   _output_tensor=std::move(output_tensor);
   _input_tensor=std::move(input_tensor);
 
+  if (_is_quant)
+    process_i8_proto_table_init(_output_tensor, _proto_output_index,
+                                _proto_table);
 
-  process_i8_index12_init(_output_tensor,_proto_table);
+  std::cout << "Model input: " << _model_width << "x" << _model_height
+            << "x" << _model_channel << "\nDetection grids:";
+  for (size_t index = 0; index < _model_spec.detection_grids.size(); ++index)
+  {
+    const cv::Size &grid = _model_spec.detection_grids[index];
+    std::cout << " " << grid.width << "x" << grid.height
+              << "(stride "
+              << static_cast<double>(_model_width) / grid.width << "x"
+              << static_cast<double>(_model_height) / grid.height << ")";
+  }
+  std::cout << "\nProto: " << _proto_channel << "x"
+            << _proto_width << "x" << _proto_height << std::endl;
 
 
 return 0;
@@ -274,6 +427,14 @@ int yolov8seg::set_npu_core(rknn_core_mask core_mask)
     {
 LOG_ERROR("image_data is nullptr");
     return -1;
+    }
+    const int expected_size = _model_width * _model_height * _model_channel;
+    if (size != expected_size)
+    {
+      LOG_ERROR("input byte size mismatch: actual=%d expected=%d (%dx%dx%d)",
+                size, expected_size, _model_width, _model_height,
+                _model_channel);
+      return -1;
     }
  
     if(!_input)
@@ -327,6 +488,20 @@ int yolov8seg::post_process(object_detect_result_list& result , letterbox& lette
  {
 
   TIMER xxx;
+    if (letter_box.dst_w != _model_width ||
+        letter_box.dst_h != _model_height)
+    {
+      LOG_ERROR("letterbox/model size mismatch: letterbox=%dx%d model=%dx%d",
+                letter_box.dst_w, letter_box.dst_h,
+                _model_width, _model_height);
+      return -1;
+    }
+    if (letter_box.src_w <= 0 || letter_box.src_h <= 0 ||
+        letter_box.scale <= 0.0)
+    {
+      LOG_ERROR("invalid letterbox metadata");
+      return -1;
+    }
 
     std::vector<float> candidate_box;  //保存候选框  四个一组  x,y,w,h  
     std::vector<float> box_score;     //每个候选框的分类置信度
@@ -340,51 +515,51 @@ int yolov8seg::post_process(object_detect_result_list& result , letterbox& lette
 
 
 
-     int dfl_len =_output_tensor[0].dims[1] / 4;//用回归张量的通道数反推出 DFL 的桶数（= reg_max+1），后处理时用于 DFL 解码。 dims[1]就是物品的类别数
-     //YOLOv8 / YOLOv5（从 6.x 开始）用的是DLF 回归框：
-    // 不是直接输出 4 个值（cx, cy, w, h）
-    // 而是输出 4 × (reg_max+1) 个值
-    // 每个边界都用一个分布来学习（类似分类概率）
-
-     int output_per_branch = _output_number / 3;// default 3 branch    输出有 3 个尺度分支（stride=8/16/32），每个尺度对应一个网格（80×80、40×40、20×20）。
-      //在 RKNN 优化后的模型里，这三块经常被拆成 3 个（或 4 个）独立的输出张量，而不是一个大张量。
-       //再加上一个单独的 Proto 张量，所以你会在 io_num.n_output 里看到总输出数 ≈ 3个尺度 × 每尺度的输出个数 + 1(proto)，常见是 13 个（12 + 1）
-
-
-
     xxx.tik();
-      //4+4+4+1）一共13个输出  
-      for(int i=0; i<_output_number ; ++i)
-      {
-       int grid_h , grid_w;
-      // int stride = _model_height / grid_h;   //这行在算 feature stride（步长/下采样倍数） ——也就是该输出特征图上 1 个网格格子对应输入图像上多少个像素。
-       if (_output_tensor[i].fmt == RKNN_TENSOR_NCHW)
-       {
-       grid_h = _output_tensor[i].dims[2];
-       grid_w = _output_tensor[i].dims[3];
-         }
-         else if(_output_tensor[i].fmt == RKNN_TENSOR_NHWC)
-         {
-         grid_h = _output_tensor[i].dims[1];
-         grid_w = _output_tensor[i].dims[2];
-        }
-        else
-        {
-            LOG_ERROR("_output_tensor[i].fmt is error");
-            return -1;
-        }
+    // Proto 与检测分支分开处理，避免遍历辅助张量时误把通道维当作网格。
+    if (_is_quant)
+      process_i8(_output, _output_tensor, _proto_output_index,
+                  _proto_width, _proto_height, 0.0f, 0.0f,
+                  candidate_box, box_score, class_id, proto,
+                  box_mask_coefficient, _proto_channel, _proto_width,
+                  _proto_height, BOX_THRESH, _proto_table,
+                  _proto_output_index);
+    else
+      process_fp32(_output, _output_tensor, _proto_output_index,
+                   _proto_width, _proto_height, 0.0f, 0.0f,
+                   candidate_box, box_score, class_id, proto,
+                   box_mask_coefficient, _proto_channel, _proto_width,
+                   _proto_height, BOX_THRESH, _proto_output_index);
 
-        int stride = _model_height / grid_h;
-   
-       if(_is_quant)
-       {
-        valid_count+=process_i8(_output,_output_tensor,i,grid_w,grid_h,_model_width,_model_height,stride,candidate_box,box_score,class_id,proto,box_mask_coefficient,_proto_channel,_proto_width,_proto_height,BOX_THRESH,_proto_table);
-       }
-       else
-       {
-        valid_count+=process_fp32(_output,_output_tensor,i,grid_w,grid_h,_model_width,_model_height,stride,candidate_box,box_score,class_id,proto,box_mask_coefficient,_proto_channel,_proto_width,_proto_height,BOX_THRESH);
-       }
+    for (const int output_index : _branch_output_indices)
+    {
+      int grid_width = 0;
+      int grid_height = 0;
+      if (!tensor_spatial_size(_output_tensor[output_index],
+                               grid_width, grid_height))
+      {
+        LOG_ERROR("invalid detection tensor format at output %d",
+                  output_index);
+        return -1;
       }
+      const float stride_x =
+          static_cast<float>(_model_width) / grid_width;
+      const float stride_y =
+          static_cast<float>(_model_height) / grid_height;
+      if (_is_quant)
+        valid_count += process_i8(
+            _output, _output_tensor, output_index, grid_width, grid_height,
+            stride_x, stride_y, candidate_box, box_score, class_id, proto,
+            box_mask_coefficient, _proto_channel, _proto_width,
+            _proto_height, BOX_THRESH, _proto_table,
+            _proto_output_index);
+      else
+        valid_count += process_fp32(
+            _output, _output_tensor, output_index, grid_width, grid_height,
+            stride_x, stride_y, candidate_box, box_score, class_id, proto,
+            box_mask_coefficient, _proto_channel, _proto_width,
+            _proto_height, BOX_THRESH, _proto_output_index);
+    }
 
 
 
@@ -444,12 +619,18 @@ int last_count = 0;//记录最终的检测数量
         filter_candidate_box.push_back(x1);
         filter_candidate_box.push_back(y1);
         filter_candidate_box.push_back(x2);
-        filter_candidate_box.push_back(y2); //这里坐标先放里面暂存一下  后面还有转换回原图坐标系里面的(这里的坐标是640*640下的坐标)
-           
-        filter_candidate_box_mask_conbine.push_back(x1/4);
-        filter_candidate_box_mask_conbine.push_back(y1/4);
-        filter_candidate_box_mask_conbine.push_back(x2/4);
-        filter_candidate_box_mask_conbine.push_back(y2/4); //这里的检测框给掩码使用，掩码层的分辨率是160*160 所以这里要缩小4倍与之对应
+        filter_candidate_box.push_back(y2); // 暂存模型输入坐标，后面统一反变换到原图。
+
+        // 检测框位于模型输入坐标系，Mask裁剪位于Proto坐标系。
+        // 比例由真实张量尺寸决定，不再假设固定 640/160=4。
+        const float proto_scale_x =
+            static_cast<float>(_proto_width) / _model_width;
+        const float proto_scale_y =
+            static_cast<float>(_proto_height) / _model_height;
+        filter_candidate_box_mask_conbine.push_back(x1 * proto_scale_x);
+        filter_candidate_box_mask_conbine.push_back(y1 * proto_scale_y);
+        filter_candidate_box_mask_conbine.push_back(x2 * proto_scale_x);
+        filter_candidate_box_mask_conbine.push_back(y2 * proto_scale_y);
         mask_classid.push_back(id);
         //mask系数提取出来过滤后的
         for(int j=0; j<_proto_channel; ++j)
@@ -511,21 +692,25 @@ xxx.print_time("matrix_mult_by_npu_fp32");
  /*     方案1  先逐张合并在整体放缩      */
  /*主要区别就是 先合并的话mask掩码先变为整数了，会导致后面放缩的时候 掩码边界地方处理的不是很平滑*/
  /*效率会快一点，当检测结果越多越显著*/
- //把所有掩码合成写到一张图上面 160*160
+ //把所有掩码合成写到Proto特征图上
  auto all_mask_in_one=std::make_unique<int8_t[]>(_proto_height*_proto_width);
  memset(all_mask_in_one.get(),0,sizeof(int8_t)*_proto_height*_proto_width);
  conbine_mak(mask_matrix_mult_result,all_mask_in_one,filter_candidate_box_mask_conbine,mask_classid,last_count,_proto_width,_proto_height);
 
 
  //得到真实mask,处理为原图尺寸
-    int tem_leftx=letter_box.upleft_pad_x/4;
-    int tem_rightx=letter_box.lowright_pad_x/4;
-    int tem_lefty=letter_box.upleft_pad_y/4;
-    int tem_righty=letter_box.lowright_pad_y/4;
+    const double proto_scale_x =
+        static_cast<double>(_proto_width) / letter_box.dst_w;
+    const double proto_scale_y =
+        static_cast<double>(_proto_height) / letter_box.dst_h;
+    int tem_leftx=std::lround(letter_box.upleft_pad_x*proto_scale_x);
+    int tem_rightx=std::lround(letter_box.lowright_pad_x*proto_scale_x);
+    int tem_lefty=std::lround(letter_box.upleft_pad_y*proto_scale_y);
+    int tem_righty=std::lround(letter_box.lowright_pad_y*proto_scale_y);
     std::cout<<tem_leftx<<" "<<tem_rightx<<" "<<tem_lefty<<" "<<tem_righty<<std::endl;
 
-    int padx= (letter_box.lowright_pad_x+letter_box.upleft_pad_x)/4;
-    int pady= (letter_box.lowright_pad_y+letter_box.upleft_pad_y)/4;
+    int padx= tem_leftx+tem_rightx;
+    int pady= tem_lefty+tem_righty;
     int conbine_width = _proto_width - padx;  //
     int conbine_height= _proto_height- pady;
     int real_width = letter_box.src_w; //原始输入图像尺寸

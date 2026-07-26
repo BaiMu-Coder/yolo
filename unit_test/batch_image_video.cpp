@@ -70,7 +70,7 @@ static void print_help(const char* app) {
         << "  --force-reference-box      Force cls0/cls1 to use box inscribed circles\n"
         << "  Visualization: "
         << (BATCH_RING_MASK_ONLY
-                ? "Mask + cls0/cls1 fitted ellipses only\n"
+                ? "Mask + detection boxes + cls0/cls1 fitted ellipses\n"
                 : "Full detection + ellipse + pose\n")
         << "  --start-frame N --end-frame N --frame-step N\n";
 }
@@ -167,7 +167,10 @@ public:
         if (args_.mode == "images") temporal_filter_.Reset();
         cv::Mat inference_frame = input.clone();
         image_process preprocessor(inference_frame);
-        if (preprocessor.image_preprocessing(640, 640) != 0) return fail(key, "preprocess failed");
+        const cv::Size model_input = model_.model_input_size();
+        if (preprocessor.image_preprocessing(model_input.width,
+                                             model_input.height) != 0)
+            return fail(key, "preprocess failed");
         int input_size = 0;
         uint8_t* input_data = preprocessor.get_image_buffer(&input_size);
         if (input_data == nullptr) return fail(key, "empty model input");
@@ -252,8 +255,11 @@ public:
                                                     ? cv::Scalar(255, 0, 255)
                                                     : cv::Scalar(0, 255, 255));
             if (args_.ring_mask_only) {
-                // 纯展示入口只画外圈(cls0)和中圈(cls1)的最终拟合椭圆：
-                // 外圈青色、中圈紫色。检测框、中心点、弧点、文字和内孔均不叠加。
+                // 演示入口画所有检测框，并只画外圈(cls0)和中圈(cls1)的最终拟合椭圆：
+                // 检测框红色、外圈青色、中圈紫色。中心点、弧点、文字和内孔不叠加。
+                cv::rectangle(visualization,
+                              {detection.x, detection.y, detection.w, detection.h},
+                              {0, 0, 255}, 2);
                 if (is_reference && ellipse.valid) {
                     const cv::Scalar ring_color = class_id == 0
                                                       ? cv::Scalar(255, 255, 0)

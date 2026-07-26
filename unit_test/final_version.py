@@ -13,15 +13,23 @@ import argparse
 import copy
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import torch
+from ultralytics import YOLO, __version__ as ULTRALYTICS_VERSION
+from ultralytics.data.augment import LetterBox
+from ultralytics.models.yolo.segment.predict import SegmentationPredictor
+from ultralytics.utils import ops
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 # =============================================================================
@@ -32,11 +40,12 @@ class Config:
     # 输入：video / camera / images
     source_mode: str = "video"
     # 视频模式只需设置：输入路径、输出路径、视频名
-    input_path: str = "/home/seven.xu2/project/yolo/video"                # 输入视频所在文件夹
-    output_path: str = "/home/seven.xu2/project/yolo/output"        # 所有结果保存的根文件夹
+    # 默认值全部相对项目自动解析，拷到演示机器后无需修改用户名或绝对路径。
+    input_path: str = str(PROJECT_ROOT / "data" / "video")  # 输入视频所在文件夹
+    output_path: str = str(PROJECT_ROOT / "output_python")  # 所有结果保存的根文件夹
     video_name: str = "day--5.1.mp4"        # 输入视频名，输出会自动沿用该名称
     camera_id: int = 0
-    model_path: str = "best.pt"          # 换成转换 RKNN 前的分割 PT 模型
+    model_path: str = str(PROJECT_ROOT / "best.pt")  # 转换 RKNN 前的分割 PT 模型
     device: str = "0"                  # CPU: "cpu"；第一张显卡: "0"
     start_frame: int = 0
     end_frame: int = -1                  # -1=直到结束
@@ -45,20 +54,25 @@ class Config:
     camera_height: int = 640
     camera_mjpg: bool = True
 
-    # Ultralytics 推理
-    image_size: int = 640
+    # Ultralytics 推理尺寸。单个整数表示正方形；(height, width) 表示矩形。
+    # PT 模型通常不是固定输入尺寸，可在这里修改，也可用 --imgsz N / --imgsz H W
+    # 覆盖。该尺寸仅影响网络 letterbox，不改变相机采集分辨率或相机内参。
+    image_size: Union[int, Tuple[int, int]] = 640
     confidence: float = 0.50
     iou_threshold: float = 0.45
     max_detections: int = 256
-    half: bool = True                   # GPU 可改 True；CPU 保持 False
+    # 效果优先：默认 FP32，避免 FP16 对低置信边界和 Mask 系数造成额外误差。
+    # 若以后只追求速度，可手动改为 True。
+    half: bool = False
     retina_masks: bool = True            # 原图尺寸高质量 mask，效果优先
     mask_binary_threshold: float = 0.50
+    use_raw_soft_masks: bool = True       # 保留阈值化前的 sigmoid 概率，供亚像素拟合
     class_names: Tuple[str, ...] = ("outer", "middle", "hole")
     outer_class_id: int = 0
     middle_class_id: int = 1
     hole_class_id: int = 2
 
-    # 椭圆拟合（对应 C++ final_version 的参数）
+    # 椭圆拟合：门限、迭代次数和最大点数均与 C++ 一致。
     mask_fit_hole: bool = False
     force_reference_box: bool = False
     ellipse_deviation_ratio: float = 0.30
@@ -73,6 +87,12 @@ class Config:
     ellipse_min_quality: float = 0.52
     ellipse_min_coverage_deg: float = 160.0
     ellipse_max_covariance_condition: float = 1e12
+    ellipse_adaptive_inlier_ratio: float = 0.02  # 完整/外层轮廓门限=短边×该比例
+    ellipse_adaptive_inlier_min_px: float = 1.0
+    ellipse_outer_gap_deg: float = 25.0     # 径向外层轮廓的连续缺口判定
+    ellipse_hull_iou_weight: float = 0.70   # 候选评分中外轮廓凸包 IoU 权重
+    ellipse_box_border_ratio: float = 0.06  # ROI 边点达到该比例视为框裁剪假边
+    ellipse_box_border_min_points: int = 6
     # 出视场专用配置：先删除贴图像边界的“封口假轮廓”，再允许开放弧拟合。
     image_border_margin_px: int = 3
     partial_min_coverage_deg: float = 90.0
@@ -97,9 +117,9 @@ class Config:
     length_base_mm: float = 920.0
     pose_fixed_distance_mm: float = 3000.0
     pose_display_fixed: bool = False
-    compute_both_pose_modes: bool = False  # 实时默认只解算当前显示模式；离线对比可开启
+    compute_both_pose_modes: bool = True   # 演示版同时保存自动/固定距离两套完整结果
     pose_max_iters: int = 30
-    pose_max_arc_points: int = 48       # 位姿数值雅可比用的均匀弧点上限
+    pose_max_arc_points: int = 48       # 与 C++ 位姿数值雅可比弧点上限一致
     signed_robust_residual: bool = False  # False 精确复现 C++；True 可试验改进
 
     # 抗抖：原始值和平滑值都会保存，画面默认显示平滑值
@@ -126,6 +146,8 @@ class Config:
     draw_all_ellipses: bool = True
     draw_pose_axis: bool = True
     draw_fps: bool = False                # batch_image_video.cpp 默认不叠加 FPS
+    # batch_mask_ring_visualization.py 使用：Mask + 检测框 + cls0/cls1 椭圆。
+    ring_mask_visualization: bool = False
 
 
 CFG = Config()
@@ -218,54 +240,188 @@ class Pose6D:
         return cls(*[float(x) for x in values])
 
 
+class EffectPrioritySegmentationPredictor(SegmentationPredictor):
+    """复用当前 Ultralytics 后处理，同时保留阈值化前的原图软 Mask。
+
+    不复制某个固定版本的 NMS/postprocess，而是让已安装版本的
+    ``SegmentationPredictor.postprocess`` 正常运行，只在其调用
+    ``process_mask_native`` 时截取 sigmoid 概率。因此模型输出结构、NMS 和
+    Results 构造均由当前版本自身负责，兼容性高于绑定 ultralytics==8.3.0。
+    """
+
+    soft_masks: List[Optional[np.ndarray]]
+
+    def pre_transform(self, images: List[np.ndarray]) -> List[np.ndarray]:
+        """按配置尺寸执行固定画布 letterbox，禁止批次内容触发自动矩形尺寸。
+
+        ``self.imgsz`` 已由 Ultralytics 按模型 stride 校验，可对应 640、1024
+        或其他合法的正方形/矩形尺寸。``auto=False`` 保证同一配置下坐标映射稳定。
+        """
+        letterbox = LetterBox(self.imgsz, auto=False, stride=self.model.stride)
+        return [letterbox(image=image) for image in images]
+
+    @staticmethod
+    def _process_mask_native_soft(protos: torch.Tensor,
+                                  masks_in: torch.Tensor,
+                                  boxes: torch.Tensor,
+                                  shape: Tuple[int, int]) -> torch.Tensor:
+        channels, mask_height, mask_width = protos.shape
+        logits = (masks_in @ protos.float().view(channels, -1)).view(
+            -1, mask_height, mask_width)
+        # 严格对齐板端：先裁掉 letterbox padding 并把 logits 双线性缩放到
+        # 原图，再 sigmoid。8.0.175 官方 Results 的二值 Mask 仍由原函数生成，
+        # 这里只为板端同算法的亚像素拟合保留概率。
+        probabilities = ops.scale_masks(logits[None], shape)[0].sigmoid()
+        return ops.crop_mask(probabilities, boxes)
+
+    def postprocess(self, predictions: Any, image: torch.Tensor,
+                    original_images: Any) -> Any:
+        original_process_mask_native = ops.process_mask_native
+        captured: List[np.ndarray] = []
+
+        def process_and_keep_probability(protos: torch.Tensor,
+                                         masks_in: torch.Tensor,
+                                         boxes: torch.Tensor,
+                                         shape: Tuple[int, int],
+                                         *args: Any, **kwargs: Any) -> torch.Tensor:
+            soft_tensor = self._process_mask_native_soft(
+                protos, masks_in, boxes, shape)
+            captured.append(soft_tensor.detach().float().cpu().numpy())
+            # 检测结果始终使用当前安装版本的官方实现；我们只旁路捕获软概率。
+            return original_process_mask_native(
+                protos, masks_in, boxes, shape, *args, **kwargs)
+
+        # Predictor 是逐帧串行调用；try/finally 保证即使异常也恢复库函数。
+        ops.process_mask_native = process_and_keep_probability
+        try:
+            results = super().postprocess(predictions, image, original_images)
+        finally:
+            ops.process_mask_native = original_process_mask_native
+
+        captured_iterator = iter(captured)
+        self.soft_masks = []
+        for result in results:
+            if result.masks is None:
+                self.soft_masks.append(None)
+            else:
+                self.soft_masks.append(next(captured_iterator, None))
+        return results
+
+
 class PTModel:
     def __init__(self, cfg: Config):
         model_path = Path(cfg.model_path).expanduser()
         if not model_path.is_file():
             raise FileNotFoundError(f"PT 模型不存在: {model_path}")
+        required_soft_mask_api = all(
+            hasattr(ops, name) for name in
+            ("process_mask_native", "scale_masks", "crop_mask"))
+        self.soft_mask_enabled = (
+            cfg.use_raw_soft_masks and cfg.retina_masks and required_soft_mask_api)
+        if cfg.use_raw_soft_masks and not self.soft_mask_enabled:
+            print(
+                "[WARNING] 当前 Ultralytics 缺少软 Mask 所需接口，"
+                f"版本为 {ULTRALYTICS_VERSION}；本次自动回退官方二值 Mask。",
+                file=sys.stderr)
         self.cfg = cfg
         self.model = YOLO(str(model_path), task="segment")
+        self._soft_mask_warning_emitted = False
+        self.effect_predictor: Optional[EffectPrioritySegmentationPredictor] = None
+        if self.soft_mask_enabled:
+            predictor_overrides = {
+                "task": "segment", "mode": "predict", "device": cfg.device,
+                "half": cfg.half, "imgsz": cfg.image_size,
+                "conf": cfg.confidence, "iou": cfg.iou_threshold,
+                "max_det": cfg.max_detections, "retina_masks": cfg.retina_masks,
+            }
+            try:
+                self.effect_predictor = EffectPrioritySegmentationPredictor(
+                    overrides=predictor_overrides, _callbacks=self.model.callbacks)
+            except TypeError:
+                # 较早的 8.x 构造函数没有 _callbacks 参数。
+                self.effect_predictor = EffectPrioritySegmentationPredictor(
+                    overrides=predictor_overrides)
+            # 8.0.x 的 Model.predict(predictor=...) 要求传 Predictor“类”，较新的
+            # 8.3.x 可接受实例。提前完成 setup 并挂到 YOLO 对象上，可同时绕开
+            # 两代接口差异；后续 predict 只会更新 args 并复用该实例。
+            self.effect_predictor.setup_model(model=self.model.model, verbose=False)
+            self.model.predictor = self.effect_predictor
 
     def infer(self, frame: np.ndarray) -> List[Detection]:
         cfg = self.cfg
-        result = self.model.predict(
+        prediction_results = self.model.predict(
             source=frame, imgsz=cfg.image_size, conf=cfg.confidence,
             iou=cfg.iou_threshold, max_det=cfg.max_detections,
             device=cfg.device, half=cfg.half, retina_masks=cfg.retina_masks,
             verbose=False,
-        )[0]
+        )
+        result = prediction_results[0]
         if result.boxes is None or len(result.boxes) == 0:
             return []
         xyxy = result.boxes.xyxy.detach().cpu().numpy()
         scores = result.boxes.conf.detach().cpu().numpy()
         classes = result.boxes.cls.detach().cpu().numpy().astype(np.int32)
         masks: Optional[np.ndarray] = None
+        masks_have_soft_probability: Optional[np.ndarray] = None
+        soft_masks: Optional[np.ndarray] = None
+        if self.soft_mask_enabled:
+            captured = getattr(self.effect_predictor, "soft_masks", None)
+            if captured and captured[0] is not None:
+                soft_masks = captured[0]
+            elif result.masks is not None:
+                if not self._soft_mask_warning_emitted:
+                    print(
+                        "[WARNING] 当前版本未能截取软 Mask，本次及后续帧自动使用"
+                        "官方二值 Mask；检测和可视化仍会继续。",
+                        file=sys.stderr)
+                    self._soft_mask_warning_emitted = True
+                self.soft_mask_enabled = False
         if result.masks is not None:
             masks = result.masks.data.detach().cpu().numpy()
+            # 多数 Ultralytics 版本的 Results.masks.data 已经是 0/1 二值图，
+            # 不能把它冒充原始 sigmoid 概率做亚像素等值线修正。先在任何 resize
+            # 之前判断，避免双线性插值人为制造的中间值被误认为真实概率。
+            masks_have_soft_probability = np.any(
+                (masks > 1e-4) & (masks < 1.0 - 1e-4), axis=(1, 2))
             if masks.shape[1:] != frame.shape[:2]:
                 masks = np.stack([
                     cv2.resize(m, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
                     for m in masks
                 ])
+        if soft_masks is not None and soft_masks.shape[1:] != frame.shape[:2]:
+            soft_masks = np.stack([
+                cv2.resize(m, (frame.shape[1], frame.shape[0]),
+                           interpolation=cv2.INTER_LINEAR)
+                for m in soft_masks
+            ])
         detections: List[Detection] = []
         for i, box in enumerate(xyxy):
-            x1 = int(np.clip(round(float(box[0])), 0, frame.shape[1]))
-            y1 = int(np.clip(round(float(box[1])), 0, frame.shape[0]))
-            x2 = int(np.clip(round(float(box[2])), 0, frame.shape[1]))
-            y2 = int(np.clip(round(float(box[3])), 0, frame.shape[0]))
+            # C++ box_reverse 最终使用 int 截断，不做四舍五入。
+            x1 = int(np.clip(float(box[0]), 0, frame.shape[1]))
+            y1 = int(np.clip(float(box[1]), 0, frame.shape[0]))
+            x2 = int(np.clip(float(box[2]), 0, frame.shape[1]))
+            y2 = int(np.clip(float(box[3]), 0, frame.shape[0]))
             if x2 <= x1 or y2 <= y1:
                 continue
             mask = None
             mask_probability = None
             if masks is not None and i < len(masks):
-                probability = np.clip(masks[i], 0.0, 1.0).astype(np.float32)
+                has_raw_probability = soft_masks is not None and i < len(soft_masks)
+                probability_source = soft_masks[i] if has_raw_probability else masks[i]
+                probability = np.clip(probability_source, 0.0, 1.0).astype(np.float32)
                 mask = (probability >= cfg.mask_binary_threshold).astype(np.uint8) * 255
                 # 与 C++ 一致，只保留检测框内的实例 mask。
                 clipped = np.zeros_like(mask)
                 clipped[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
                 mask = clipped
-                mask_probability = np.zeros_like(probability)
-                mask_probability[y1:y2, x1:x2] = probability[y1:y2, x1:x2]
+                if (has_raw_probability or
+                        (masks_have_soft_probability is not None and
+                         bool(masks_have_soft_probability[i]))):
+                    # 板端拟合器接收 uint8 概率图；这里同样量化到 0..255，
+                    # 避免 float/Sobel 路径产生另一套亚像素结果。
+                    probability_u8 = np.rint(probability * 255.0).astype(np.uint8)
+                    mask_probability = np.zeros_like(probability_u8)
+                    mask_probability[y1:y2, x1:x2] = probability_u8[y1:y2, x1:x2]
             detections.append(Detection(x1, y1, x2 - x1, y2 - y1,
                                         float(scores[i]), int(classes[i]), mask,
                                         mask_probability))
@@ -582,6 +738,145 @@ def _fit_points(points: np.ndarray, point_weights: np.ndarray, det: Detection,
     return _score_candidate(fitted, det, cfg)
 
 
+def _fit_global_points(points: np.ndarray, point_weights: np.ndarray,
+                       det: Detection, cfg: Config,
+                       removed_border_points: int = 0) -> Optional[EllipseResult]:
+    """完整好 Mask 的全轮廓候选，防止 RANSAC 被某一段局部弧劫持。"""
+    if len(points) < 20:
+        return None
+    step = max(1, len(points) // cfg.ellipse_max_points)
+    sampled = points[::step][:cfg.ellipse_max_points].astype(np.float32)
+    # 全局候选的职责是忠实代表整圈，不能再让局部高梯度边缘获得更高权重，
+    # 否则反光较强的一侧仍可能把中心拖偏。
+    weights = np.ones(len(sampled), dtype=np.float64)
+    contour = sampled.reshape(-1, 1, 2)
+    initial_candidates: List[Ellipse] = []
+    for fitter in (cv2.fitEllipseDirect, cv2.fitEllipseAMS, cv2.fitEllipse):
+        try:
+            ellipse = fitter(contour)
+        except cv2.error:
+            continue
+        major, minor = max(ellipse[1]), min(ellipse[1])
+        if (minor >= 4.0 and
+                major / max(minor, 1e-3) <= cfg.ellipse_max_axis_ratio):
+            initial_candidates.append(ellipse)
+    if not initial_candidates:
+        return None
+
+    # 不按平均误差选初值，使用 q90 约束整圈，避免一侧贴合掩盖另一侧偏离。
+    initial = min(
+        initial_candidates,
+        key=lambda ellipse: float(np.quantile(
+            np.abs(signed_sampson_errors(ellipse, sampled)), 0.90)))
+    refined = refine_sampson_lm(initial, sampled, weights, cfg)
+    if refined is None:
+        return None
+    ellipse, covariance, condition = refined
+    errors = np.abs(signed_sampson_errors(ellipse, sampled))
+    inlier_mask = errors <= cfg.ellipse_inlier_px
+    inlier_count = int(np.count_nonzero(inlier_mask))
+    required = max(20, int(math.ceil(cfg.ellipse_min_inlier_ratio * len(sampled))))
+    if inlier_count < required:
+        return None
+
+    (cx, cy), size, angle = ellipse
+    result = EllipseResult(
+        ellipse=((cx + det.x, cy + det.y), size, angle),
+        source="mask", inliers=inlier_count,
+        mean_error_px=float(np.mean(errors[inlier_mask])),
+        sampled_points=len(sampled), inlier_ratio=inlier_count / len(sampled),
+        covariance=covariance, covariance_condition=condition,
+        removed_border_points=removed_border_points)
+    result.conic = ellipse_conic_matrix(result.ellipse)
+    global_points = sampled.astype(np.float64) + np.asarray(
+        [det.x, det.y], dtype=np.float64)
+    update_ellipse_statistics(result, global_points, det, cfg, False)
+    final_inliers = np.abs(signed_sampson_errors(
+        result.ellipse, global_points)) <= cfg.ellipse_inlier_px
+    result.visible_arc_points = global_points[final_inliers].astype(np.float32)
+    return _score_candidate(result, det, cfg)
+
+
+def _outer_radial_envelope(points: np.ndarray, point_weights: np.ndarray,
+                           det: Detection,
+                           cfg: Config) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """从环形/C 形轮廓中只保留每个方向最外侧的点。
+
+    被遮挡的环形 Mask，其一条 external contour 往往同时包含外圆弧、内圆弧
+    和缺口侧边。围绕检测框中心按角度取最大半径，可把后两者排除；连续缺角
+    则标记为 partial，交给开放弧规则处理。
+    """
+    if len(points) < 20:
+        return points, point_weights, False
+    center = np.asarray([0.5 * det.w, 0.5 * det.h], dtype=np.float64)
+    vectors = points.astype(np.float64) - center
+    radii2 = np.sum(vectors * vectors, axis=1)
+    angles = np.mod(np.arctan2(vectors[:, 1], vectors[:, 0]),
+                    2.0 * math.pi)
+    # 小目标减少角度格，避免像素量化制造虚假的空格；大目标最多保留 180 点，
+    # 与 ellipse_max_points 的默认规模一致。
+    bin_count = int(np.clip(round(math.pi * min(det.w, det.h) * 0.5),
+                            72, 180))
+    bins = np.minimum(
+        bin_count - 1, (angles * bin_count / (2.0 * math.pi)).astype(int))
+    selected_indices: List[int] = []
+    occupied = np.zeros(bin_count, dtype=bool)
+    for bin_id in np.unique(bins):
+        members = np.flatnonzero(bins == bin_id)
+        # 半径优先；半径相同时选择软 Mask 梯度更可靠的点。
+        best = members[np.lexsort(
+            (-point_weights[members], -radii2[members]))[0]]
+        selected_indices.append(int(best))
+        occupied[int(bin_id)] = True
+
+    selected_indices.sort(key=lambda index: float(angles[index]))
+    envelope = points[selected_indices]
+    envelope_weights = point_weights[selected_indices]
+
+    # 允许一个角度格的像素离散空洞，再计算最大连续缺口。
+    occupied = occupied | np.roll(occupied, 1) | np.roll(occupied, -1)
+    doubled = np.concatenate((~occupied, ~occupied))
+    longest_gap = current_gap = 0
+    for is_gap in doubled:
+        current_gap = current_gap + 1 if is_gap else 0
+        longest_gap = max(longest_gap, current_gap)
+    longest_gap = min(longest_gap, bin_count)
+    gap_deg = 360.0 * longest_gap / bin_count
+    return envelope, envelope_weights, gap_deg >= cfg.ellipse_outer_gap_deg
+
+
+def _mask_ellipse_global_score(candidate: EllipseResult, roi_mask: np.ndarray,
+                               contour_points: np.ndarray, det: Detection,
+                               cfg: Config) -> float:
+    """以外轮廓凸包 IoU 和全局 q90 残差评价候选。
+
+    环形 Mask 被遮挡后是 C 形，直接拿原始面积计算 IoU 会错误惩罚正确的完整
+    外圈；外层采样点的凸包更接近这里真正要估计的锥套投影轮廓。
+    """
+    target = np.zeros_like(roi_mask, dtype=np.uint8)
+    if len(contour_points) >= 3:
+        hull = cv2.convexHull(
+            np.rint(contour_points).astype(np.int32).reshape(-1, 1, 2))
+        cv2.drawContours(target, [hull], -1, 255, cv2.FILLED)
+    ellipse_mask = np.zeros_like(target)
+    (cx, cy), size, angle = candidate.ellipse
+    local_ellipse = ((float(cx - det.x), float(cy - det.y)),
+                     (float(size[0]), float(size[1])), float(angle))
+    cv2.ellipse(ellipse_mask, local_ellipse, 255, cv2.FILLED)
+    target_active, ellipse_active = target > 0, ellipse_mask > 0
+    union = int(np.count_nonzero(target_active | ellipse_active))
+    intersection = int(np.count_nonzero(target_active & ellipse_active))
+    iou = intersection / union if union else 0.0
+
+    global_points = contour_points.astype(np.float64) + np.asarray(
+        [det.x, det.y], dtype=np.float64)
+    errors = np.abs(signed_sampson_errors(candidate.ellipse, global_points))
+    q90 = float(np.quantile(errors, 0.90)) if len(errors) else math.inf
+    residual_score = math.exp(-q90 / max(0.5, cfg.ellipse_inlier_px))
+    iou_weight = float(np.clip(cfg.ellipse_hull_iou_weight, 0.0, 1.0))
+    return iou_weight * iou + (1.0 - iou_weight) * residual_score
+
+
 def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
                  force_box: bool = False, allow_edge: bool = True) -> EllipseResult:
     height, width = frame.shape[:2]
@@ -631,28 +926,106 @@ def best_ellipse(frame: np.ndarray, det: Detection, cfg: Config,
             removed_border_points = int(len(points) - np.count_nonzero(keep))
             points = points[keep]
             point_weights = point_weights[keep]
-            partial_visibility = border_truncated or removed_border_points > 0
+            # Mask 在检测框内被裁剪时，findContours 会沿 ROI 四边生成假直线。
+            # 少数极值点正常；只有边界点占比较高时才按截断轮廓处理。
+            on_box_border = (
+                (points[:, 0] <= 0) | (points[:, 1] <= 0) |
+                (points[:, 0] >= det.w - 1) | (points[:, 1] >= det.h - 1))
+            box_border_count = int(np.count_nonzero(on_box_border))
+            box_truncated = box_border_count >= max(
+                cfg.ellipse_box_border_min_points,
+                int(cfg.ellipse_box_border_ratio * len(points)))
+            if box_truncated:
+                points = points[~on_box_border]
+                point_weights = point_weights[~on_box_border]
+            total_removed = removed_border_points + (
+                box_border_count if box_truncated else 0)
+            partial_visibility = (
+                border_truncated or removed_border_points > 0 or box_truncated)
+            outer_points, outer_weights, outer_has_gap = _outer_radial_envelope(
+                points, point_weights, det, cfg)
             # 在软 mask 的 p=0.5 等值线上做一步法向亚像素修正。
             # 梯度越清晰的点越靠前，供 PROSAC 优先采样。
             if det.mask_probability is not None:
-                probability = det.mask_probability[det.y:det.y + det.h,
-                                                   det.x:det.x + det.w].astype(np.float32)
-                gx = cv2.Sobel(probability, cv2.CV_32F, 1, 0, ksize=3) / 8.0
-                gy = cv2.Sobel(probability, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+                probability_u8 = det.mask_probability[
+                    det.y:det.y + det.h, det.x:det.x + det.w]
                 xi = np.clip(np.rint(points[:, 0]).astype(int), 0, max(0, det.w - 1))
                 yi = np.clip(np.rint(points[:, 1]).astype(int), 0, max(0, det.h - 1))
-                grad_x, grad_y = gx[yi, xi], gy[yi, xi]
-                magnitude = np.hypot(grad_x, grad_y)
-                safe = np.maximum(magnitude, 1e-6)
-                shift = np.clip((0.5 - probability[yi, xi]) / safe, -0.75, 0.75)
-                points[:, 0] += shift * grad_x / safe
-                points[:, 1] += shift * grad_y / safe
-                point_weights = np.clip(magnitude * 4.0, 0.15, 1.0).astype(np.float64)
+                interior = ((xi > 0) & (yi > 0) &
+                            (xi + 1 < probability_u8.shape[1]) &
+                            (yi + 1 < probability_u8.shape[0]))
+                indices = np.flatnonzero(interior)
+                if len(indices):
+                    px, py = xi[indices], yi[indices]
+                    probability_f32 = probability_u8.astype(np.float32)
+                    values = probability_f32[py, px] / 255.0
+                    grad_x = (probability_f32[py, px + 1] -
+                              probability_f32[py, px - 1]) / 510.0
+                    grad_y = (probability_f32[py + 1, px] -
+                              probability_f32[py - 1, px]) / 510.0
+                    magnitude = np.hypot(grad_x, grad_y)
+                    usable = magnitude > 1e-3
+                    active = indices[usable]
+                    if len(active):
+                        active_magnitude = magnitude[usable]
+                        shift = np.clip(
+                            (0.5 - values[usable]) / active_magnitude,
+                            -0.75, 0.75)
+                        points[active, 0] += (
+                            shift * grad_x[usable] / active_magnitude)
+                        points[active, 1] += (
+                            shift * grad_y[usable] / active_magnitude)
+                        point_weights[active] = np.clip(
+                            active_magnitude * 4.0, 0.15, 1.0)
+                # 亚像素修正会更新轮廓坐标和权重，外层包络需基于更新后的点重算。
+                outer_points, outer_weights, outer_has_gap = (
+                    _outer_radial_envelope(points, point_weights, det, cfg))
             if len(points) >= 20:
-                fitted = _fit_points(points, point_weights, det, cfg, "mask",
-                                     partial_visibility, removed_border_points)
-                if fitted is not None:
-                    candidates.append(fitted)
+                # 对小目标收紧 3px 固定阈值；截图中的几十像素目标使用 3px
+                # 会让局部偏斜椭圆也获得大量“内点”。
+                fit_cfg = copy.copy(cfg)
+                # 完整小目标使用自适应阈值；残缺/贴边轮廓继续沿用原来的
+                # 3px 宽松阈值，避免修复完整 Mask 时损害短弧拟合能力。
+                if not partial_visibility:
+                    fit_cfg.ellipse_inlier_px = min(
+                        cfg.ellipse_inlier_px,
+                        max(cfg.ellipse_adaptive_inlier_min_px,
+                            cfg.ellipse_adaptive_inlier_ratio *
+                            min(det.w, det.h)))
+                mask_candidates: List[EllipseResult] = []
+                robust = _fit_points(
+                    points, point_weights, det, fit_cfg, "mask",
+                    partial_visibility, total_removed)
+                if robust is not None:
+                    mask_candidates.append(robust)
+                if not partial_visibility and not outer_has_gap:
+                    global_candidate = _fit_global_points(
+                        points, point_weights, det, fit_cfg, total_removed)
+                    if global_candidate is not None:
+                        mask_candidates.append(global_candidate)
+                # 对 C 形、环形以及中心有孔的 Mask，专门拟合每个方向的最外层
+                # 轮廓。缺口只改变可见弧范围，不再把内缘/缺口侧边当外椭圆。
+                if len(outer_points) >= 20:
+                    outer_cfg = copy.copy(cfg)
+                    outer_cfg.ellipse_inlier_px = min(
+                        cfg.ellipse_inlier_px,
+                        max(cfg.ellipse_adaptive_inlier_min_px,
+                            cfg.ellipse_adaptive_inlier_ratio *
+                            min(det.w, det.h)))
+                    outer_candidate = _fit_points(
+                        outer_points, np.ones(len(outer_points), dtype=np.float64),
+                        det, outer_cfg, "mask",
+                        partial_visibility or outer_has_gap, total_removed)
+                    if outer_candidate is not None:
+                        mask_candidates.append(outer_candidate)
+                if mask_candidates:
+                    if len(mask_candidates) == 1:
+                        candidates.append(mask_candidates[0])
+                    else:
+                        candidates.append(max(
+                            mask_candidates,
+                            key=lambda item: _mask_ellipse_global_score(
+                                item, roi, outer_points, det, fit_cfg)))
     # 截断场景禁用 Edge：图像边界和反光边缘往往比真实开放弧更强，风险高于收益。
     if (allow_edge and not border_truncated and cfg.enable_edge_fallback and
             (not candidates or max(x.quality for x in candidates) < 0.72)):
@@ -1223,24 +1596,14 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
             color = np.asarray(colors[det.class_id], dtype=np.float32)
             vis[active] = np.clip(vis[active] * (1.0 - cfg.mask_alpha) + color * cfg.mask_alpha,
                                   0, 255).astype(np.uint8)
-        if cfg.draw_boxes:
-            cv2.rectangle(vis, (det.x, det.y), (det.x + det.w, det.y + det.h), (0, 0, 255), 2)
-            cv2.putText(vis, f"cls={det.class_id} conf={det.score:.2f} "
-                        f"q={ellipse.quality:.2f} {ellipse.source}"
-                        f"{' PARTIAL' if ellipse.partial_visibility else ''}",
-                        (det.x, max(18, det.y - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        if cfg.draw_all_ellipses:
-            color = ((0, 0, 255) if not ellipse.valid else
-                     ((0, 165, 255) if ellipse.partial_visibility else
-                      ((0, 255, 0) if ellipse.source == "mask" else
-                       ((255, 0, 255) if ellipse.source == "edge" else (0, 255, 255)))))
-            cv2.ellipse(vis, ellipse.ellipse, color, 2)
-            cv2.circle(vis, tuple(np.rint(ellipse.ellipse[0]).astype(int)), 2, (0, 0, 255), -1)
-            if ellipse.partial_visibility:
-                for point in ellipse.visible_arc_points[::4]:
-                    cv2.circle(vis, tuple(np.rint(point).astype(int)), 1,
-                               (0, 165, 255), -1)
+        if cfg.ring_mask_visualization:
+            # 精简入口始终画检测框；椭圆要等双环门控和时序滤波完成后再画。
+            cv2.rectangle(vis, (det.x, det.y), (det.x + det.w, det.y + det.h),
+                          (0, 0, 255), 2)
+        else:
+            if cfg.draw_boxes:
+                cv2.rectangle(vis, (det.x, det.y), (det.x + det.w, det.y + det.h),
+                              (0, 0, 255), 2)
         if cfg.save_masks and det.mask is not None and frame_id % max(1, cfg.mask_every) == 0:
             cv2.imwrite(str(masks_dir / f"frame_{frame_id:08d}_det_{i:03d}_cls_{det.class_id}.png"), det.mask)
 
@@ -1258,6 +1621,35 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
             ellipses[idx1] = ellipse_smoother.update(cfg.middle_class_id, ellipses[idx1])
         if idx2 >= 0:
             ellipses[idx2] = ellipse_smoother.update(cfg.hole_class_id, ellipses[idx2])
+
+    # 必须在双环一致性门控和视频 EMA 之后绘制。旧代码在循环内提前画了原始
+    # 椭圆，因此保存的视频看不到时序滤波效果，视觉上会比实际算法结果更抖。
+    for det, ellipse in zip(detections, ellipses):
+        is_reference = det.class_id in (cfg.outer_class_id, cfg.middle_class_id)
+        if cfg.ring_mask_visualization:
+            if is_reference and ellipse.valid:
+                ring_color = ((255, 255, 0) if det.class_id == cfg.outer_class_id
+                              else (255, 0, 255))
+                cv2.ellipse(vis, ellipse.ellipse, ring_color, 3)
+            continue
+        if cfg.draw_boxes:
+            cv2.putText(vis, f"cls={det.class_id} conf={det.score:.2f} "
+                        f"q={ellipse.quality:.2f} {ellipse.source}"
+                        f"{' PARTIAL' if ellipse.partial_visibility else ''}",
+                        (det.x, max(18, det.y - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        if cfg.draw_all_ellipses:
+            color = ((0, 0, 255) if not ellipse.valid else
+                     ((0, 165, 255) if ellipse.partial_visibility else
+                      ((0, 255, 0) if ellipse.source == "mask" else
+                       ((255, 0, 255) if ellipse.source == "edge" else (0, 255, 255)))))
+            cv2.ellipse(vis, ellipse.ellipse, color, 2)
+            cv2.circle(vis, tuple(np.rint(ellipse.ellipse[0]).astype(int)),
+                       2, (0, 0, 255), -1)
+            if ellipse.partial_visibility:
+                for point in ellipse.visible_arc_points[::4]:
+                    cv2.circle(vis, tuple(np.rint(point).astype(int)), 1,
+                               (0, 165, 255), -1)
     target_idx = -1
     use_middle = False
     pose_auto = pose_fixed = None
@@ -1287,28 +1679,36 @@ def process_visual(frame: np.ndarray, detections: List[Detection], cfg: Config,
                 cfg.pose_fixed_distance_mm)
         pose_auto = valid_pose(pose_auto)
         pose_fixed = valid_pose(pose_fixed)
-        cv2.ellipse(vis, target, (255, 255, 0), 4)
-        cv2.ellipse(vis, ellipses[idx2].ellipse, (255, 255, 0), 4)
-        cv2.circle(vis, tuple(np.rint(hole_center).astype(int)), 6, (255, 255, 0), -1)
-        cv2.line(vis, tuple(np.rint(target[0]).astype(int)), tuple(np.rint(hole_center).astype(int)),
-                 (255, 255, 0), 3)
-        draw_text(vis, f"Ref({'Mid' if use_middle else 'Out'}): ({target[0][0]:.0f}, {target[0][1]:.0f})",
-                  100, (255, 255, 255), 0.8)
-        draw_text(vis, f"Hole: ({hole_center[0]:.0f}, {hole_center[1]:.0f})", 140, (255, 255, 255), 0.8)
+        if not cfg.ring_mask_visualization:
+            cv2.ellipse(vis, target, (255, 255, 0), 4)
+            cv2.ellipse(vis, ellipses[idx2].ellipse, (255, 255, 0), 4)
+            cv2.circle(vis, tuple(np.rint(hole_center).astype(int)),
+                       6, (255, 255, 0), -1)
+            cv2.line(vis, tuple(np.rint(target[0]).astype(int)),
+                     tuple(np.rint(hole_center).astype(int)), (255, 255, 0), 3)
+            draw_text(vis, f"Ref({'Mid' if use_middle else 'Out'}): "
+                      f"({target[0][0]:.0f}, {target[0][1]:.0f})",
+                      100, (255, 255, 255), 0.8)
+            draw_text(vis, f"Hole: ({hole_center[0]:.0f}, {hole_center[1]:.0f})",
+                      140, (255, 255, 255), 0.8)
 
     raw = pose_fixed if cfg.pose_display_fixed else pose_auto
     smooth, stale = smoother.update(raw)
     display_pose = smooth if cfg.enable_pose_smoothing else raw
-    if display_pose is not None and (not stale or cfg.draw_held_pose):
-        color = (0, 255, 255) if cfg.pose_display_fixed else ((160, 160, 160) if stale else (0, 255, 0))
-        suffix = "Fixed" if cfg.pose_display_fixed else ("Held" if stale else "Auto")
-        draw_text(vis, f"Yaw:{display_pose.yaw_deg:.1f} Pit:{display_pose.pitch_deg:.1f}", 190, color, 1.3)
-        draw_text(vis, f"Dist: {display_pose.tz_mm / 1000.0:.2f}m ({suffix})", 240, color, 1.3)
-        if cfg.draw_pose_axis and not stale:
-            estimator.draw_axis(vis, display_pose, use_middle)
-    else:
-        draw_text(vis, "Pose: --", 190, (255, 255, 0), 1.2)
-        draw_text(vis, "Dist: --", 240, (255, 255, 0), 1.2)
+    if not cfg.ring_mask_visualization:
+        if display_pose is not None and (not stale or cfg.draw_held_pose):
+            color = ((0, 255, 255) if cfg.pose_display_fixed else
+                     ((160, 160, 160) if stale else (0, 255, 0)))
+            suffix = "Fixed" if cfg.pose_display_fixed else ("Held" if stale else "Auto")
+            draw_text(vis, f"Yaw:{display_pose.yaw_deg:.1f} "
+                      f"Pit:{display_pose.pitch_deg:.1f}", 190, color, 1.3)
+            draw_text(vis, f"Dist: {display_pose.tz_mm / 1000.0:.2f}m ({suffix})",
+                      240, color, 1.3)
+            if cfg.draw_pose_axis and not stale:
+                estimator.draw_axis(vis, display_pose, use_middle)
+        else:
+            draw_text(vis, "Pose: --", 190, (255, 255, 0), 1.2)
+            draw_text(vis, "Dist: --", 240, (255, 255, 0), 1.2)
 
     det_details = []
     def finite_or_none(value: float) -> Optional[float]:
@@ -1567,7 +1967,14 @@ def parse_args(cfg: Config) -> Config:
     parser.add_argument("--video-name", help="兼容 C++：与 --input-path 拼接的视频文件名")
     parser.add_argument("--mode", choices=("auto", "images", "video", "camera"),
                         help="兼容 C++：auto/images/video；另支持 camera")
+    parser.add_argument("--camera-width", type=int,
+                        help="相机采集宽度；与 --imgsz 网络输入尺寸相互独立")
+    parser.add_argument("--camera-height", type=int,
+                        help="相机采集高度；与 --imgsz 网络输入尺寸相互独立")
     parser.add_argument("--device", help='cpu 或 CUDA 编号，如 "0"')
+    parser.add_argument(
+        "--imgsz", type=int, nargs="+", metavar="N",
+        help="PT推理尺寸：--imgsz 1024 或 --imgsz 768 1024（H W）")
     parser.add_argument("--output", "--output-path", dest="output",
                         help="输出根目录，直接创建 visual/labels/ellipses/poses")
     parser.add_argument("--no-show", action="store_true")
@@ -1596,6 +2003,14 @@ def parse_args(cfg: Config) -> Config:
         cfg.source_mode, cfg.input_path, cfg.video_name = "images", str(path.parent), path.name
     if args.cam is not None:
         cfg.source_mode, cfg.camera_id = "camera", args.cam
+    if args.camera_width is not None:
+        if args.camera_width <= 0:
+            parser.error("--camera-width 必须为正整数")
+        cfg.camera_width = args.camera_width
+    if args.camera_height is not None:
+        if args.camera_height <= 0:
+            parser.error("--camera-height 必须为正整数")
+        cfg.camera_height = args.camera_height
     if args.input_path:
         cfg.input_path = str(Path(args.input_path).expanduser())
         cfg.video_name = args.video_name or ""
@@ -1607,6 +2022,11 @@ def parse_args(cfg: Config) -> Config:
         cfg.source_mode = "images" if configured_input_path(cfg).is_dir() else "video"
     if args.device:
         cfg.device = args.device
+    if args.imgsz:
+        if len(args.imgsz) not in (1, 2) or any(value <= 0 for value in args.imgsz):
+            parser.error("--imgsz 只能提供一个正整数，或按 H W 提供两个正整数")
+        cfg.image_size = (args.imgsz[0] if len(args.imgsz) == 1
+                          else (args.imgsz[0], args.imgsz[1]))
     if args.output:
         cfg.output_path = args.output
     if args.no_show:
@@ -1635,6 +2055,23 @@ def parse_args(cfg: Config) -> Config:
         cfg.frame_step = max(1, args.frame_step)
     if cfg.device.lower() == "cpu":
         cfg.half = False
+    elif not torch.cuda.is_available():
+        print("[WARNING] 未检测到可用 CUDA，自动回退 CPU/FP32。", file=sys.stderr)
+        cfg.device, cfg.half = "cpu", False
+    else:
+        try:
+            first_device = int(cfg.device.split(",")[0])
+            if first_device < 0 or first_device >= torch.cuda.device_count():
+                raise ValueError
+        except ValueError:
+            print(f"[WARNING] CUDA 设备 '{cfg.device}' 无效，自动使用 cuda:0。",
+                  file=sys.stderr)
+            cfg.device = "0"
+    if (cfg.show_window and sys.platform.startswith("linux") and
+            not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")):
+        print("[WARNING] 当前 Linux 环境没有图形显示服务，自动启用 --no-show。",
+              file=sys.stderr)
+        cfg.show_window = False
     return cfg
 
 
@@ -1662,8 +2099,16 @@ def main() -> int:
     writer: Optional[cv2.VideoWriter] = None
     history: List[Tuple[int, Pose6D]] = []
     try:
+        print("=== YOLO Segmentation Effect-Priority Demo ===")
+        print(f"Ultralytics : {ULTRALYTICS_VERSION}")
+        print(f"Model       : {Path(cfg.model_path).expanduser().resolve()}")
+        print(f"Input       : {configured_input_path(cfg)} ({cfg.source_mode})")
+        print(f"Output      : {out_dir.resolve()}")
+        print(f"Inference   : FP32, imgsz={cfg.image_size}, "
+              f"raw_soft_mask_requested={cfg.use_raw_soft_masks}")
         source = FrameSource(cfg)
         model = PTModel(cfg)
+        print(f"Soft Mask   : {'active' if model.soft_mask_enabled else 'binary fallback'}")
         estimator, smoother = PoseEstimatorLM(cfg), PoseSmoother(cfg)
         ellipse_smoother = EllipseSmoother(cfg)
         source_fps = source.fps if source.fps > 1e-3 else 25.0
@@ -1731,6 +2176,8 @@ def main() -> int:
                     if key == ord("s"):
                         cv2.imwrite(str(out_dir / f"manual_frame_{frame_id:08d}.jpg"), vis,
                                     [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if processed == 0:
+            raise RuntimeError("输入已打开，但没有成功处理任何帧；请检查帧范围或视频完整性")
         save_pose_plots(history, out_dir)
         print(f"\n完成：{processed} 帧，全部结果在 {out_dir.resolve()}")
         return 0

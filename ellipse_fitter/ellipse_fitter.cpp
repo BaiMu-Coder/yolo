@@ -147,6 +147,13 @@ EllipseFitter::EllipseFitter(EllipseFitConfig config) : config_(std::move(config
         std::clamp(config_.partial_minimum_occupied_quadrants, 1, 4);
     config_.partial_minimum_candidate_quality =
         clamp01(config_.partial_minimum_candidate_quality);
+    config_.adaptive_inlier_ratio = std::max(0.0f, config_.adaptive_inlier_ratio);
+    config_.adaptive_inlier_min_px = std::max(0.1f, config_.adaptive_inlier_min_px);
+    config_.outer_gap_threshold_deg =
+        std::clamp(config_.outer_gap_threshold_deg, 0.0f, 360.0f);
+    config_.hull_iou_weight = clamp01(config_.hull_iou_weight);
+    config_.box_border_point_ratio = clamp01(config_.box_border_point_ratio);
+    config_.box_border_minimum_points = std::max(1, config_.box_border_minimum_points);
 }
 
 EllipseFitResult EllipseFitter::BoxInscribedCircle(const cv::Rect &detection_box)
@@ -304,7 +311,8 @@ EllipseFitter::RansacResult EllipseFitter::FitRansac(
 std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
     const cv::Mat &binary_roi, const cv::Mat &probability_roi,
     const cv::Point2f &box_center_roi, const cv::Rect &roi_in_image,
-    cv::Size image_size, int *removed_border_points) const
+    cv::Size image_size, int *removed_border_points,
+    bool *box_border_truncated) const
 {
     // =========================================================================
     // Mask 轮廓点生成
@@ -315,6 +323,8 @@ std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(work, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
     std::vector<WeightedPoint> points;
+    std::vector<uint8_t> on_box_border_flags;
+    if (box_border_truncated != nullptr) *box_border_truncated = false;
     const double minimum_area = config_.minimum_contour_area_ratio * binary_roi.cols * binary_roi.rows;
     const float distance_limit = config_.contour_center_distance_ratio *
                                  std::min(binary_roi.cols, binary_roi.rows);
@@ -343,6 +353,10 @@ std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
                 continue;
             }
             WeightedPoint point{cv::Point2f(pixel), 1.0f};
+            const bool on_box_border =
+                pixel.x <= 0 || pixel.y <= 0 ||
+                pixel.x >= binary_roi.cols - 1 ||
+                pixel.y >= binary_roi.rows - 1;
             if (!probability_roi.empty() && pixel.x > 0 && pixel.y > 0 &&
                 pixel.x + 1 < probability_roi.cols && pixel.y + 1 < probability_roi.rows)
             {
@@ -366,9 +380,100 @@ std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectMaskPoints(
                 }
             }
             points.push_back(point);
+            on_box_border_flags.push_back(on_box_border ? 1 : 0);
         }
     }
+    // 检测框过紧或 Mask 在框内被裁剪时，findContours 会沿 ROI 边界生成假直线。
+    // 椭圆正常与框相切只产生少数极值点；达到“最少点数+比例”才判为假封口。
+    const int box_border_count = std::count(on_box_border_flags.begin(),
+                                            on_box_border_flags.end(), 1);
+    const int box_border_limit = std::max(
+        config_.box_border_minimum_points,
+        static_cast<int>(config_.box_border_point_ratio * points.size()));
+    if (box_border_count >= box_border_limit)
+    {
+        std::vector<WeightedPoint> filtered;
+        filtered.reserve(points.size() - box_border_count);
+        for (size_t index = 0; index < points.size(); ++index)
+            if (!on_box_border_flags[index]) filtered.push_back(points[index]);
+        points.swap(filtered);
+        if (removed_border_points != nullptr)
+            *removed_border_points += box_border_count;
+        if (box_border_truncated != nullptr) *box_border_truncated = true;
+    }
     return points;
+}
+
+EllipseFitter::OuterEnvelopeResult EllipseFitter::CollectOuterRadialEnvelope(
+    const std::vector<WeightedPoint> &points,
+    const cv::Point2f &box_center_roi,
+    cv::Size roi_size) const
+{
+    // C 形/环形 Mask 的 external contour 会同时串起外弧、内弧和缺口侧边。
+    // 按检测框中心做角度分箱，每个方向只保留半径最大的点，即得到外层可见弧。
+    OuterEnvelopeResult result;
+    if (points.size() < 20)
+    {
+        result.points = points;
+        return result;
+    }
+    const int bin_count = std::clamp(
+        static_cast<int>(std::lround(CV_PI *
+                                     std::min(roi_size.width, roi_size.height) * 0.5)),
+        72, 180);
+    std::vector<int> selected(bin_count, -1);
+    std::vector<double> selected_radius2(bin_count, -1.0);
+    std::vector<double> angles(points.size(), 0.0);
+    std::vector<bool> occupied(bin_count, false);
+    for (size_t index = 0; index < points.size(); ++index)
+    {
+        const cv::Point2f delta = points[index].point - box_center_roi;
+        double angle = std::atan2(delta.y, delta.x);
+        if (angle < 0.0) angle += 2.0 * CV_PI;
+        angles[index] = angle;
+        const int bin = std::min(
+            bin_count - 1,
+            static_cast<int>(angle * bin_count / (2.0 * CV_PI)));
+        const double radius2 = delta.dot(delta);
+        const int previous = selected[bin];
+        if (previous < 0 || radius2 > selected_radius2[bin] ||
+            (radius2 == selected_radius2[bin] &&
+             points[index].weight > points[previous].weight))
+        {
+            selected[bin] = static_cast<int>(index);
+            selected_radius2[bin] = radius2;
+        }
+        occupied[bin] = true;
+    }
+    std::vector<int> indices;
+    indices.reserve(bin_count);
+    for (int index : selected)
+        if (index >= 0) indices.push_back(index);
+    std::sort(indices.begin(), indices.end(), [&](int first, int second) {
+        return angles[first] < angles[second];
+    });
+    result.points.reserve(indices.size());
+    for (int index : indices) result.points.push_back(points[index]);
+
+    // 容忍一个角度格的像素量化空洞，计算首尾相接的最大连续缺角。
+    std::vector<bool> dilated(bin_count, false);
+    for (int bin = 0; bin < bin_count; ++bin)
+        dilated[bin] = occupied[bin] ||
+                       occupied[(bin + bin_count - 1) % bin_count] ||
+                       occupied[(bin + 1) % bin_count];
+    int longest_gap = 0, current_gap = 0;
+    for (int index = 0; index < 2 * bin_count; ++index)
+    {
+        if (!dilated[index % bin_count])
+        {
+            current_gap = std::min(bin_count, current_gap + 1);
+            longest_gap = std::max(longest_gap, current_gap);
+        }
+        else current_gap = 0;
+    }
+    const float gap_deg = 360.0f * std::min(longest_gap, bin_count) / bin_count;
+    result.has_large_gap = gap_deg >= config_.outer_gap_threshold_deg;
+    return result;
 }
 
 std::vector<EllipseFitter::WeightedPoint> EllipseFitter::CollectEdgePoints(
@@ -693,6 +798,191 @@ EllipseFitResult EllipseFitter::BuildCandidate(const std::vector<WeightedPoint> 
     return result;
 }
 
+EllipseFitResult EllipseFitter::BuildGlobalCandidate(
+    const std::vector<WeightedPoint> &points,
+    const cv::Rect &roi,
+    const cv::Rect &detection_box,
+    int removed_border_points) const
+{
+    // 完整 Mask 同时建立 Direct/AMS/标准三种全轮廓初值，以 q90 而非平均误差
+    // 选优，防止“某一侧很贴、另一侧被拉偏”的局部最优。
+    if (points.size() < 20) return {};
+    std::vector<WeightedPoint> sampled;
+    sampled.reserve(std::min(static_cast<int>(points.size()), config_.maximum_points));
+    const int step = std::max(1, static_cast<int>(points.size()) /
+                                  config_.maximum_points);
+    for (int index = 0; index < static_cast<int>(points.size()) &&
+                        static_cast<int>(sampled.size()) < config_.maximum_points;
+         index += step)
+    {
+        WeightedPoint point = points[index];
+        point.weight = 1.0f; // 全局候选必须让整圈各方向等权。
+        sampled.push_back(point);
+    }
+    std::vector<cv::Point2f> raw_points;
+    raw_points.reserve(sampled.size());
+    for (const WeightedPoint &point : sampled) raw_points.push_back(point.point);
+
+    std::vector<cv::RotatedRect> initials;
+    auto append_if_valid = [&](const cv::RotatedRect &ellipse) {
+        if (minor_axis(ellipse) >= 4.0f &&
+            axis_ratio(ellipse) <= config_.maximum_axis_ratio)
+            initials.push_back(ellipse);
+    };
+    try { append_if_valid(cv::fitEllipseDirect(raw_points)); }
+    catch (const cv::Exception &) {}
+    try { append_if_valid(cv::fitEllipseAMS(raw_points)); }
+    catch (const cv::Exception &) {}
+    try { append_if_valid(cv::fitEllipse(raw_points)); }
+    catch (const cv::Exception &) {}
+    if (initials.empty()) return {};
+
+    auto q90_residual = [&](const cv::RotatedRect &ellipse,
+                            const std::vector<WeightedPoint> &candidate_points) {
+        std::vector<float> errors;
+        errors.reserve(candidate_points.size());
+        for (const WeightedPoint &point : candidate_points)
+            errors.push_back(std::abs(SampsonResidualPx(ellipse, point.point)));
+        std::sort(errors.begin(), errors.end());
+        if (errors.empty()) return std::numeric_limits<float>::infinity();
+        const double position = 0.90 * (errors.size() - 1);
+        const size_t lower = static_cast<size_t>(std::floor(position));
+        const size_t upper = static_cast<size_t>(std::ceil(position));
+        const double fraction = position - lower;
+        return static_cast<float>(errors[lower] * (1.0 - fraction) +
+                                  errors[upper] * fraction);
+    };
+    cv::RotatedRect refined = *std::min_element(
+        initials.begin(), initials.end(),
+        [&](const cv::RotatedRect &first, const cv::RotatedRect &second) {
+            return q90_residual(first, sampled) < q90_residual(second, sampled);
+        });
+    cv::Matx<double, 5, 5> covariance = cv::Matx<double, 5, 5>::zeros();
+    double condition = std::numeric_limits<double>::infinity();
+    if (!RefineSampson(sampled, refined, covariance, condition)) return {};
+
+    const int required = std::max(
+        20, static_cast<int>(std::ceil(config_.minimum_inlier_ratio *
+                                       sampled.size())));
+    int inliers = 0;
+    float error_sum = 0.0f;
+    for (const WeightedPoint &point : sampled)
+    {
+        const float error = std::abs(SampsonResidualPx(refined, point.point));
+        if (error <= config_.inlier_threshold_px)
+        {
+            ++inliers;
+            error_sum += error;
+        }
+    }
+    if (inliers < required) return {};
+
+    EllipseFitResult result;
+    result.ellipse = refined;
+    result.ellipse.center += cv::Point2f(roi.x, roi.y);
+    result.valid = true;
+    result.source = EllipseSource::Mask;
+    result.from_mask = true;
+    result.removed_border_points = removed_border_points;
+    result.covariance = covariance;
+    result.covariance_condition = condition;
+    result.sampled_points = static_cast<int>(sampled.size());
+    result.inliers = inliers;
+    result.inlier_ratio = static_cast<float>(inliers) / sampled.size();
+    result.mean_error_px = error_sum / std::max(1, inliers);
+    std::vector<WeightedPoint> global_points = sampled;
+    result.visible_arc_points.reserve(inliers);
+    for (WeightedPoint &point : global_points)
+    {
+        point.point += cv::Point2f(roi.x, roi.y);
+        if (std::abs(SampsonResidualPx(result.ellipse, point.point)) <=
+            config_.inlier_threshold_px)
+            result.visible_arc_points.push_back(point.point);
+    }
+    UpdateGeometryStatistics(global_points, detection_box, result, false);
+
+    const cv::Point2f box_center(
+        detection_box.x + detection_box.width * 0.5f,
+        detection_box.y + detection_box.height * 0.5f);
+    const float short_side = std::max(
+        1.0f, static_cast<float>(std::min(detection_box.width,
+                                          detection_box.height)));
+    result.center_deviation_ratio =
+        cv::norm(result.ellipse.center - box_center) / short_side;
+    if (result.center_deviation_ratio > config_.center_deviation_ratio ||
+        minor_axis(result.ellipse) < 0.20f * short_side ||
+        major_axis(result.ellipse) >
+            1.45f * std::max(detection_box.width, detection_box.height) ||
+        result.angular_coverage_deg < config_.minimum_angular_coverage_deg ||
+        result.occupied_quadrants < config_.minimum_occupied_quadrants ||
+        !result.uncertainty_valid)
+        return {};
+
+    const float error_quality = std::exp(
+        -result.mean_error_px / std::max(0.5f, config_.inlier_threshold_px));
+    const float center_quality = clamp01(
+        1.0f - result.center_deviation_ratio / config_.center_deviation_ratio);
+    const float coverage_quality =
+        clamp01(result.angular_coverage_deg / 300.0f);
+    const float uncertainty_quality = clamp01(
+        1.0f - result.center_std_px /
+                   std::max(1.0f, config_.maximum_center_std_ratio * short_side));
+    result.quality = clamp01(
+        0.32f * result.inlier_ratio + 0.22f * error_quality +
+        0.16f * center_quality + 0.16f * coverage_quality +
+        0.14f * uncertainty_quality + 0.04f);
+    return result;
+}
+
+float EllipseFitter::MaskCandidateScore(
+    const EllipseFitResult &candidate,
+    const std::vector<WeightedPoint> &outer_points,
+    const cv::Rect &roi) const
+{
+    if (!candidate.valid || outer_points.size() < 3)
+        return -std::numeric_limits<float>::infinity();
+    std::vector<cv::Point> integer_points;
+    integer_points.reserve(outer_points.size());
+    for (const WeightedPoint &point : outer_points)
+        integer_points.emplace_back(cvRound(point.point.x), cvRound(point.point.y));
+    std::vector<cv::Point> hull;
+    cv::convexHull(integer_points, hull);
+    cv::Mat target(roi.size(), CV_8UC1, cv::Scalar(0));
+    if (hull.size() >= 3)
+        cv::fillConvexPoly(target, hull, cv::Scalar(255));
+
+    cv::Mat ellipse_mask(roi.size(), CV_8UC1, cv::Scalar(0));
+    cv::RotatedRect local = candidate.ellipse;
+    local.center -= cv::Point2f(roi.x, roi.y);
+    cv::ellipse(ellipse_mask, local, cv::Scalar(255), cv::FILLED);
+    cv::Mat intersection, union_mask;
+    cv::bitwise_and(target, ellipse_mask, intersection);
+    cv::bitwise_or(target, ellipse_mask, union_mask);
+    const int union_count = cv::countNonZero(union_mask);
+    const float iou = union_count > 0
+        ? static_cast<float>(cv::countNonZero(intersection)) / union_count
+        : 0.0f;
+
+    std::vector<float> errors;
+    errors.reserve(outer_points.size());
+    for (const WeightedPoint &point : outer_points)
+    {
+        const cv::Point2f global = point.point + cv::Point2f(roi.x, roi.y);
+        errors.push_back(std::abs(SampsonResidualPx(candidate.ellipse, global)));
+    }
+    std::sort(errors.begin(), errors.end());
+    const double position = 0.90 * (errors.size() - 1);
+    const size_t lower = static_cast<size_t>(std::floor(position));
+    const size_t upper = static_cast<size_t>(std::ceil(position));
+    const double fraction = position - lower;
+    const float q90 = static_cast<float>(
+        errors[lower] * (1.0 - fraction) + errors[upper] * fraction);
+    const float residual_score = std::exp(
+        -q90 / std::max(0.5f, config_.inlier_threshold_px));
+    return config_.hull_iou_weight * iou +
+           (1.0f - config_.hull_iou_weight) * residual_score;
+}
+
 EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
                                     const cv::Rect &detection_box,
                                     const uint8_t *mask_data,
@@ -748,12 +1038,68 @@ EllipseFitResult EllipseFitter::Fit(const cv::Mat &image,
                                      const_cast<uint8_t *>(mask_probability));
             probability_roi = full_probability(roi);
         }
+        bool box_border_truncated = false;
         const std::vector<WeightedPoint> mask_points =
             CollectMaskPoints(full_mask(roi), probability_roi, box_center_roi,
-                              roi, image.size(), &removed_border_points);
-        const bool partial = border_truncated || removed_border_points > 0;
-        best = BuildCandidate(mask_points, roi, detection_box, EllipseSource::Mask,
-                              partial, removed_border_points);
+                              roi, image.size(), &removed_border_points,
+                              &box_border_truncated);
+        const bool partial = border_truncated || removed_border_points > 0 ||
+                             box_border_truncated;
+        const OuterEnvelopeResult outer = CollectOuterRadialEnvelope(
+            mask_points, box_center_roi, roi.size());
+
+        // 与 Python 效果版一致：完整小目标及最外层弧使用短边自适应门限，
+        // 图像/框边界截断的原始混合轮廓继续保留 3px 宽松门限。
+        EllipseFitConfig adaptive_config = config_;
+        adaptive_config.inlier_threshold_px = std::min(
+            config_.inlier_threshold_px,
+            std::max(config_.adaptive_inlier_min_px,
+                     config_.adaptive_inlier_ratio *
+                         std::min(detection_box.width, detection_box.height)));
+        const EllipseFitter adaptive_fitter(adaptive_config);
+        const EllipseFitter &primary_fitter = partial ? *this : adaptive_fitter;
+        std::vector<EllipseFitResult> mask_candidates;
+
+        EllipseFitResult robust = primary_fitter.BuildCandidate(
+            mask_points, roi, detection_box, EllipseSource::Mask,
+            partial, removed_border_points);
+        if (robust.valid) mask_candidates.push_back(robust);
+
+        if (!partial && !outer.has_large_gap)
+        {
+            EllipseFitResult global = adaptive_fitter.BuildGlobalCandidate(
+                mask_points, roi, detection_box, removed_border_points);
+            if (global.valid) mask_candidates.push_back(global);
+        }
+
+        if (outer.points.size() >= 20)
+        {
+            std::vector<WeightedPoint> equal_weight_outer = outer.points;
+            for (WeightedPoint &point : equal_weight_outer) point.weight = 1.0f;
+            EllipseFitResult outer_candidate = adaptive_fitter.BuildCandidate(
+                equal_weight_outer, roi, detection_box, EllipseSource::Mask,
+                partial || outer.has_large_gap, removed_border_points);
+            if (outer_candidate.valid) mask_candidates.push_back(outer_candidate);
+        }
+
+        if (!mask_candidates.empty())
+        {
+            if (mask_candidates.size() == 1) best = mask_candidates.front();
+            else
+            {
+                const EllipseFitter &score_fitter =
+                    partial ? *this : adaptive_fitter;
+                best = *std::max_element(
+                    mask_candidates.begin(), mask_candidates.end(),
+                    [&](const EllipseFitResult &first,
+                        const EllipseFitResult &second) {
+                        return score_fitter.MaskCandidateScore(
+                                   first, outer.points, roi) <
+                               score_fitter.MaskCandidateScore(
+                                   second, outer.points, roi);
+                    });
+            }
+        }
     }
 
     // Mask 已经足够稳定时跳过 Canny，避免在实时路径上重复消耗 CPU。

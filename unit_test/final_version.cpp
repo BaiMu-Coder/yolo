@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <string>
+#include <stdexcept>
 
 #include "npu_infer_pool.hpp"
 #include <image_process.hpp>
@@ -24,6 +25,8 @@ struct Args {
     std::string model;
     bool use_cam = false;
     int cam_id = 0;
+    int camera_width = 640;  // 采集尺寸，与 RKNN 网络输入尺寸相互独立
+    int camera_height = 640;
     std::string video_path;
     int target_fps = 0; // 0=不限速
     bool force_reference_box = false; // 外/中参考圈强制使用检测框内切圆
@@ -46,6 +49,10 @@ static Args parse_args(int argc, char** argv)
         if (s == "--cam" && i + 1 < argc) {
             a.use_cam = true;
             a.cam_id = std::stoi(argv[++i]);
+        } else if (s == "--camera-width" && i + 1 < argc) {
+            a.camera_width = std::stoi(argv[++i]);
+        } else if (s == "--camera-height" && i + 1 < argc) {
+            a.camera_height = std::stoi(argv[++i]);
         } else if (s == "--video" && i + 1 < argc) {
             a.use_cam = false;
             a.video_path = argv[++i];
@@ -57,6 +64,9 @@ static Args parse_args(int argc, char** argv)
             a.fit_hole_from_mask = true;
         }
     }
+    if (a.camera_width <= 0 || a.camera_height <= 0) {
+        throw std::invalid_argument("camera width/height must be positive");
+    }
     return a;
 }
 
@@ -67,7 +77,9 @@ int main(int argc, char** argv)
     if (argc < 2) {
         std::cerr << "Usage:\n"
                   << "  Video: " << argv[0] << " <model.rknn> --video <path> [--fps 40] [--force-reference-box] [--hole-mask]\n"
-                  << "  Cam  : " << argv[0] << " <model.rknn> --cam <id> [--force-reference-box] [--hole-mask]\n"
+                  << "  Cam  : " << argv[0] << " <model.rknn> --cam <id>"
+                     " [--camera-width W --camera-height H]"
+                     " [--force-reference-box] [--hole-mask]\n"
                   << "  (Compat) " << argv[0] << " <model.rknn> <video_path>\n";
         return 1;
     }
@@ -86,7 +98,7 @@ int main(int argc, char** argv)
     cv::setNumThreads(1);
 
     // 建 npu_pool
-    npu_infer_pool pool(args.model, 6, 6);
+    npu_infer_pool pool(args.model, 9, 6);
     pool.set_reference_ring_force_box_mode(args.force_reference_box);
     pool.set_class2_mask_fit_mode(args.fit_hole_from_mask);
 
@@ -148,13 +160,13 @@ int main(int argc, char** argv)
         cv::VideoCapture cap;
         if (args.use_cam) {
             cap.open(args.cam_id);
-        // === 关键修改 ===
-        // 降低分辨率，减少 CPU 负担
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, 640); 
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 640);
+        // 这里设置的是相机采集分辨率，不是 RKNN 输入分辨率。
+        // 后续预处理会自动读取所加载模型的原生尺寸（例如 640 或 1024）
+        // 并执行 letterbox，因此切换 RKNN 模型时无需修改这里。
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, args.camera_width);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, args.camera_height);
         // 使用压缩格式，降低 USB 带宽压力
         cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-        // ================
 
         } else {
             cap.open(args.video_path);

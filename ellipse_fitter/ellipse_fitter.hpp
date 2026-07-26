@@ -66,6 +66,12 @@ struct EllipseFitConfig
     float maximum_center_std_ratio = 0.10f; ///< 中心标准差最大值/检测框短边。
     float maximum_axis_std_ratio = 0.18f;   ///< 轴长标准差最大值/检测框短边。
     double maximum_covariance_condition = 1e12; ///< 法方程条件数上限，过大表示拟合退化。
+    float adaptive_inlier_ratio = 0.02f; ///< 完整/外层轮廓内点门限=框短边×该比例。
+    float adaptive_inlier_min_px = 1.0f; ///< 自适应门限的像素下限。
+    float outer_gap_threshold_deg = 25.0f; ///< 径向最外层轮廓的连续缺口判定角。
+    float hull_iou_weight = 0.70f; ///< Mask 候选评分中外层凸包 IoU 的权重。
+    float box_border_point_ratio = 0.06f; ///< ROI 边点达到该比例时视为检测框假封口。
+    int box_border_minimum_points = 6; ///< 判定检测框假封口所需的最少边点数。
 
     // ---------- 候选选择与可选 Edge 路径 ----------
     float minimum_candidate_quality = 0.52f;     ///< 低于该综合质量分时返回 Box。
@@ -168,6 +174,12 @@ private:
         float mean_error_px = std::numeric_limits<float>::infinity();
     };
 
+    struct OuterEnvelopeResult
+    {
+        std::vector<WeightedPoint> points;
+        bool has_large_gap = false;
+    };
+
     /// 一阶近似的带符号点到椭圆距离，单位近似为像素。
     static float SampsonResidualPx(const cv::RotatedRect &ellipse,
                                    const cv::Point2f &point);
@@ -177,7 +189,12 @@ private:
                                                  const cv::Point2f &box_center_roi,
                                                  const cv::Rect &roi_in_image,
                                                  cv::Size image_size,
-                                                 int *removed_border_points) const;
+                                                 int *removed_border_points,
+                                                 bool *box_border_truncated) const;
+    OuterEnvelopeResult CollectOuterRadialEnvelope(
+        const std::vector<WeightedPoint> &points,
+        const cv::Point2f &box_center_roi,
+        cv::Size roi_size) const;
     std::vector<WeightedPoint> CollectEdgePoints(const cv::Mat &edge_roi,
                                                  const cv::Point2f &box_center_roi) const;
     EllipseFitResult BuildCandidate(const std::vector<WeightedPoint> &points,
@@ -186,6 +203,14 @@ private:
                                     EllipseSource source,
                                     bool partial_visibility = false,
                                     int removed_border_points = 0) const;
+    EllipseFitResult BuildGlobalCandidate(
+        const std::vector<WeightedPoint> &points,
+        const cv::Rect &roi,
+        const cv::Rect &detection_box,
+        int removed_border_points = 0) const;
+    float MaskCandidateScore(const EllipseFitResult &candidate,
+                             const std::vector<WeightedPoint> &outer_points,
+                             const cv::Rect &roi) const;
     bool RefineSampson(const std::vector<WeightedPoint> &points,
                        cv::RotatedRect &ellipse,
                        cv::Matx<double, 5, 5> &covariance,

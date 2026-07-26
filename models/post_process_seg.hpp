@@ -19,25 +19,27 @@ template <typename T>  void swap(T&a,T&b)
 
 
 int process_i8(std::unique_ptr<rknn_output[]>& output,std::unique_ptr<rknn_tensor_attr[]>& output_tensor,int index,         //输出信息  和  索引
-     int grid_w, int grid_h, int model_w, int model_h, int stride,                    //格子大小（输出的大小）  ;  模型输入的大小  stride（步长/下采样倍数） ——也就是该输出特征图上 1 个网格格子对应输入图像上多少个像素。
+     int grid_w, int grid_h, float stride_x, float stride_y,
      std::vector<float>& candidate_box ,std::vector<float>& box_score,std::vector<int>& class_id,  //候选框  置信度  类别
     std::unique_ptr<rknpu2::float16[]>& proto,std::vector<rknpu2::float16>& box_mask_coefficient,
     int proto_channel,int proto_width,int proto_height ,    //掩码系数部分
      float nms_threshold ,   //NMS阈值  
-     rknpu2::float16 proto_table[]) ;    //proto反量化查表                                  
+     rknpu2::float16 proto_table[], int proto_output_index);
 
-void process_i8_index12_init(std::unique_ptr<rknn_tensor_attr[]> &output_tensor, rknpu2::float16 table[]);
+void process_i8_proto_table_init(std::unique_ptr<rknn_tensor_attr[]> &output_tensor,
+                                 int proto_output_index,
+                                 rknpu2::float16 table[]);
 
 
 
 
 //处理方法和上面类似
 int process_fp32(std::unique_ptr<rknn_output[]>& output,std::unique_ptr<rknn_tensor_attr[]>& output_tensor,int index,         
-     int grid_w, int grid_h, int model_w, int model_h, int stride ,                     
+     int grid_w, int grid_h, float stride_x, float stride_y,
      std::vector<float>& candidate_box ,std::vector<float>& box_score,std::vector<int>& class_id, 
     std::unique_ptr<rknpu2::float16[]>& proto,std::vector<rknpu2::float16>& box_mask_coefficient,
     int proto_channel,int proto_width,int proto_height ,    
-     float nms_threshold )   ;          
+     float nms_threshold, int proto_output_index);
 
 
 

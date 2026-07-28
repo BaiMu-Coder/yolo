@@ -33,18 +33,23 @@ RKNN 则采用后文说明的多个静态模型文件。
 python unit_test/yolo_mask_bbox_error.py
 ```
 
-脚本保留原有七项检测框像素误差，同时只对 `cls0` 最外圈复用
-`final_version.py` 的稳健 Mask 椭圆拟合，计算标签多边形与填充拟合椭圆的像素 IoU。
+脚本保留原有七项检测框像素误差，并统一按几何尺寸确定最外圈：标签侧取外接框面积
+最大的多边形，预测侧取外接框面积最大的检测实例，不再按类别或最大 IoU 做目标
+对应。七项检测误差和椭圆 IoU 共用这唯一一对目标。最大预测实例复用
+`final_version.py` 的稳健 Mask 椭圆拟合，并计算最大标签多边形与填充拟合椭圆的像素 IoU。
+最大标签与最大预测的类别还必须一致；类别不一致的图片标记为 `class_mismatch`，
+可视化单独保存到 `class_mismatch/`，且不参与检测误差、椭圆 IoU、分组和排行统计。
 结果按拟合椭圆完整长轴直径 `max(width, height)` 分为：
 
 - 小目标：`major < 77 px`；
 - 中目标：`77 px <= major <= 311 px`；
 - 大目标：`major > 311 px`。
 
-输出已精简为两个目录：
+输出按正常检测、椭圆 IoU 和类别异常分为三个目录：
 
 ```text
 误差评估结果/
+├── class_mismatch/
 ├── detection/
 │   ├── detection_statistics.xlsx
 │   ├── grouped_errors.png
@@ -66,15 +71,15 @@ python unit_test/yolo_mask_bbox_error.py
 IoU 工作簿包含总体及三档的样本占比、平均值、最小值、最大值和 P95，以及评估状态、
 逐图 IoU 和最低50排行。`overall_and_grouped.png` 用均值柱、P95 标记和最小—最大
 范围直观展示统计结果。`ellipse_iou/visualizations/` 保存全部独立 IoU 可视化：
-绿色边界为 cls0 标签外圈，红色边界为拟合椭圆；绿色填充表示仅标签、红色表示仅
+绿色边界为最大外接框对应的标签多边形，红色边界为拟合椭圆；绿色填充表示仅标签、红色表示仅
 椭圆、黄色表示交集。IoU 最低的 50 张另存到 `lowest_50/`。
 
 Excel 输出依赖 `openpyxl`。如果服务器没有安装该库，或 Excel 写入失败，脚本不会
 停止，而会自动回退为同等内容的 UTF-8-BOM TXT；两张统计 PNG 仍会正常生成。
 命令行参数仍可临时覆盖配置，例如 `--imgsz 1024 --device 0`。
 
-板端可使用同步的 RKNN/C++ 评估入口，统计口径、长轴分组、Top10、最低50和目录
-结构与 Python 版一致：
+板端可使用同步的 RKNN/C++ 评估入口；同样固定使用“最大标签外框 + 最大预测外框”，
+不按类别对应。统计口径、长轴分组、Top10、最低50和目录结构与 Python 版一致：
 
 ```bash
 cmake -S . -B build

@@ -8,10 +8,11 @@ YOLO 分割检测框与外圈椭圆评估工具。
 
 脚本保留原有的七项检测框像素误差，并新增：
 
-1. 只对 cls0 最外圈运行项目同款稳健 Mask 椭圆拟合。
-2. 计算最外圈标签多边形与填充拟合椭圆的像素 IoU。
-3. 按拟合椭圆长轴 <77px、77–311px、>311px 分三档，并保留总体统计。
-4. 检测和椭圆 IoU 分目录保存，优先输出 Excel，环境不支持时回退 TXT。
+1. 标签和预测均按外接框面积取最大目标，不再按类别或最大 IoU 配对。
+2. 对最大预测框运行项目同款稳健 Mask 椭圆拟合。
+3. 计算最大标签多边形与填充拟合椭圆的像素 IoU。
+4. 按拟合椭圆长轴 <77px、77–311px、>311px 分三档，并保留总体统计。
+5. 检测和椭圆 IoU 分目录保存，优先输出 Excel，环境不支持时回退 TXT。
 
 The original seven bounding-box errors are:
 
@@ -50,14 +51,12 @@ Expected label format (one target per line):
 Polygon coordinates must be normalized to [0, 1], as in an Ultralytics YOLO
 segmentation dataset.
 
-By default, all label classes and all prediction classes participate in
-automatic matching. Every ground-truth box is compared with every prediction
-box, and the pair with the highest bounding-box IoU is selected. IoU ties are
-resolved using prediction confidence and then ground-truth box area. The
-selected ground-truth class, prediction class, and IoU are used in the
-per-image result and visualization. ``--class-id`` and
-``--match-pred-class`` remain available when a restricted evaluation is
-explicitly required.
+For every image, the label polygon with the largest bounding-box area and the
+prediction with the largest bounding-box area are selected. Classes are only
+reported and never participate in selection. The two selected classes must
+then match; mismatches are marked as anomalies and excluded from every metric.
+The same valid pair is used by the seven detection-error metrics and the
+outer-ellipse IoU evaluation.
 
 Dependencies:
 
@@ -139,13 +138,14 @@ class EvaluationConfig:
     image_size: int | tuple[int, int] = 640
     device: str | None = None
 
-    # 原有检测框误差统计。
+    # 检测误差固定使用“最大标签外框 + 最大预测外框”。
     error_threshold_px: float = 3.0
+    # 以下三个字段只为兼容旧配置/命令行保留，当前选择逻辑不会使用它们。
     requested_label_class: int | None = None
     ignore_prediction_class: bool = True
     selection: str = "iou"
 
-    # 新增外圈椭圆评估。项目当前约定 cls0 是最外圈。
+    # 旧版外圈类别配置仅为兼容保留，当前按外框面积识别最外圈。
     outer_class_id: int = 0
     ellipse_force_box: bool = False
     mask_threshold: float = 0.50
@@ -314,27 +314,27 @@ def parse_args(config: EvaluationConfig = CFG) -> argparse.Namespace:
         "--class-id",
         type=int,
         default=config.requested_label_class,
-        help="可选：只限制标签类别；默认不限制类别，自动按最大 IoU 匹配",
+        help="兼容旧命令，当前已忽略；最外圈固定按标签外框面积选择",
     )
     class_matching_group = parser.add_mutually_exclusive_group()
     class_matching_group.add_argument(
         "--ignore-pred-class",
         dest="ignore_pred_class",
         action="store_true",
-        help="预测框匹配时不要求与标签同类别（默认行为）",
+        help="兼容旧命令，当前已忽略",
     )
     class_matching_group.add_argument(
         "--match-pred-class",
         dest="ignore_pred_class",
         action="store_false",
-        help="只允许标签与相同类别的预测框配对",
+        help="兼容旧命令，当前已忽略",
     )
     parser.set_defaults(ignore_pred_class=config.ignore_prediction_class)
     parser.add_argument(
         "--selection",
         choices=("confidence", "iou"),
         default=config.selection,
-        help="候选组合排序方式；默认按最大 IoU，confidence 仅用于兼容旧命令",
+        help="兼容旧命令，当前已忽略；预测固定按外框面积选择",
     )
     parser.add_argument(
         "--recursive",
@@ -556,198 +556,67 @@ def box_iou(
     return intersection / union if union > 0.0 else 0.0
 
 
-def choose_best_match(
+def choose_largest_outer_pair(
     result: Any,
     gt_targets: list[
         tuple[int, tuple[float, float, float, float], np.ndarray]
     ],
-    ignore_pred_class: bool,
-    selection: str,
     image_width: int,
     image_height: int,
-) -> tuple[
-    int,
-    tuple[float, float, float, float],
-    np.ndarray,
-    tuple[float, float, float, float] | None,
-    int | None,
-    float | None,
-    int,
-    int,
-    float | None,
-]:
-    fallback_class, fallback_bbox, fallback_polygon = largest_ground_truth(
-        gt_targets
-    )
+) -> dict[str, Any]:
+    """选择物理意义上的最外圈，不使用类别或 GT/预测 IoU 做对应。
+
+    标签侧取外接框面积最大的多边形；预测侧取裁剪后检测框面积最大的实例。
+    当多个预测框面积相同时，依次用置信度和较小的原始下标稳定决策。
+    返回的唯一一对会同时用于七项检测误差和椭圆 IoU，避免两套匹配口径。
+    """
+    gt_class, gt_bbox, polygon = largest_ground_truth(gt_targets)
     boxes = result.boxes
     if boxes is None or len(boxes) == 0:
-        return (
-            fallback_class,
-            fallback_bbox,
-            fallback_polygon,
-            None,
-            None,
-            None,
-            0,
-            0,
-            None,
-        )
+        return {
+            "status": "no_detection",
+            "gt_class": gt_class,
+            "gt_bbox": gt_bbox,
+            "polygon": polygon,
+            "prediction_count": 0,
+        }
 
     xyxy = boxes.xyxy.detach().cpu().numpy()
     confidences = boxes.conf.detach().cpu().numpy()
     classes = boxes.cls.detach().cpu().numpy().astype(int)
-    prediction_count = len(xyxy)
-
-    predictions: list[
-        tuple[tuple[float, float, float, float], int, float]
-    ] = []
-    for raw_box, pred_class, confidence in zip(xyxy, classes, confidences):
+    candidates: list[tuple[float, float, int, Any, int]] = []
+    for prediction_index, (raw_box, pred_class, confidence) in enumerate(
+        zip(xyxy, classes, confidences)
+    ):
         bbox = clip_bbox(
             tuple(float(value) for value in raw_box),
             image_width,
             image_height,
         )
-        predictions.append((bbox, int(pred_class), float(confidence)))
-
-    candidate_pairs: list[
-        tuple[
-            float,
-            float,
-            float,
-            int,
-            tuple[float, float, float, float],
-            np.ndarray,
-            tuple[float, float, float, float],
-            int,
-        ]
-    ] = []
-    for gt_class, gt_bbox, polygon in gt_targets:
-        for pred_bbox, pred_class, confidence in predictions:
-            if not ignore_pred_class and pred_class != gt_class:
-                continue
-            candidate_pairs.append(
-                (
-                    box_iou(gt_bbox, pred_bbox),
-                    confidence,
-                    bbox_area(gt_bbox),
-                    gt_class,
-                    gt_bbox,
-                    polygon,
-                    pred_bbox,
-                    pred_class,
-                )
+        candidates.append(
+            (
+                bbox_area(bbox),
+                float(confidence),
+                -prediction_index,
+                bbox,
+                int(pred_class),
             )
-
-    if selection == "iou":
-        selected = max(
-            candidate_pairs,
-            key=lambda item: (item[0], item[1], item[2]),
-        ) if candidate_pairs else None
-    else:
-        selected = max(
-            candidate_pairs,
-            key=lambda item: (item[1], item[0], item[2]),
-        ) if candidate_pairs else None
-
-    if selected is None:
-        return (
-            fallback_class,
-            fallback_bbox,
-            fallback_polygon,
-            None,
-            None,
-            None,
-            prediction_count,
-            0,
-            None,
         )
 
-    (
-        matched_iou,
-        confidence,
-        _,
-        gt_class,
-        gt_bbox,
-        polygon,
-        pred_bbox,
-        pred_class,
-    ) = selected
-    return (
-        gt_class,
-        gt_bbox,
-        polygon,
-        pred_bbox,
-        pred_class,
-        confidence,
-        prediction_count,
-        len(candidate_pairs),
-        matched_iou,
-    )
-
-
-def choose_outer_ring_match(
-    result: Any,
-    gt_targets: list[
-        tuple[int, tuple[float, float, float, float], np.ndarray]
-    ],
-    outer_class_id: int,
-    image_width: int,
-    image_height: int,
-) -> dict[str, Any]:
-    """为椭圆评估独立选择 cls0 最外圈。
-
-    原有七项检测框误差可继续评估所有类别；这里只在
-    ``outer_class_id`` 标签与同类预测之间按框 IoU 匹配，防止
-    中圈或内孔被误用于外圈椭圆统计。
-    """
-    outer_targets = [target for target in gt_targets if target[0] == outer_class_id]
-    if not outer_targets:
-        return {"status": "no_outer_label"}
-    if result.boxes is None or len(result.boxes) == 0:
-        return {"status": "no_outer_detection"}
-
-    xyxy = result.boxes.xyxy.detach().cpu().numpy()
-    confidences = result.boxes.conf.detach().cpu().numpy()
-    classes = result.boxes.cls.detach().cpu().numpy().astype(int)
-    candidates: list[tuple[Any, ...]] = []
-    for prediction_index, (raw_box, pred_class, confidence) in enumerate(
-        zip(xyxy, classes, confidences)
-    ):
-        if int(pred_class) != outer_class_id:
-            continue
-        pred_bbox = clip_bbox(
-            tuple(float(value) for value in raw_box),
-            image_width,
-            image_height,
-        )
-        for gt_class, gt_bbox, polygon in outer_targets:
-            candidates.append(
-                (
-                    box_iou(gt_bbox, pred_bbox),
-                    float(confidence),
-                    bbox_area(gt_bbox),
-                    int(prediction_index),
-                    gt_class,
-                    gt_bbox,
-                    polygon,
-                    pred_bbox,
-                    int(pred_class),
-                )
-            )
-    if not candidates:
-        return {"status": "no_outer_detection"}
-
-    selected = max(candidates, key=lambda item: (item[0], item[1], item[2]))
+    _, confidence, negative_index, pred_bbox, pred_class = max(
+        candidates, key=lambda item: (item[0], item[1], item[2]))
+    prediction_index = -negative_index
     return {
         "status": "matched",
-        "box_iou": selected[0],
-        "confidence": selected[1],
-        "prediction_index": selected[3],
-        "gt_class": selected[4],
-        "gt_bbox": selected[5],
-        "polygon": selected[6],
-        "pred_bbox": selected[7],
-        "pred_class": selected[8],
+        "box_iou": box_iou(gt_bbox, pred_bbox),
+        "confidence": confidence,
+        "prediction_index": prediction_index,
+        "prediction_count": len(xyxy),
+        "gt_class": gt_class,
+        "gt_bbox": gt_bbox,
+        "polygon": polygon,
+        "pred_bbox": pred_bbox,
+        "pred_class": pred_class,
     }
 
 
@@ -832,12 +701,19 @@ def evaluate_outer_ellipse(
         tuple[int, tuple[float, float, float, float], np.ndarray]
     ],
     args: argparse.Namespace,
+    matched: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """运行工程同款外圈拟合，并返回逐图 IoU 与分组信息。"""
     image_height, image_width = image.shape[:2]
-    matched = choose_outer_ring_match(
-        result, gt_targets, args.outer_class_id, image_width, image_height)
+    if matched is None:
+        matched = choose_largest_outer_pair(
+            result, gt_targets, image_width, image_height)
+    else:
+        # 后续会补充椭圆字段，复制可避免修改检测误差侧保存的选择结果。
+        matched = dict(matched)
     if matched["status"] != "matched":
+        if matched["status"] == "no_detection":
+            matched["status"] = "no_outer_detection"
         return matched
 
     x1, y1, x2, y2 = matched["pred_bbox"]
@@ -1258,7 +1134,7 @@ def draw_outer_ellipse_iou_visualization(
 ) -> np.ndarray:
     """生成只用于椭圆 IoU 核对的干净画面。
 
-    绿色边界是 cls0 标签外圈，红色边界是最终拟合椭圆。区域颜色用于解释 IoU：
+    绿色边界是最大标签外框对应的多边形，红色边界是最终拟合椭圆。区域颜色用于解释 IoU：
     绿色为仅标签、红色为仅椭圆、黄色为两者交集。
     """
     canvas = image.copy()
@@ -1779,10 +1655,11 @@ def write_run_config(path: Path, args: argparse.Namespace) -> None:
         "image_size": args.imgsz,
         "device": args.device,
         "bbox_error_threshold_px": args.threshold,
-        "bbox_requested_label_class": args.class_id,
-        "bbox_ignore_prediction_class": args.ignore_pred_class,
-        "bbox_selection": args.selection,
-        "outer_class_id": args.outer_class_id,
+        "matching_rule": "largest_label_bbox_and_largest_prediction_bbox",
+        "legacy_bbox_requested_label_class_ignored": args.class_id,
+        "legacy_bbox_ignore_prediction_class_ignored": args.ignore_pred_class,
+        "legacy_bbox_selection_ignored": args.selection,
+        "legacy_outer_class_id_ignored": args.outer_class_id,
         "ellipse_force_box": args.ellipse_force_box,
         "mask_threshold": args.mask_threshold,
         "small_major_axis_px": args.small_major_axis_px,
@@ -2563,6 +2440,7 @@ def main() -> int:
 
     detection_dir = args.output / "detection"
     ellipse_iou_dir = args.output / "ellipse_iou"
+    class_mismatch_dir = args.output / "class_mismatch"
     visualization_dir = detection_dir / "visualizations"
     over_threshold_dir = detection_dir / "over_threshold"
     top_k_dir = detection_dir / "top10_max_error"
@@ -2574,24 +2452,16 @@ def main() -> int:
         visualization_dir.mkdir(parents=True, exist_ok=True)
         over_threshold_dir.mkdir(parents=True, exist_ok=True)
         ellipse_iou_visualization_dir.mkdir(parents=True, exist_ok=True)
+        class_mismatch_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"加载模型：{args.model}")
-    label_scope = (
-        "全部标签类别"
-        if args.class_id is None
-        else f"仅标签类别 {args.class_id}"
-    )
-    prediction_scope = (
-        "预测类别不限"
-        if args.ignore_pred_class
-        else "标签与预测必须同类别"
+    print(
+        "匹配规则：标签取外接框面积最大的多边形，"
+        "预测取外接框面积最大的检测实例；类别不参与选择"
     )
     print(
-        f"匹配规则：{label_scope}，{prediction_scope}，"
-        f"按 {args.selection.upper()} 选择最佳组合"
-    )
-    print(
-        f"外圈椭圆：cls{args.outer_class_id}，"
+        "检测误差与椭圆 IoU 共用上述唯一最外圈目标；"
+        "两者类别不一致时标记异常并排除；"
         f"长轴分组 <{args.small_major_axis_px:g}px / "
         f"{args.small_major_axis_px:g}–{args.large_major_axis_px:g}px / "
         f">{args.large_major_axis_px:g}px"
@@ -2619,17 +2489,8 @@ def main() -> int:
                 image_height,
                 requested_class=None,
             )
-            gt_targets = (
-                all_gt_targets
-                if args.class_id is None
-                else [
-                    target for target in all_gt_targets
-                    if target[0] == args.class_id
-                ]
-            )
-            if not gt_targets:
-                raise ValueError(
-                    f"标签中不存在类别 {args.class_id}：{label_path}")
+            # 不按类别过滤。最大外接框就是该图最外圈标签。
+            gt_targets = all_gt_targets
         except FileNotFoundError as exc:
             row["status"] = "missing_label"
             row["message"] = str(exc)
@@ -2673,11 +2534,7 @@ def main() -> int:
 
         gt_class, gt_bbox, polygon = largest_ground_truth(gt_targets)
         row["gt_target_count"] = len(gt_targets)
-        row["match_mode"] = (
-            f"max_{args.selection}_all_classes"
-            if args.ignore_pred_class
-            else f"max_{args.selection}_same_class"
-        )
+        row["match_mode"] = "largest_label_bbox_and_largest_prediction_bbox"
 
         predict_kwargs: dict[str, Any] = {
             "source": image,
@@ -2726,11 +2583,80 @@ def main() -> int:
             rows.append(row)
             continue
 
-        # 外圈椭圆评估与原有检测框误差评估相互独立。
-        # 即使某张图的椭圆拟合异常，也不中断原有七项误差统计。
+        # 只选择一次最外圈，检测误差与椭圆 IoU 必须共用同一对目标。
+        largest_pair = choose_largest_outer_pair(
+            result, gt_targets, image_width, image_height)
+        gt_class = int(largest_pair["gt_class"])
+        gt_bbox = largest_pair["gt_bbox"]
+        polygon = largest_pair["polygon"]
+        pred_bbox = largest_pair.get("pred_bbox")
+        pred_class = largest_pair.get("pred_class")
+        confidence = largest_pair.get("confidence")
+        prediction_count = int(largest_pair.get("prediction_count", 0))
+        matched_iou = largest_pair.get("box_iou")
+
+        row["gt_class"] = gt_class
+        row["prediction_count"] = prediction_count
+        row["candidate_pair_count"] = int(pred_bbox is not None)
+        row["threshold_px"] = rounded(args.threshold)
+        row["gt_x1"], row["gt_y1"], row["gt_x2"], row["gt_y2"] = (
+            rounded(value) for value in gt_bbox
+        )
+
+        # 最大标签和最大预测必须属于同一类别。类别不一致说明最大框可能
+        # 选到了错误实例：单独留图排查，且不运行椭圆拟合、不进入任何指标。
+        if pred_bbox is not None and int(pred_class) != gt_class:
+            row.update(
+                {
+                    "status": "class_mismatch",
+                    "message": (
+                        "最大面积目标类别不一致，已排除："
+                        f"GT class {gt_class} != Pred class {pred_class}"
+                    ),
+                    "pred_class": pred_class,
+                    "confidence": rounded(confidence),
+                    "pred_x1": rounded(pred_bbox[0]),
+                    "pred_y1": rounded(pred_bbox[1]),
+                    "pred_x2": rounded(pred_bbox[2]),
+                    "pred_y2": rounded(pred_bbox[3]),
+                }
+            )
+            mismatch_evaluation = dict(largest_pair)
+            mismatch_evaluation.update(
+                status="class_mismatch",
+                error=(
+                    f"GT class {gt_class} != Pred class {pred_class}; "
+                    "excluded from detection and ellipse metrics"
+                ),
+            )
+            update_row_with_outer_ellipse(row, mismatch_evaluation)
+            if args.save_vis:
+                mismatch_visualization = draw_visualization(
+                    image,
+                    polygon,
+                    gt_bbox,
+                    pred_bbox,
+                    errors=None,
+                    confidence=float(confidence),
+                    gt_class=gt_class,
+                    pred_class=int(pred_class),
+                    status_text=(
+                        f"CLASS MISMATCH: GT {gt_class} != "
+                        f"PRED {int(pred_class)} | EXCLUDED"
+                    ),
+                )
+                write_image(
+                    visualization_path_for_image(
+                        image_path, args.images, class_mismatch_dir),
+                    mismatch_visualization,
+                )
+            rows.append(row)
+            continue
+
+        # 即使某张图的椭圆拟合异常，也不中断七项检测误差统计。
         try:
             outer_evaluation = evaluate_outer_ellipse(
-                image, result, all_gt_targets, args)
+                image, result, gt_targets, args, largest_pair)
         except Exception as exc:
             outer_evaluation = {
                 "status": "outer_ellipse_error",
@@ -2750,40 +2676,9 @@ def main() -> int:
             )
             write_image(ellipse_iou_path, ellipse_iou_visualization)
 
-        (
-            gt_class,
-            gt_bbox,
-            polygon,
-            pred_bbox,
-            pred_class,
-            confidence,
-            prediction_count,
-            candidate_pair_count,
-            matched_iou,
-        ) = choose_best_match(
-            result,
-            gt_targets,
-            args.ignore_pred_class,
-            args.selection,
-            image_width,
-            image_height,
-        )
-
-        row["gt_class"] = gt_class
-        row["prediction_count"] = prediction_count
-        row["candidate_pair_count"] = candidate_pair_count
-        row["threshold_px"] = rounded(args.threshold)
-        row["gt_x1"], row["gt_y1"], row["gt_x2"], row["gt_y2"] = (
-            rounded(value) for value in gt_bbox
-        )
-
         if pred_bbox is None:
             row["status"] = "no_detection"
-            row["message"] = (
-                "模型没有输出检测框"
-                if prediction_count == 0
-                else "类别约束下没有可用的标签框与预测框组合"
-            )
+            row["message"] = "模型没有输出检测框"
             if args.save_vis:
                 visualized = draw_visualization(
                     image,
@@ -2806,11 +2701,9 @@ def main() -> int:
             {
                 "status": "ok",
                 "message": (
-                    f"从 {len(gt_targets)} 个标签目标、"
-                    f"{prediction_count} 个预测框组成的 "
-                    f"{candidate_pair_count} 个候选组合中，"
-                    f"按 {args.selection.upper()} 选择："
-                    f"GT class {gt_class} <-> Pred class {pred_class}，"
+                    f"标签侧从 {len(gt_targets)} 个目标中取最大外框，"
+                    f"预测侧从 {prediction_count} 个检测中取最大外框；"
+                    f"类别仅记录：GT {gt_class}，Pred {pred_class}，"
                     f"IoU={float(matched_iou):.6f}"
                 ),
                 "pred_class": pred_class,
@@ -3005,6 +2898,7 @@ def main() -> int:
     if args.save_vis:
         print(f"全部检测可视化：{visualization_dir}")
         print(f"全部椭圆 IoU 可视化：{ellipse_iou_visualization_dir}")
+        print(f"最大目标类别异常可视化：{class_mismatch_dir}")
         over_threshold_count = sum(
             row["status"] == "ok"
             and not bool(int(row["all_metrics_within_threshold"]))

@@ -1,12 +1,14 @@
-// 板端 RKNN 版：检测框七项误差 + cls0 外圈拟合椭圆 IoU 批量评估。
+// 板端 RKNN 版：检测框七项误差 + 最外圈拟合椭圆 IoU 批量评估。
 //
 // 与 yolo_mask_bbox_error.py 保持相同核心口径：
 //   1. YOLO 分割标签多边形的外接框作为检测误差真值；
-//   2. 默认在全部类别中选择检测框 IoU 最大的 GT/预测组合；
-//   3. cls0 外圈独立匹配，并复用生产 EllipseFitter 的 Mask -> Box 管线；
-//   4. 按拟合外圈完整长轴 <77、77~311、>311 px 分组；
-//   5. 保存全部检测/IoU 可视化、超阈值、总体误差 Top10、IoU 最低50；
-//   6. 优先写 Excel 2003 XML 多工作表（Excel/WPS 可直接打开），失败时回退 TXT。
+//   2. 标签侧与预测侧分别选择外接框面积最大的目标，类别不参与选择；
+//   3. 两个最大目标类别不一致时单独留图，并排除所有指标；
+//   4. 检测误差和椭圆 IoU 共用上述唯一一对最外圈目标；
+//   5. 最大预测实例复用生产 EllipseFitter 的 Mask -> Box 管线；
+//   6. 按拟合外圈完整长轴 <77、77~311、>311 px 分组；
+//   7. 保存全部检测/IoU 可视化、超阈值、总体误差 Top10、IoU 最低50；
+//   8. 优先写 Excel 2003 XML 多工作表（Excel/WPS 可直接打开），失败时回退 TXT。
 
 #include <opencv2/opencv.hpp>
 
@@ -48,12 +50,12 @@ struct Args {
     fs::path labels;
     fs::path output;
     double threshold_px = 3.0;
-    int class_id = -1;  // -1 表示全部标签类别。
-    bool match_prediction_class = false;
+    int class_id = -1;  // 兼容旧命令，当前选择逻辑忽略。
+    bool match_prediction_class = false;  // 兼容旧命令，当前忽略。
     bool recursive = false;
     bool save_visualizations = true;
     bool force_outer_box = false;
-    int outer_class_id = 0;
+    int outer_class_id = 0;  // 兼容旧命令，当前忽略。
     double small_major_px = 77.0;
     double large_major_px = 311.0;
     int top_k = 10;
@@ -124,9 +126,9 @@ void print_help(const char* app) {
            " --output /data/evaluation\n\n"
         << "Options:\n"
         << "  --threshold PX             Detection pass threshold, default 3\n"
-        << "  --class-id ID              Restrict detection GT class; default all\n"
-        << "  --match-pred-class         Require prediction class == GT class\n"
-        << "  --outer-class-id ID        Outer-ring class, default 0\n"
+        << "  --class-id ID              Deprecated compatibility option; ignored\n"
+        << "  --match-pred-class         Deprecated compatibility option; ignored\n"
+        << "  --outer-class-id ID        Deprecated compatibility option; ignored\n"
         << "  --force-outer-box          Force outer box-inscribed circle\n"
         << "  --small-major PX           Small/medium boundary, default 77\n"
         << "  --large-major PX           Medium/large boundary, default 311\n"
@@ -289,31 +291,39 @@ struct Match {
     double iou = -1.0;
 };
 
-Match choose_match(const std::vector<GroundTruth>& targets,
-                   const object_detect_result_list& detections,
-                   int gt_class_filter, bool require_same_class) {
-    Match best;
-    float best_confidence = -1.0f;
-    double best_gt_area = -1.0;
-    for (int gt_index = 0; gt_index < static_cast<int>(targets.size()); ++gt_index) {
-        const auto& target = targets[gt_index];
-        if (gt_class_filter >= 0 && target.class_id != gt_class_filter) continue;
-        for (int pred_index = 0; pred_index < detections.count; ++pred_index) {
-            const auto& prediction = detections.results_box[pred_index];
-            if (require_same_class && prediction.cls_id != target.class_id) continue;
-            const double iou = box_iou(target.box, detection_box(prediction));
-            const double area = target.box.area();
-            if (iou > best.iou ||
-                (std::abs(iou - best.iou) < 1e-12 &&
-                 (prediction.prop > best_confidence ||
-                  (prediction.prop == best_confidence && area > best_gt_area)))) {
-                best = {gt_index, pred_index, iou};
-                best_confidence = prediction.prop;
-                best_gt_area = area;
-            }
+Match choose_largest_outer_pair(
+    const std::vector<GroundTruth>& targets,
+    const object_detect_result_list& detections) {
+    Match selected;
+    double largest_gt_area = -1.0;
+    for (int index = 0; index < static_cast<int>(targets.size()); ++index) {
+        const double area = std::max(0.0f, targets[index].box.area());
+        if (area > largest_gt_area) {
+            largest_gt_area = area;
+            selected.gt = index;
         }
     }
-    return best;
+
+    double largest_prediction_area = -1.0;
+    float best_confidence = -1.0f;
+    for (int index = 0; index < detections.count; ++index) {
+        const auto& prediction = detections.results_box[index];
+        const cv::Rect2f box = detection_box(prediction);
+        const double area = std::max(0.0f, box.area());
+        if (area > largest_prediction_area ||
+            (std::abs(area - largest_prediction_area) < 1e-12 &&
+             prediction.prop > best_confidence)) {
+            largest_prediction_area = area;
+            best_confidence = prediction.prop;
+            selected.pred = index;
+        }
+    }
+
+    if (selected.gt >= 0 && selected.pred >= 0)
+        selected.iou = box_iou(
+            targets[selected.gt].box,
+            detection_box(detections.results_box[selected.pred]));
+    return selected;
 }
 
 std::string size_group(double major, const Args& args) {
@@ -437,12 +447,14 @@ cv::Mat draw_detection_visual(const cv::Mat& image, const GroundTruth* gt,
     }
     if (pred) cv::rectangle(visual, detection_box(*pred), {0, 0, 255}, 2);
     std::vector<std::string> lines{"status=" + row.status};
-    if (row.status == "ok") {
+    if (pred) {
         std::ostringstream header;
         header << std::fixed << std::setprecision(3)
                << "GT cls=" << row.gt_class << " pred cls=" << row.pred_class
                << " conf=" << row.confidence << " box IoU=" << row.detection_iou;
         lines.push_back(header.str());
+    }
+    if (row.status == "ok") {
         for (int i = 0; i < kMetricCount; ++i) {
             std::ostringstream item;
             item << kMetricNames[i] << '=' << std::fixed << std::setprecision(2)
@@ -674,14 +686,17 @@ Table detection_stat_table(const std::vector<MetricStat>& stats,
 }
 
 Table per_image_detection_table(const std::vector<EvaluationRow>& rows) {
-    Table table{{"image", "status", "outer_group", "outer_major_px",
+    Table table{{"image", "status", "gt_class", "pred_class",
+                 "outer_group", "outer_major_px",
                  kMetricNames[0], kMetricNames[1], kMetricNames[2],
                  kMetricNames[3], kMetricNames[4], kMetricNames[5],
                  kMetricNames[6], "max_error_px", "max_error_metric",
                  "all_within_threshold"}};
     for (const auto& row : rows) {
         std::vector<std::string> record{
-            row.image.string(), row.status, row.size_group,
+            row.image.string(), row.status, std::to_string(row.gt_class),
+            row.pred_class >= 0 ? std::to_string(row.pred_class) : "",
+            row.size_group,
             number(row.outer_major_px)};
         int maximum_index = 0;
         for (int i = 0; i < kMetricCount; ++i) {
@@ -712,10 +727,13 @@ Table iou_stat_table(const std::vector<IouStat>& stats) {
 }
 
 Table per_image_iou_table(const std::vector<EvaluationRow>& rows) {
-    Table table{{"image", "status", "major_axis_px", "group", "source",
+    Table table{{"image", "status", "gt_class", "pred_class",
+                 "major_axis_px", "group", "source",
                  "iou", "iou_percent"}};
     for (const auto& row : rows)
         table.push_back({row.image.string(), row.outer_status,
+                         std::to_string(row.gt_class),
+                         row.pred_class >= 0 ? std::to_string(row.pred_class) : "",
                          number(row.outer_major_px), row.size_group,
                          row.outer_source, number(row.ellipse_iou),
                          number(row.ellipse_iou * 100.0)});
@@ -925,6 +943,7 @@ int main(int argc, char** argv) {
 
         const fs::path detection_dir = args.output / "detection";
         const fs::path iou_dir = args.output / "ellipse_iou";
+        const fs::path class_mismatch_dir = args.output / "class_mismatch";
         const fs::path detection_visual_dir = detection_dir / "visualizations";
         const fs::path over_threshold_dir = detection_dir / "over_threshold";
         const fs::path detection_top_dir = detection_dir / "top10_max_error";
@@ -932,6 +951,8 @@ int main(int argc, char** argv) {
         const fs::path lowest_iou_dir = iou_dir / "lowest_50";
         fs::create_directories(detection_dir);
         fs::create_directories(iou_dir);
+        if (args.save_visualizations)
+            fs::create_directories(class_mismatch_dir);
 
         yolov8seg model(args.model.string());
         const int init_status = model.init();
@@ -990,21 +1011,43 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            const Match detection_match = choose_match(
-                targets, detections, args.class_id, args.match_prediction_class);
-            const GroundTruth* selected_gt = nullptr;
-            const object_detect_result* selected_prediction = nullptr;
-            if (detection_match.gt < 0 || detection_match.pred < 0) {
-                row.status = "no_detection";
-            } else {
-                selected_gt = &targets[detection_match.gt];
-                selected_prediction =
-                    &detections.results_box[detection_match.pred];
-                row.status = "ok";
-                row.gt_class = selected_gt->class_id;
+            // 只做一次几何选择：标签最大外框 + 预测最大外框。
+            // 检测误差、椭圆拟合及 IoU 必须共用这一对；类别随后用于一致性门禁。
+            const Match largest_outer =
+                choose_largest_outer_pair(targets, detections);
+            const GroundTruth* selected_gt =
+                largest_outer.gt >= 0 ? &targets[largest_outer.gt] : nullptr;
+            const object_detect_result* selected_prediction =
+                largest_outer.pred >= 0
+                    ? &detections.results_box[largest_outer.pred]
+                    : nullptr;
+            // 标签存在但模型漏检时也保留最大标签的类别，便于逐图结果追溯。
+            row.gt_class = selected_gt->class_id;
+            if (selected_prediction &&
+                selected_prediction->cls_id != selected_gt->class_id) {
+                // 最大面积目标类别不一致通常意味着选错实例。只保存异常图和
+                // 状态记录，不计算检测误差、椭圆 IoU、分组或排行。
+                row.status = row.outer_status = "class_mismatch";
                 row.pred_class = selected_prediction->cls_id;
                 row.confidence = selected_prediction->prop;
-                row.detection_iou = static_cast<float>(detection_match.iou);
+                row.detection_iou = static_cast<float>(largest_outer.iou);
+                if (args.save_visualizations) {
+                    const cv::Mat mismatch_visual = draw_detection_visual(
+                        image, selected_gt, selected_prediction, row, args);
+                    save_image(output_image_path(
+                        class_mismatch_dir, image_path, args),
+                        mismatch_visual);
+                }
+                rows.push_back(std::move(row));
+                continue;
+            }
+            if (largest_outer.pred < 0) {
+                row.status = "no_detection";
+            } else {
+                row.status = "ok";
+                row.pred_class = selected_prediction->cls_id;
+                row.confidence = selected_prediction->prop;
+                row.detection_iou = static_cast<float>(largest_outer.iou);
                 row.errors = calculate_errors(
                     selected_gt->box, detection_box(*selected_prediction));
                 row.all_within_threshold = std::all_of(
@@ -1012,14 +1055,11 @@ int main(int argc, char** argv) {
                     [&](double value) { return value <= args.threshold_px; });
             }
 
-            const Match outer_match = choose_match(
-                targets, detections, args.outer_class_id, true);
-            const GroundTruth* outer_gt = nullptr;
-            if (outer_match.gt < 0) {
+            const GroundTruth* outer_gt = selected_gt;
+            if (largest_outer.pred < 0) {
                 row.outer_status = "no_outer_detection";
             } else {
-                outer_gt = &targets[outer_match.gt];
-                const int prediction_index = outer_match.pred;
+                const int prediction_index = largest_outer.pred;
                 const auto& prediction =
                     detections.results_box[prediction_index];
                 const auto& masks = detections.results_mask[0].each_of_mask;
@@ -1127,9 +1167,13 @@ int main(int argc, char** argv) {
         const int ellipse_ok = static_cast<int>(std::count_if(
             rows.begin(), rows.end(),
             [](const auto& row) { return row.outer_status == "ok"; }));
+        const int class_mismatch = static_cast<int>(std::count_if(
+            rows.begin(), rows.end(),
+            [](const auto& row) { return row.status == "class_mismatch"; }));
         std::cout << "\nFinished: " << rows.size() << " images\n"
                   << "Detection valid: " << detection_ok << '\n'
                   << "Outer ellipse IoU valid: " << ellipse_ok << '\n'
+                  << "Class mismatch excluded: " << class_mismatch << '\n'
                   << "Detection statistics: " << detection_book << '\n'
                   << "Ellipse IoU statistics: " << iou_book << '\n'
                   << "Output: " << args.output << '\n';
